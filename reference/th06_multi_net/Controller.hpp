@@ -1,0 +1,108 @@
+#pragma once
+
+#include "inttypes.hpp"
+#include <string>
+
+
+struct KeyDefine {
+    u16 dik;
+    u16 vk;
+    std::string keyname;
+    bool operator==(const KeyDefine& k2)const
+    {
+        return dik == k2.dik && vk == k2.vk && keyname == k2.keyname;
+    }
+    };
+extern KeyDefine keyBindDefine[109];
+struct THKeysDefine{
+    KeyDefine key_1P_shoot;
+    KeyDefine key_1P_bomb;
+    KeyDefine key_1P_focus;
+    KeyDefine key_1P_up;
+    KeyDefine key_1P_down;
+    KeyDefine key_1P_left;
+    KeyDefine key_1P_right;
+
+    KeyDefine key_2P_shoot;
+    KeyDefine key_2P_bomb;
+    KeyDefine key_2P_focus;
+    KeyDefine key_2P_up;
+    KeyDefine key_2P_down;
+    KeyDefine key_2P_left;
+    KeyDefine key_2P_right;
+
+    KeyDefine key_ctrl;
+    KeyDefine key_esc;
+    KeyDefine key_Q;
+    KeyDefine key_R;
+
+    KeyDefine key_M;
+    KeyDefine key_N;
+};
+void InitKeyBindDefine();
+KeyDefine GetKeyDefine(std::string keyname,KeyDefine default_key);
+KeyDefine GetKeyDefine(int vk,KeyDefine default_key);
+
+namespace th06
+{
+
+enum TouhouButton
+{
+    TH_BUTTON_SHOOT = 1 << 0,
+    TH_BUTTON_BOMB = 1 << 1,
+    TH_BUTTON_FOCUS = 1 << 2,
+    TH_BUTTON_MENU = 1 << 3,
+    TH_BUTTON_UP = 1 << 4,
+    TH_BUTTON_DOWN = 1 << 5,
+    TH_BUTTON_LEFT = 1 << 6,
+    TH_BUTTON_RIGHT = 1 << 7,
+    TH_BUTTON_SKIP = 1 << 8,
+
+    // Player 2
+    TH_BUTTON_SHOOT2 = 1 << 9,
+    TH_BUTTON_BOMB2 = 1 << 10,
+    TH_BUTTON_FOCUS2 = 1 << 11,
+    TH_BUTTON_UP2 = 1 << 12,
+    TH_BUTTON_DOWN2 = 1 << 13,
+    TH_BUTTON_LEFT2 = 1 << 14,
+    TH_BUTTON_RIGHT2 = 1 << 15,
+
+    TH_BUTTON_UP_LEFT = TH_BUTTON_UP | TH_BUTTON_LEFT,
+    TH_BUTTON_UP_RIGHT = TH_BUTTON_UP | TH_BUTTON_RIGHT,
+    TH_BUTTON_DOWN_LEFT = TH_BUTTON_DOWN | TH_BUTTON_LEFT,
+    TH_BUTTON_DOWN_RIGHT = TH_BUTTON_DOWN | TH_BUTTON_RIGHT,
+    TH_BUTTON_DIRECTION = TH_BUTTON_DOWN | TH_BUTTON_RIGHT | TH_BUTTON_UP | TH_BUTTON_LEFT,
+
+    // Player 2
+    TH_BUTTON_UP_LEFT2 = TH_BUTTON_UP2 | TH_BUTTON_LEFT2,
+    TH_BUTTON_UP_RIGHT2 = TH_BUTTON_UP2 | TH_BUTTON_RIGHT2,
+    TH_BUTTON_DOWN_LEFT2 = TH_BUTTON_DOWN2 | TH_BUTTON_LEFT2,
+    TH_BUTTON_DOWN_RIGHT2 = TH_BUTTON_DOWN2 | TH_BUTTON_RIGHT2,
+    TH_BUTTON_DIRECTION2 = TH_BUTTON_DOWN2 | TH_BUTTON_RIGHT2 | TH_BUTTON_UP2 | TH_BUTTON_LEFT2,
+
+    TH_BUTTON_SELECTMENU = TH_BUTTON_SHOOT,
+    TH_BUTTON_RETURNMENU = TH_BUTTON_MENU | TH_BUTTON_BOMB,
+    TH_BUTTON_WRONG_CHEATCODE = TH_BUTTON_SHOOT | TH_BUTTON_BOMB | TH_BUTTON_MENU,
+    TH_BUTTON_ANY = 0xFFFF,
+};
+
+namespace Controller
+{
+u16 GetJoystickCaps(void);
+u32 SetButtonFromControllerInputs(u16 *outButtons, i16 controllerButtonToTest, enum TouhouButton touhouButton,
+                                  u32 inputButtons);
+
+unsigned int SetButtonFromDirectInputJoystate(u16 *outButtons, i16 controllerButtonToTest,
+                                              enum TouhouButton touhouButton, u8 *inputButtons);
+
+u16 GetControllerInput(u16 buttons);
+u8 *GetControllerState();
+u16 GetInput(void);
+void ResetKeyboard(void);
+
+bool RcvPacks();
+void SendKeys(int frame);
+u16 GetInput_Net(int frame,bool is_in_UI,int& cur_ctrl);
+u16 GetInput_Single(int& cur_ctrl);
+}; // namespace Controller
+}; // namespace th06

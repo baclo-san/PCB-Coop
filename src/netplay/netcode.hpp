@@ -1,0 +1,72 @@
+// netcode.hpp — public interface for the PCB co-op netcode core.
+//
+// This is the th06 mod's Controller lockstep logic (delay buffer + merge + sync)
+// decoupled from th06's engine. The original Controller::GetInput() read th06's
+// DirectInput keyboard; here the host environment supplies two callbacks:
+//   - ReadLocalInput : returns this frame's raw local 16-bit button word
+//                      (th07: read g_InputMenu @0x004b9e4c; test: scripted)
+//   - ReadRngSeed    : returns the current RNG seed for the per-frame sync check
+//                      (th07: *(u16*)0x0049fe20; test: a simulated value)
+//
+// Per-frame flow lives in Netcode_GetInput_Net(); see netcode.cpp / Controller.cpp.
+#pragma once
+#include "Connection.hpp"
+
+// ---- button bit layout (matches th06 TouhouButton; th07 gameplay reads low 9) ----
+enum NetButton
+{
+    NB_SHOOT  = 1 << 0,
+    NB_BOMB   = 1 << 1,
+    NB_FOCUS  = 1 << 2,
+    NB_MENU   = 1 << 3,
+    NB_UP     = 1 << 4,
+    NB_DOWN   = 1 << 5,
+    NB_LEFT   = 1 << 6,
+    NB_RIGHT  = 1 << 7,
+    NB_SKIP   = 1 << 8,
+
+    NB_SHOOT2 = 1 << 9,
+    NB_BOMB2  = 1 << 10,
+    NB_FOCUS2 = 1 << 11,
+    NB_UP2    = 1 << 12,
+    NB_DOWN2  = 1 << 13,
+    NB_LEFT2  = 1 << 14,
+    NB_RIGHT2 = 1 << 15,
+};
+
+// host-provided callbacks
+typedef unsigned short (*ReadLocalInputFn)(void);
+typedef unsigned short (*ReadRngSeedFn)(void);
+
+struct NetcodeCallbacks
+{
+    ReadLocalInputFn readLocalInput;
+    ReadRngSeedFn    readRngSeed;
+};
+
+// ---- lifecycle ----
+void Netcode_SetCallbacks(const NetcodeCallbacks& cb);
+
+// Bring up transport. host: bindIp may be "" (any), port to listen on.
+// guest: peer host ip/port + local bind port. family AF_INET or AF_INET6.
+bool Netcode_StartHost(const std::string& bindIp, int port, int family);
+bool Netcode_StartGuest(const std::string& hostIp, int hostPort, int localPort, int family);
+
+// Mark the link live (after the UI handshake completes) and set the agreed delay.
+// rngSeedInit is the host-chosen start seed both machines must load at game start.
+void Netcode_SetConnected(bool connected, int delay, unsigned short rngSeedInit);
+void Netcode_Reset();          // clear all per-frame maps (call on new game / calcCount reset)
+
+// ---- per-frame entry (the injection point) ----
+// Returns the merged 16-bit word BOTH machines agree on for logic-frame `frame`:
+//   gameplay (is_in_UI=false): P1 = host's low-bit input, P2 = guest's input in high bits.
+//   menu     (is_in_UI=true) : self_key | rcv_key (both navigate together).
+// out_ctrl receives the resolved in-game control action (cheats/quit/restart) for this frame.
+unsigned short Netcode_GetInput_Net(int frame, bool is_in_UI, int& out_ctrl);
+
+// ---- state accessors ----
+bool Netcode_IsConnected();
+bool Netcode_IsSync();          // false the frame a seed mismatch was detected
+bool Netcode_IsHost();
+int  Netcode_GetDelay();
+unsigned short Netcode_GetInitSeed();

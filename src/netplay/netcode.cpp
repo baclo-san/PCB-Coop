@@ -1,0 +1,303 @@
+// netcode.cpp — PCB co-op lockstep core.
+//
+// Port of RUEEE/th06_multi_net Controller.cpp (CC0): delay-buffer + per-frame
+// UDP exchange + merge + RNG-seed sync check. th06 engine deps removed:
+//   GetInput()          -> g_cb.readLocalInput()
+//   g_Rng.seed          -> g_cb.readRngSeed()
+//   g_Supervisor.calcCount -> g_netFrame (our own logic-frame index)
+// The merge that makes both machines agree on one word is factored into the
+// pure function MergeKeys() (declared in netcode_internal.hpp) for unit testing.
+#include "netcode.hpp"
+#include "netcode_internal.hpp"
+#include <map>
+
+// ---- transport (one peer per process, as in the reference) ----
+static Host  g_host;
+static Guest g_guest;
+
+// ---- delay-buffer maps, keyed by logic-frame index ----
+static std::map<int, Bits<16> >     g_ctrl_bits_self;
+static std::map<int, Bits<16> >     g_ctrl_bits_rcved;
+static std::map<int, int>           g_ctrl_rng_self;
+static std::map<int, int>           g_ctrl_rng_rcved;
+static std::map<int, InGameCtrlType> g_ctrl_self;
+static std::map<int, InGameCtrlType> g_ctrl_rcved;
+
+// ---- state ----
+static NetcodeCallbacks g_cb         = { 0, 0 };
+static int   g_delay                 = 1;
+static bool  g_is_host               = false;
+static bool  g_is_connected          = false;
+static bool  g_is_sync               = true;
+static bool  g_istry_to_reconnect    = false;
+static unsigned short g_initSeed     = 0;
+static int   g_netFrame              = 0;   // replaces g_Supervisor.calcCount
+
+static bool  g_resync_trigger        = false;
+static int   g_resync_stage_frame    = 0;
+
+// ---------------------------------------------------------------------------
+// The merge: produce the single 16-bit word BOTH machines compute identically.
+// Extracted verbatim-in-behavior from Controller::GetKeys.
+// ---------------------------------------------------------------------------
+#define TH_ISDOWN(a, mask, b) ((a) & (mask) ? (b) : 0)
+
+unsigned short MergeKeys(bool is_host, bool is_in_UI,
+                         unsigned short self_key, unsigned short rcv_key)
+{
+    if (is_in_UI)
+        return (unsigned short)(self_key | rcv_key);
+
+    unsigned short finres = 0;
+    if (is_host)
+    {
+        // P1 = local (host) low bits; P2 = remote (guest) mapped to high bits
+        finres = self_key;
+        finres |= TH_ISDOWN(rcv_key, NB_LEFT,  NB_LEFT2);
+        finres |= TH_ISDOWN(rcv_key, NB_RIGHT, NB_RIGHT2);
+        finres |= TH_ISDOWN(rcv_key, NB_UP,    NB_UP2);
+        finres |= TH_ISDOWN(rcv_key, NB_DOWN,  NB_DOWN2);
+        finres |= TH_ISDOWN(rcv_key, NB_SHOOT, NB_SHOOT2);
+        finres |= TH_ISDOWN(rcv_key, NB_BOMB,  NB_BOMB2);
+        finres |= TH_ISDOWN(rcv_key, NB_FOCUS, NB_FOCUS2);
+        finres |= TH_ISDOWN(rcv_key, NB_MENU,  NB_MENU);
+        finres |= TH_ISDOWN(rcv_key, NB_SKIP,  NB_SKIP);
+    }
+    else
+    {
+        // P1 = remote (host) low bits; P2 = local (guest) mapped to high bits
+        finres = rcv_key;
+        finres |= TH_ISDOWN(self_key, NB_LEFT,  NB_LEFT2);
+        finres |= TH_ISDOWN(self_key, NB_RIGHT, NB_RIGHT2);
+        finres |= TH_ISDOWN(self_key, NB_UP,    NB_UP2);
+        finres |= TH_ISDOWN(self_key, NB_DOWN,  NB_DOWN2);
+        finres |= TH_ISDOWN(self_key, NB_SHOOT, NB_SHOOT2);
+        finres |= TH_ISDOWN(self_key, NB_BOMB,  NB_BOMB2);
+        finres |= TH_ISDOWN(self_key, NB_FOCUS, NB_FOCUS2);
+        finres |= TH_ISDOWN(self_key, NB_MENU,  NB_MENU);
+        finres |= TH_ISDOWN(self_key, NB_SKIP,  NB_SKIP);
+    }
+    return finres;
+}
+
+// ---------------------------------------------------------------------------
+static bool RcvPacks()
+{
+    bool hasdata_all = false;
+    bool hasdata;
+    do
+    {
+        Pack pack;
+        if (g_is_host) g_host.PollReceive(pack, hasdata);
+        else           g_guest.PollReceive(pack, hasdata);
+
+        hasdata_all |= hasdata;
+        if (!hasdata)
+            return hasdata_all;
+
+        if (pack.ctrl.ctrl_type == Ctrl_Key)
+        {
+            int frame = pack.ctrl.frame;
+            for (int i = 0; i < KeyPackFrameNum; i++)
+            {
+                g_ctrl_bits_rcved[frame - i] = pack.ctrl.keys[i];
+                g_ctrl_rng_rcved[frame - i]  = pack.ctrl.rng_seed[i];
+                g_ctrl_rcved[frame - i]      = pack.ctrl.igc_type[i];
+            }
+        }
+        else if (pack.ctrl.ctrl_type == Ctrl_Try_Resync)
+        {
+            if ((pack.ctrl.resync_setting.frame_to_re_sync > g_netFrame) &&
+                (pack.ctrl.resync_setting.frame_to_re_sync <= g_netFrame + g_delay * 2 + 2))
+            {
+                g_resync_trigger = true;
+                g_resync_stage_frame = pack.ctrl.resync_setting.frame_to_re_sync;
+            }
+        }
+    } while (hasdata);
+    return hasdata_all;
+}
+
+static void SendKeys(int frame)
+{
+    Pack pack;
+    pack.type = 4;
+    pack.ctrl.ctrl_type = Ctrl_Key;
+    pack.ctrl.frame = frame;
+
+    for (int i = 0; i < KeyPackFrameNum; i++)
+    {
+        std::map<int, Bits<16> >::iterator r = g_ctrl_bits_self.find(frame - i);
+        if (r == g_ctrl_bits_self.end()) ReadFromInt(pack.ctrl.keys[i], 0);
+        else                             pack.ctrl.keys[i] = r->second;
+
+        std::map<int, int>::iterator r2 = g_ctrl_rng_self.find(frame - i);
+        pack.ctrl.rng_seed[i] = (r2 == g_ctrl_rng_self.end()) ? 0
+                                                              : (unsigned short)r2->second;
+
+        std::map<int, InGameCtrlType>::iterator r3 = g_ctrl_self.find(frame - i);
+        pack.ctrl.igc_type[i] = (r3 == g_ctrl_self.end()) ? IGC_NONE : r3->second;
+    }
+
+    if (g_is_host) g_host.SendPack(pack);
+    else           g_guest.SendPack(pack);
+}
+
+static unsigned short GetKeys(int frame, bool is_in_UI, int& out_ctrl)
+{
+    InGameCtrlType self_ctrl = IGC_NONE;
+    InGameCtrlType rcv_ctrl  = IGC_NONE;
+    out_ctrl = IGC_NONE;
+
+    if (frame - g_delay < 0)
+        return 0;
+
+    unsigned short self_key = 0;
+    std::map<int, Bits<16> >::iterator res = g_ctrl_bits_self.find(frame - g_delay);
+    if (res != g_ctrl_bits_self.end())
+        WriteToInt(res->second, self_key);
+
+    std::map<int, InGameCtrlType>::iterator res2 = g_ctrl_self.find(frame - g_delay);
+    if (res2 != g_ctrl_self.end())
+        self_ctrl = res2->second;
+
+    unsigned short rcv_key = 0;
+    bool has_rcv_data = false;
+
+    static bool inited = false;
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER cur, ping_key_time, max_wait_to_time;
+    if (!inited) { inited = true; QueryPerformanceFrequency(&freq); }
+    QueryPerformanceCounter(&cur);
+    max_wait_to_time.QuadPart = cur.QuadPart + (LONGLONG)(freq.QuadPart * 5.0);   // 5s lockstep stall
+    ping_key_time.QuadPart    = cur.QuadPart + (LONGLONG)(freq.QuadPart * 0.1);
+
+    do {
+        res = g_ctrl_bits_rcved.find(frame - g_delay);
+        if (res != g_ctrl_bits_rcved.end())
+        {
+            WriteToInt(res->second, rcv_key);
+            g_is_sync = (g_ctrl_rng_rcved[frame - g_delay] == g_ctrl_rng_self[frame - g_delay]);
+            rcv_ctrl = g_ctrl_rcved[frame - g_delay];
+            has_rcv_data = true;
+            break;
+        }
+        else
+        {
+            while (cur.QuadPart < max_wait_to_time.QuadPart)
+            {
+                if (RcvPacks()) { Sleep(1); break; }
+                Sleep(1);
+                QueryPerformanceCounter(&cur);
+                if (cur.QuadPart > ping_key_time.QuadPart)
+                {
+                    ping_key_time.QuadPart = cur.QuadPart + (LONGLONG)(freq.QuadPart * 0.1);
+                    SendKeys(frame);       // re-ping our keys so the peer doesn't lock
+                }
+            }
+        }
+    } while (cur.QuadPart < max_wait_to_time.QuadPart);
+
+    if (!has_rcv_data)
+    {
+        rcv_key = self_key = 0;
+        self_ctrl = rcv_ctrl = IGC_NONE;
+        g_is_connected = false;
+        g_istry_to_reconnect = false;
+    }
+
+    if (self_ctrl != IGC_NONE && rcv_ctrl != IGC_NONE)
+        out_ctrl = g_is_host ? self_ctrl : rcv_ctrl;
+    else
+        out_ctrl = (self_ctrl == IGC_NONE) ? rcv_ctrl : self_ctrl;
+
+    return MergeKeys(g_is_host, is_in_UI, self_key, rcv_key);
+}
+
+// HandleControlKeys equivalent: the core carries no local cheat keys yet.
+// (Protocol slot stays so igc_type round-trips; integration can populate this.)
+static void HandleControlKeys(int frame)
+{
+    g_ctrl_self[frame] = IGC_NONE;
+}
+
+unsigned short Netcode_GetInput_Net(int frame, bool is_in_UI, int& cur_ctrl)
+{
+    g_netFrame = frame;
+
+    if (!g_is_connected)
+    {
+        unsigned short input = g_cb.readLocalInput ? g_cb.readLocalInput() : 0;
+        HandleControlKeys(frame);
+        cur_ctrl = g_ctrl_self[frame];
+        return input;
+    }
+
+    unsigned short btn = g_cb.readLocalInput ? g_cb.readLocalInput() : 0;
+    Bits<16> cur_btn_bits;
+    ReadFromInt(cur_btn_bits, btn);
+    g_ctrl_bits_self[frame] = cur_btn_bits;
+    g_ctrl_rng_self[frame]  = g_cb.readRngSeed ? g_cb.readRngSeed() : 0;
+
+    // erase frames older than 80
+    const int frame_rem = 80;
+    g_ctrl_bits_self.erase(frame - frame_rem);
+    g_ctrl_bits_rcved.erase(frame - frame_rem);
+    g_ctrl_rng_rcved.erase(frame - frame_rem);
+    g_ctrl_rng_self.erase(frame - frame_rem);
+    g_ctrl_rcved.erase(frame - frame_rem);
+    g_ctrl_self.erase(frame - frame_rem);
+
+    HandleControlKeys(frame);
+    SendKeys(frame);
+    RcvPacks();
+
+    return GetKeys(frame, is_in_UI, cur_ctrl);
+}
+
+// ---------------------------------------------------------------------------
+// lifecycle / accessors
+// ---------------------------------------------------------------------------
+void Netcode_SetCallbacks(const NetcodeCallbacks& cb) { g_cb = cb; }
+
+bool Netcode_StartHost(const std::string& bindIp, int port, int family)
+{
+    g_is_host = true;
+    return g_host.Start(bindIp, port, family);
+}
+
+bool Netcode_StartGuest(const std::string& hostIp, int hostPort, int localPort, int family)
+{
+    g_is_host = false;
+    return g_guest.Start(hostIp, hostPort, localPort, family);
+}
+
+void Netcode_SetConnected(bool connected, int delay, unsigned short rngSeedInit)
+{
+    g_is_connected = connected;
+    if (delay > 0) g_delay = delay;
+    g_initSeed = rngSeedInit;
+    g_is_sync = true;
+}
+
+void Netcode_Reset()
+{
+    g_ctrl_bits_self.clear();
+    g_ctrl_bits_rcved.clear();
+    g_ctrl_rng_self.clear();
+    g_ctrl_rng_rcved.clear();
+    g_ctrl_self.clear();
+    g_ctrl_rcved.clear();
+    g_netFrame = 0;
+    g_is_sync = true;
+    g_resync_trigger = false;
+}
+
+bool Netcode_IsConnected()        { return g_is_connected; }
+bool Netcode_IsSync()             { return g_is_sync; }
+bool Netcode_IsHost()             { return g_is_host; }
+int  Netcode_GetDelay()           { return g_delay; }
+unsigned short Netcode_GetInitSeed() { return g_initSeed; }
+
+// test-only hooks (defined here, declared in netcode_internal.hpp)
+void Netcode_TestSetHost(bool h)  { g_is_host = h; }

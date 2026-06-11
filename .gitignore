@@ -1,0 +1,7 @@
+# Generated test artifacts from tests/run_netsim.sh
+build/clean_host.csv
+build/clean_guest.csv
+build/desync_host.csv
+build/desync_guest.csv
+# netsim driver is a build product, not a shipped artifact
+build/netsim.exe

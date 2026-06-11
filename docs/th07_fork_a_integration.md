@@ -1,0 +1,180 @@
+# Fork A — Netcode ↔ th07 integration seams (verified against PCBdecomp.c)
+
+This document pins the exact in-game hook points that wire the engine-agnostic
+netcode core (`src/netplay/`) into th07.exe. Every address/offset/line below was
+read directly out of `PCBdecomp.c` (the Ghidra dump, same db the handoff uses),
+not inferred. It is the concrete recipe the integration DLL needs.
+
+**Binary:** th07.exe ver 1.00b, SHA256 `35467EAF…E80CA` (see handoff §0). All
+addresses are build-specific to this hash.
+
+---
+
+## 1. The replay subsystem is the injection surface
+
+PCB muxes gameplay input through its **replay record/playback** tasks. Two input
+globals (handoff §1):
+
+| Addr | Symbol | Meaning |
+|---|---|---|
+| `0x004b9e4c` | `DAT_004b9e4c` = `g_InputMenu` | raw keyboard poll (menus read this) |
+| `0x004b9e50` | `DAT_004b9e50` = `g_InputGameplay` | **what gameplay reads (low 9 bits)** |
+| `0x004b9e58` | `DAT_004b9e58` = `g_InputGameplayPrev` | previous-frame gameplay (edge detect) |
+| `0x0049fe20` | `DAT_0049fe20` = `g_RngState.seed` (u16) | RNG seed |
+| `0x0049fe24` | `DAT_0049fe24` = `g_RngState.call_counter` (u32) | RNG call counter (desync oracle) |
+| `0x004b9e48` | `DAT_004b9e48` | replay-manager object pointer |
+
+### Mode flags live in `DAT_0062f648`
+- **bit 0x4** (`>>2 & 1`): *recording active* — input is being captured this frame.
+  Set during normal play. This is the gate inside `FUN_00442cd0`.
+- **bit 0x8** (`>>3 & 1`): *playback mode* — reading input from a replay file.
+  Selected at stage load (PCBdecomp.c:18445 / 18465).
+
+**Both netplay machines run in RECORD mode** (bit 0x4 set, bit 0x8 clear), so the
+record task `FUN_00442cd0` runs every logic frame — that is our seam.
+
+---
+
+## 2. `FUN_00442cd0` — ReplayRecord — THE per-frame input injection point
+PCBdecomp.c:27593, `__fastcall(int *param_1)` (ECX = the record task object).
+
+```c
+uVar1 = DAT_004b9e4c;                       // g_InputMenu
+if ((DAT_0062f648 >> 2 & 1) != 0) {         // recording active
+    DAT_004b9e58 = DAT_004b9e50;            // g_InputGameplayPrev = g_InputGameplay
+    DAT_004b9e50 = DAT_004b9e4c;            // *** g_InputGameplay = g_InputMenu  (INJECT HERE) ***
+    if ((*(char *)(DAT_00626274 + 0x25) == '\0') && ((DAT_00575adc >> 3 & 1) == 0)) {
+        ...
+        *param_1 = *param_1 + 1;            // frame counter advances (line 27618)
+    }
+}
+```
+
+**Facts the integration relies on:**
+- `*param_1` (i.e. `param_1[0]`) is the **netcode logic-frame index**. It advances
+  once per *recorded* frame and is paused exactly when a replay would pause
+  (the inner `DAT_00626274+0x25 == 0` gate = "not paused/not in sub-menu"). Use it,
+  NOT the displayed-frame counter `0x0135e1f8` (handoff §1).
+- The write at line 27602 (`DAT_004b9e50 = DAT_004b9e4c`) is unconditional within
+  the recording branch — it runs in stages, the inner pause gate does not affect it.
+
+**Hook recipe (A2, gameplay-only lockstep):**
+```c
+int __fastcall Hook_442cd0(int *self) {
+    int r = orig_442cd0(self);              // runs ZUN's record: g_InputGameplay = g_InputMenu
+    if (Netcode_IsConnected()) {
+        int ctrl = 0;
+        unsigned short merged = Netcode_GetInput_Net(*self /*frame*/, /*is_in_UI=*/false, ctrl);
+        *(volatile uint16_t*)0x004b9e50 = merged;   // override with the lockstep-merged word
+        // g_InputGameplayPrev (0x004b9e58) was already set to last frame's merged value
+        // by ZUN's line 27601, because last frame we wrote merged into 0x004b9e50.
+    }
+    return r;
+}
+```
+- `Netcode_GetInput_Net` does the UDP exchange + 5 s lockstep stall internally
+  (exactly th06's model). Calling it inside the per-frame task is correct.
+- `readLocalInput` callback → read `*(u16*)0x004b9e4c` (g_InputMenu, the raw poll).
+- `readRngSeed`   callback → read `*(u16*)0x0049fe20`.
+
+---
+
+## 3. `FUN_00442c60` — game-start init — THE seed-sync point
+PCBdecomp.c:27578, `__fastcall(int param_1)` (registered as a priority-6 task by
+`FUN_00443aa0` in record mode; see §5).
+
+```c
+*(undefined2 *)(param_1 + 0xd6) = 0;
+*(undefined2 *)(param_1 + 0xd4) = DAT_0049fe20;   // save seed into replay obj +0xd4
+DAT_0049fe24 = 0;                                 // reset RNG call counter
+if (DAT_0062f640 != 0)                             // 2-player/PVP start flag
+    *(ushort *)(param_1 + 0xd6) |= 0x100;
+DAT_0062f640 = 0;
+```
+
+This runs once at game/stage start and **reads `DAT_0049fe20`** (the seed) to snapshot
+it, then zeroes the counter. To make both machines deterministic from the same seed:
+
+**Hook recipe (seed sync):**
+```c
+int __fastcall Hook_442c60(int self) {
+    if (Netcode_IsConnected())
+        *(volatile uint16_t*)0x0049fe20 = Netcode_GetInitSeed();  // host-chosen seed
+    return orig_442c60(self);   // saves the (now forced) seed, zeroes counter
+}
+```
+The host picks the seed and sends it in `CtrlPack.init_setting.rng_seed_init`
+(already wired in `Connection.hpp`); both call `Netcode_SetConnected(true, delay, seed)`
+so `Netcode_GetInitSeed()` returns the same value on both ends.
+
+**Cross-check — the existing replay seed-restore** (PCBdecomp.c:27909, inside the
+playback-load path): `DAT_0049fe20 = *(undefined2 *)(iVar1 + 0x20);` — ZUN restores
+the seed from replay-file offset +0x20 on playback. Our seed-force mirrors this exact
+mechanism; it is known-safe because the engine already supports externally-supplied
+seeds.
+
+---
+
+## 4. `FUN_00442ee0` — ReplayPlayback (reference only)
+PCBdecomp.c:27648. Feeds `DAT_004b9e50` from the replay buffer
+(`DAT_004b9e50 = *(short *)param_1[0x21]`) and advances `*param_1`. Not hooked for
+netplay (we are always in record mode), but it documents the symmetric read side —
+useful if a future "spectator"/replay-of-netgame feature is wanted.
+
+---
+
+## 5. `FUN_00443aa0` — replay-manager setup (how the tasks get registered)
+PCBdecomp.c:27950, `__fastcall(int param_1, undefined4 param_2)`. `param_1` selects mode:
+
+- **`param_1 == 0` (RECORD):** registers `FUN_00442cd0` (per-frame record) at
+  `mgr+0xc4`, and `FUN_00442c60` (start init) at `mgr+0xd0`, priority 6.
+- **`param_1 == 1` (PLAYBACK):** registers `FUN_00442ee0` + `FUN_00442e50`.
+
+Manager object = `DAT_004b9e48` (`operator_new(0xd8)`); it stores the frame-counter
+task at `+0xc4`. Called from the stage-load function at PCBdecomp.c:18447 (playback)
+and 18466 (record). The "random seed %d %d" log is at 18492 — a convenient breakpoint
+to confirm the seed actually took on both machines.
+
+**Implication for hooking:** because the per-frame counter `*param_1` resets each new
+game (the task object is re-`new`'d), the DLL should call `Netcode_Reset()` when it
+detects the frame index jump backwards / a fresh `DAT_004b9e48`. (th06 mod does the
+analogous reset on `calcCount` reset — handoff §2 "On new game it detects calcCount
+reset and clears the rcved maps".)
+
+---
+
+## 6. Open: menu lockstep (Fork A1 vs A2)
+
+`FUN_00442cd0` only runs **in-stage**, so the §2 hook locksteps gameplay but NOT the
+pre-stage menus (char/difficulty select). Two options (handoff §3b Fork A):
+
+- **A2 (minimal, recommended first):** lockstep gameplay only (§2 hook) + force the
+  seed (§3 hook). Players coordinate char/difficulty manually. Smallest surface;
+  enough to validate the whole lockstep premise end-to-end in a real stage.
+- **A1 (clean):** also hook an *always-runs* per-logic-frame seam and overwrite
+  `g_InputMenu` (0x004b9e4c) with the merged word (`is_in_UI=true` → `self|rcv`), so
+  menus navigate together. The handoff names GameUpdate `FUN_0042fd60` for this, but
+  **that exact symbol is not present in this dump** — it must be re-resolved (likely a
+  thunk/inlined or a different label). TODO for a future session: find the function the
+  frame governor `FUN_004346e0` calls once per logic frame and hook there. Until then,
+  A2 is the path.
+
+---
+
+## 7. Integration checklist (for the DLL that ports the netcode in)
+
+1. On attach: read role/peer/port/delay from a config file (stand-in for the
+   ConnectionUI in `reference/`), `Netcode_StartHost/Guest`, set callbacks
+   (`readLocalInput`→0x4b9e4c, `readRngSeed`→0x49fe20).
+2. Handshake → `Netcode_SetConnected(true, delay, seed)` (host picks seed).
+3. MinHook `FUN_00442cd0` (0x00442cd0) — §2 input injection.
+4. MinHook `FUN_00442c60` (0x00442c60) — §3 seed sync.
+5. Detect new-game (frame index reset / new `DAT_004b9e48`) → `Netcode_Reset()`.
+6. (A1, later) hook the once-per-logic-frame seam for menu lockstep.
+7. Fork B (P2 entity, `src/coop/coop.c`) is independent and already drives a second
+   player off high-bit input; once the netcode feeds high bits into 0x4b9e50, the two
+   forks meet. NOTE: coop.c currently reads its own local keyboard for P2
+   (`ReadP2InputLocal`); under netplay that source is replaced by the merged word's
+   high bits.
+
+All hook addresses verified present in PCBdecomp.c at the lines cited above.

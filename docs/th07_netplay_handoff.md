@@ -407,10 +407,19 @@ needed), and the netcode lockstep core is verified end-to-end.**
   base `0x4bdad8`, collision fns `0x43e260`/`0x43e6b0`, res ptr `0x626278`, etc. — all
   present and consistent. No constant bugs found. `coop.c`'s struct offsets are also
   empirically validated by its successful runtime log (P2 spawns/updates/draws).
-- **Observation for a future session:** in the last `build/coop_log.txt`, P2 spawns in
-  **state 3 (respawn-invuln) and never leaves it** (the tail is all "P2 draw st=3").
-  Worth checking whether P2 cloned mid-invuln and is stuck non-interactive, or if the
-  state machine just isn't advancing for the piggyback clone. Needs the game to debug.
+- **Observation (re-verify before chasing):** the committed `build/coop_log.txt` is from
+  an OLDER, more-instrumented `coop.c` than the one committed (it logs "P2 draw PRE
+  st=3", "update call #N" — lines the current `coop.c` does not emit). In that stale
+  log P2 sits in **state 3 (respawn-invuln)** in the tail. Before debugging, reproduce
+  with the *current* build. Map data gathered for that hunt: the player's per-frame
+  **state processor is `FUN_00441330` (0x00441330)**, `__fastcall(player)`, called
+  unconditionally from the player update `FUN_00441fb0` (line 27224). Its state-3→0
+  transition (PCBdecomp.c:26875–26888) is **param-relative** — it fires when the invuln
+  counter `player+0x16a08` drops below 1, and that counter is advanced param-relative
+  too (`FUN_0043958d(player+0x16a08,…)` @26957). So the countdown *logic* supports a P2
+  clone; if P2 still doesn't advance, the thing to check is whether
+  `FUN_00441fb0`'s sub-calls actually pass `ECX = P2` (vs. reloading the P1 static base
+  `0x4bdad8`) — that needs the disassembly, not the decomp (ECX is hidden in the C).
 
 ### ⚠️ BLOCKER for whoever runs next: git push was DENIED this session.
 `git push` to the proxy returns **403 "Permission to baclo-san/PCB-Coop.git denied"**,

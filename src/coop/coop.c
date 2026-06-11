@@ -50,6 +50,14 @@
  *   P2 is live (factor = 1 + P2-present); F5 toggles off. Scales all enemies
  *   (TTK-neutral for popcorn, correct for bosses). See docs/th07_boss_hp_scaling.md.
  *
+ * SHARED TEAM BORDER (user decision): in PCB bombing IS activating the cherry
+ *   border. We give the team ONE border: P2's bomb starts the border on P1 (the
+ *   single Cherry+ gauge), spending one of P2's bombs only when it actually starts
+ *   a border (free while one is already active, per PCB); P2's own bomb input is
+ *   masked so it can't start a second border that would clobber the gauge. Both
+ *   players are invulnerable while the border is up (P2 collision is skipped while
+ *   P1 is in border state 4). F4 toggles. See docs/th07_cherry_determinism.md §0.
+ *
  * Controls (in-stage):
  *   F9  = spawn P2 (clone of P1, offset +24px X). Only when a char is loaded.
  *   F10 = despawn P2 (stop piggyback + free).
@@ -57,6 +65,7 @@
  *   F7  = toggle P2 shot damage (default ON).
  *   F6  = toggle P2 separate resources (default ON).
  *   F5  = toggle boss/enemy HP scaling (default ON).
+ *   F4  = toggle shared team border (default ON).
  *   F11 = revive P2 out of ghost mode (debug stand-in for the proximity/graze
  *         resurrection trigger; grants a life if needed, drops P2 into the
  *         respawn-invuln state next to P1).
@@ -106,6 +115,10 @@
  * caller of the overlap test. We bracket it to undo any P2-collected resource
  * swap that the last collected item left in place. */
 #define ADDR_ITEM_LOOP ((LPVOID)0x00432990)
+/* Border-start = the "bomb": FUN_00441960 __fastcall(player) sets state 4 + inits
+ * the border timer. In PCB, bombing IS activating the supernatural border. We CALL
+ * this directly (not hook it) to start the single TEAM border on P1 when P2 bombs. */
+#define ADDR_BORDER_START 0x00441960u
 
 /* Tier-1 boss/enemy HP scaling. The per-phase max-life cap is (re)written once
  * per phase by the "set life" opcode inside the per-enemy ECL command
@@ -126,6 +139,7 @@ typedef int (__fastcall *CollideLaserFn_t )(void *self, void *edx,
 typedef int (__fastcall *CollectOverlapFn_t)(void *self, void *edx,
                                              float *pos, float *size);
 typedef void (__fastcall *ItemLoopFn_t)(void *self);
+typedef void (__fastcall *BorderStartFn_t)(void *self);
 
 /* ---- separate resources (lives/bombs/power) ----
  * They live in the struct at *(player+8) == DAT_00626278, stored as floats, and
@@ -187,7 +201,7 @@ static ItemLoopFn_t      s_origItemLoop       = NULL;
 static volatile void *s_p2   = NULL;   /* P2 object base, NULL until spawned     */
 static int   s_p2Killable = 1;         /* on by default; F8 toggles              */
 static unsigned char s_p2PrevState = 0;/* for death-transition logging           */
-static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0, s_prevF5 = 0;
+static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0, s_prevF5 = 0, s_prevF4 = 0;
 
 /* P2's own LIVES + BOMBS + POWER, field-swapped into the shared struct around P2's
  * update; ZUN's anti-tamper checksum is re-healed afterward (see the heal below).
@@ -208,6 +222,13 @@ static int   s_p2Ghost = 0;
  * only takes effect while P2 is live (factor = 1 + (s_p2 != NULL)). F5 toggles. */
 static int   s_bossHpScale = 1;
 static int   s_bossScaleLogged = 0;
+
+/* SHARED TEAM BORDER: P2's bomb activates ONE border on P1 (one gauge, both
+ * players protected); P2's own bomb is masked so it can't start a second border.
+ * On by default; F4 toggles. Only active alongside separate resources (P2's own
+ * bomb count). Known limitation: P2 can't deathbomb while this is on. */
+static int   s_p2TeamBorder = 1;
+static int   s_p2BombPrev = 0;
 
 static FILE *s_log = NULL;
 static char  s_dir[MAX_PATH];
@@ -353,6 +374,7 @@ static void PollHotkeys(void)
     int f7  = (GetAsyncKeyState(VK_F7)  & 0x8000) != 0;
     int f6  = (GetAsyncKeyState(VK_F6)  & 0x8000) != 0;
     int f5  = (GetAsyncKeyState(VK_F5)  & 0x8000) != 0;
+    int f4  = (GetAsyncKeyState(VK_F4)  & 0x8000) != 0;
     int f11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     if (f9  && !s_prevF9)  { Log("F9 edge detected");  SpawnP2(); }
     if (f10 && !s_prevF10) { Log("F10 edge detected"); DespawnP2(); }
@@ -360,6 +382,7 @@ static void PollHotkeys(void)
     if (f7  && !s_prevF7)  { s_shotXfer = !s_shotXfer; Log("shot xfer %s", s_shotXfer ? "ON" : "OFF"); }
     if (f6  && !s_prevF6)  { s_p2SepRes = !s_p2SepRes; Log("P2 separate-resources %s", s_p2SepRes ? "ON" : "OFF"); }
     if (f5  && !s_prevF5)  { s_bossHpScale = !s_bossHpScale; Log("boss/enemy HP scaling %s", s_bossHpScale ? "ON" : "OFF"); }
+    if (f4  && !s_prevF4)  { s_p2TeamBorder = !s_p2TeamBorder; Log("P2 team-border %s", s_p2TeamBorder ? "ON" : "OFF"); }
     if (f11 && !s_prevF11) { Log("F11 edge detected"); ReviveP2(); }
     s_prevF9  = f9;
     s_prevF10 = f10;
@@ -367,6 +390,7 @@ static void PollHotkeys(void)
     s_prevF7  = f7;
     s_prevF6  = f6;
     s_prevF5  = f5;
+    s_prevF4  = f4;
     s_prevF11 = f11;
 }
 
@@ -381,7 +405,9 @@ static int __fastcall HookedCollideBullet(void *self, void *edx, float *pos, flo
 {
     int r = s_origCollideBullet(self, edx, pos, size);   /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost)
+    /* P2 is invulnerable while the team border is up (P1 in state 4). */
+    if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost &&
+        *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE) != 4)
         s_origCollideBullet(p2, edx, pos, size);          /* P2 — param-relative */
     return r;
 }
@@ -391,7 +417,8 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
 {
     int r = s_origCollideLaser(self, edx, a, b, c, d, e); /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost)
+    if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost &&
+        *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE) != 4)
         s_origCollideLaser(p2, edx, a, b, c, d, e);        /* P2 */
     return r;
 }
@@ -526,6 +553,29 @@ static int __fastcall HookedUpdate(void *self)
             if (p2in && !s_p2InputLogged) { Log("P2 input read OK: 0x%03x (key path works)", p2in); s_p2InputLogged = 1; }
             if (s_p2Ghost) p2in &= ~(IN_SHOOT | IN_BOMB);  /* a ghost only wanders */
 
+            /* TEAM BORDER: P2's bomb starts the single border on P1 (one gauge,
+             * both players protected — P2 invuln via the collision detours while
+             * P1 is in border state 4).
+             *   Bomb COST follows PCB: a bomb is spent ONLY to START a border (here
+             *   gated on P1 state 0). Pressing bomb while a border is already active
+             *   is FREE in PCB — so we must NOT charge it; with our state-0 gate that
+             *   case is simply a no-op for P2 (no spend, no extra clear — a refinement
+             *   to add later).
+             * We MASK P2's bomb so its own update can't start a second,
+             * gauge-clobbering border. Needs separate resources (P2's own bomb
+             * count). NOTE: P2 can't deathbomb while this is on — known limitation. */
+            if (s_p2TeamBorder && s_p2SepRes && !s_p2Ghost) {
+                int p2bomb = (p2in & IN_BOMB) != 0;
+                if (p2bomb && !s_p2BombPrev && (int)s_p2Bombs >= 1 &&
+                    *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE) == 0) {
+                    s_p2Bombs -= 1.0f;
+                    ((BorderStartFn_t)ADDR_BORDER_START)((void *)ADDR_PLAYER_BASE);
+                    Log("P2 bomb -> TEAM border on P1 (P2 bombs now %.0f)", s_p2Bombs);
+                }
+                s_p2BombPrev = p2bomb;
+                p2in &= ~IN_BOMB;              /* P2 never starts its own border */
+            }
+
             *ADDR_INPUT_GAMEPLAY = p2in;
 
             /* FIELD-SWAP P2's own LIVES + BOMBS + POWER into the shared struct for
@@ -627,7 +677,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         { char *s = strrchr(s_dir, '\\'); if (s) s[1] = '\0'; }
         { char p[MAX_PATH]; snprintf(p, sizeof(p), "%scoop_log.txt", s_dir); s_log = fopen(p, "w"); }
         Log("th07_coop attached. AUTO-spawn P2 ~3s. P2: IJKL move, Space shot, U focus, O bomb. "
-            "F5=boss-HP-scale, F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, F11=revive.");
+            "F4=team-border, F5=boss-HP-scale, F6=sep-resources, F7=shot-damage, F8=killable, "
+            "F9=spawn, F10=despawn, F11=revive.");
         if (!InstallHooks())
             MessageBoxA(NULL, "th07_coop: hook install failed (wrong build/addresses?)",
                         "th07_coop", MB_ICONERROR);

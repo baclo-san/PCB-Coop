@@ -49,14 +49,24 @@ update, so **P2 already bombs/borders independently** off its own (separate) bom
 `DAT_0062f890` from the *per-player* timer — so P2's border clobbers P1's gauge.
 
 ⇒ "Shared border" is a **design fork**, not just a clobber to patch, because the
-border is per-player bombing but the gauge is one global. Options (await user):
-- **(A) P2's bomb triggers ONE team border** — both players get invuln + bullet
-  clear, one gauge. Most faithful; needs routing P2's trigger to a single border
-  (P1-owned) + mirroring border invuln onto P2.
-- **(B) Independent borders, gauge follows P1** — least work (snapshot/restore
-  `DAT_0062f890` around P2's update); but the meter is wrong when only P2 borders.
-- **(C) Full per-player borders** — second gauge global + HUD (user leaned away
-  from this earlier as trivializing).
+border is per-player bombing but the gauge is one global.
+
+> **DECIDED (user): option A — ONE team border. IMPLEMENTED in coop.c (F4),
+> compile + injection smoke-tested; needs in-game play test.** P2's bomb edge calls
+> the border-start `FUN_00441960` on **P1** (the single Cherry+ gauge); P2's own
+> bomb input is masked so it can't start a second border; P2 is invulnerable while
+> P1 is in border state 4 (the collision detours skip P2 then).
+>
+> **Bomb COST rule (user, verified gameplay): a bomb is spent only to START a
+> border; bombing while a border is already active is FREE.** coop.c honours this —
+> it only spends one of P2's bombs (and only triggers) when P1 is in state 0; a P2
+> bomb during an active border is a no-op (no spend). Known gaps to refine:
+> (1) P2 gets no free *re-clear* when bombing inside an active border; (2) P2 can't
+> deathbomb while team-border is on.
+>
+> Rejected: (B) independent borders + gauge-follows-P1 (meter wrong when only P2
+> borders); (C) full per-player borders + 2nd HUD (user: trivializing).
+
 Determinism is unaffected in all cases (cherry globals are lockstep sim state).
 
 ---

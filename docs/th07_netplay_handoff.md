@@ -449,13 +449,21 @@ this transcript. First action next session: verify write access, then `git push`
   toggle. Builds clean, 32-bit. **Not game-tested** (see the doc's status).
 - Build now completes all targets again (the stderr-warning abort is gone with
   the warning fixed).
-- **Per-player cherry — design decided + groundwork laid.** Verified the cherry
-  model and re-framed determinism (lockstep makes the shared `+0x88` cherry
-  auto-identical on both ends, so keeping the gameplay cherry shared is safe by
-  construction; "separate counts" is a display attribution layer). Corrected
-  `FUN_0043e4e0`'s label (it's the player-area overlap test, not the collect
-  logic). **Implemented step 1: P2 now collects items it overlaps** (detour
-  `FUN_0043e4e0`, ECX=P2; credit shared for now). Plan + caveats in cherry doc §6.
+- **Per-player cherry — design decided + RE done.** Re-framed determinism
+  (lockstep makes all cherry globals auto-identical on both ends, so keeping the
+  gameplay cherry shared is safe by construction). Corrected `FUN_0043e4e0`'s label
+  (player-area overlap test, not the collect logic) and **implemented step 1: P2
+  now collects items it overlaps** (`HookedCollectOverlap`, ECX=P2; credit shared).
+- **Cherry model corrected to THREE values** (user domain knowledge, verified):
+  Cherry (`DAT_0062f88c`, point value + roll), CherryMax (`DAT_0062f888`), **Cherry+
+  (`DAT_0062f890`, the border)** — each a delta from base `*(0x626278+0x88)`. The
+  border is Cherry+, recomputed each frame during state 4 from the *per-player*
+  border timer (`FUN_00441330`:26914) — so P2's piggyback clobbers it; "shared
+  border" needs `DAT_0062f890` reconciliation. Mapped the item-collect credit path
+  (`docs/th07_item_collect_credit.md`): power/bombs/1up/points all to the shared
+  pool; cherry is NOT credited by collection. ⇒ **separate power/bombs is
+  implementable now**; separate cherry display + shared border need the cherry-gain
+  trace + the `DAT_0062f890` fix.
 
 ### Updated next steps
 > **User directive (2026-06-11): postpone all *manual netplay* testing until the
@@ -470,16 +478,20 @@ this transcript. First action next session: verify write access, then `git push`
 2. **Game-side: investigate the P2 state-3 observation** (handoff §5b) with the
    *current* build — does P2 advance through respawn-invuln? This gates revive
    and the auto-resurrection trigger feeling right.
-3. **Game-side: per-player cherry** (Tier-2, `docs/th07_cherry_determinism.md`).
-   **DECIDED (user, 2026-06-11): separate counts per player, SHARED border.** This
-   is determinism-safe by construction — the gameplay cherry `+0x88` (drives the
-   roll AND the border) stays the shared lockstep value, untouched; "separate
-   counts" is a display attribution layer. Prerequisite **P2 item collection is
-   DONE** (`HookedCollectOverlap` detours `FUN_0043e4e0`, ECX=P2). **Remaining:**
-   per-player *attribution* — detour the collect caller (item-update loop @ ~20435)
-   to credit P1's vs P2's overlap branch separately + a P2 cherry HUD. The collect
-   loop is decompiled ambiguously, so this step likely needs the th07.exe
-   **disassembly** (the binary isn't in-repo). Plan + caveats in cherry doc §6.
+3. **Game-side: separate resources / cherry** (Tier-2). **DECIDED (user): separate
+   counts per player, SHARED border.** Determinism-safe by construction (all cherry
+   globals are lockstep sim state). Split into two now-distinct sub-tasks:
+   - **3a. Separate power/bombs — implementable now** (collect-credit map is done,
+     `docs/th07_item_collect_credit.md`). Set a collector flag in
+     `HookedCollectOverlap` (P1 vs P2 overlap), detour the credit accessors
+     (`FUN_004325e0` power, `FUN_0042d612` bomb) and field-swap+heal P2's value when
+     P2 collected. Mind the anti-tamper guard — a local (non-netplay) smoke test is
+     the cheap de-risk. This is what makes "P2 power separate" actually true.
+   - **3b. Separate cherry display + shared border — needs more RE.** Cherry is the
+     three-value model (cherry doc §0); it is NOT credited by item collection, so
+     attribution needs tracing the cherry-*gain* path (`DAT_0062fXXX` moves). AND the
+     **shared border** needs reconciling `DAT_0062f890` (Cherry+) around P2's update,
+     which currently clobbers it (cherry doc §0). + a P2 cherry HUD.
 4. **Game-side: auto-resurrection trigger** — replace the F11 stand-in with the
    th06 mechanic (hold focus + release shot near the ghost for ~90 frames → spend
    a life). The `+0xb7e68` spirit ptr + state 2/3 are the hooks (player-struct doc).

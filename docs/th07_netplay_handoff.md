@@ -429,19 +429,54 @@ The work above is committed **locally** on `claude/optimistic-brown-xe5tz6` but 
 not be pushed — if the container was reclaimed before a human re-pushed, recover from
 this transcript. First action next session: verify write access, then `git push`.
 
+## 5c. Session progress — 2026-06-11 (continued)
+
+- **Recovered the working tree.** Found an interrupted interactive rebase whose
+  `exec git commit --amend --no-edit -S` step was re-signing every commit — but
+  no GPG key/`commit.gpgsign` is configured, so it could never succeed and had
+  stalled. Branch was fully synced to origin, so the re-sign pass was both
+  doomed and unnecessary; aborted it (nothing lost). No commits should be
+  `-S`-signed unless a key is actually configured.
+- **Finished the dangling `nightwork` feature.** That commit added `ReviveP2()`
+  and an `s_prevF11` edge-tracker but never wired them (dead code + a
+  `-Wunused-variable` that, on stderr, tripped `build.ps1`'s `Stop` pref and
+  aborted the build). Wired **F11 → ReviveP2** (exit ghost, grant a life if at 0,
+  drop into respawn-invuln next to P1). This is the manual/debug trigger for the
+  th06-style resurrection; the proximity+graze auto-trigger replaces it later.
+- **Tier-1 boss/enemy HP scaling — IMPLEMENTED** in `coop.c` (`HookedEclInterp`
+  on `FUN_00424290`, Option A from the boss-HP doc). Scales `+0xd30` by the
+  active player count (`1 + P2-present`), auto-armed while P2 is live, F5 to
+  toggle. Builds clean, 32-bit. **Not game-tested** (see the doc's status).
+- Build now completes all targets again (the stderr-warning abort is gone with
+  the warning fixed).
+
 ### Updated next steps
-1. **Game-test `th07_coop_net.dll`** (A2): inject into two th07.exe instances with
-   matching `coop_net.ini` (one host, one guest, same delay+seed), reach a stage, and
-   confirm both see the merged input + the RNG counter `0x0049fe24` stays locked. This
-   is the live proof of the determinism premise (supersedes the old record/replay-diff
-   plan — the netsim test already proved the lockstep logic in isolation).
-2. **Resolve the A1 menu-lockstep seam** (once-per-logic-frame hook) so char/difficulty
-   select syncs; until then coordinate menus manually.
-3. **Real seed handshake**: host sends `Ctrl_Set_InitSetting.rng_seed_init`; guest
+> **User directive (2026-06-11): postpone all *manual netplay* testing until the
+> game side is finished.** So step 1 below is parked — proceed through the
+> game-side items (2–6) first, then run the two-instance live test.
+
+1. ⏸ *(parked per user)* **Game-test `th07_coop_net.dll`** (A2): inject into two
+   th07.exe instances with matching `coop_net.ini` (one host, one guest, same
+   delay+seed), reach a stage, confirm both see the merged input + the RNG
+   counter `0x0049fe24` stays locked. The netsim test already proved the lockstep
+   logic in isolation; this is the live determinism proof, deferred to last.
+2. **Game-side: investigate the P2 state-3 observation** (handoff §5b) with the
+   *current* build — does P2 advance through respawn-invuln? This gates revive
+   and the auto-resurrection trigger feeling right.
+3. **Game-side: per-player cherry** (Tier-2, `docs/th07_cherry_determinism.md`) —
+   the RNG-coupled one; do it carefully (shared item-drop roll stays deterministic).
+4. **Game-side: auto-resurrection trigger** — replace the F11 stand-in with the
+   th06 mechanic (hold focus + release shot near the ghost for ~90 frames → spend
+   a life). The `+0xb7e68` spirit ptr + state 2/3 are the hooks (player-struct doc).
+5. **Resolve the A1 menu-lockstep seam** (once-per-logic-frame hook) so
+   char/difficulty select syncs; `GameUpdate FUN_0042fd60` is absent under that
+   label in this dump — find what `FrameGovernor FUN_004346e0` calls once per
+   logic frame. (RE work, no live netplay needed.)
+6. **Real seed handshake**: host sends `Ctrl_Set_InitSetting.rng_seed_init`; guest
    adopts it (today both read the seed from config).
-4. **Merge Fork A + Fork B**: feed the merged word's high bits to `coop.c`'s P2 (it
-   currently reads a local keyboard); investigate the P2 state-3 observation above.
-5. **Tier 1 boss HP**: implement the `FUN_00424290` detour from the boss-HP doc.
+7. **Merge Fork A + Fork B**: feed the merged word's high bits to `coop.c`'s P2
+   (it currently reads a local keyboard) — then do step 1.
+8. ✅ ~~**Tier 1 boss HP**: implement the `FUN_00424290` detour.~~ Done (§5c).
 
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)

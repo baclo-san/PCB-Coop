@@ -64,8 +64,11 @@ isn't game-tested yet.
 ## Status (2026-06-11)
 - ✅ Netcode core: built + unit-tested + **lockstep verified end-to-end** (`netsim`).
 - ✅ Determinism harness + injector: built, smoke-tested in-game.
-- ✅ Fork B (P2 entity): substantial — spawns, killable, separate bombs/power, ghost mode.
+- ✅ Fork B (P2 entity): substantial — spawns, killable, separate bombs/power, ghost
+  mode, F11 revive-from-ghost (debug stand-in for proximity/graze resurrection).
+- 🟡 Tier-1 boss/enemy HP scaling: implemented in `coop.c` (scales with player count,
+  F5 toggle), **compile-verified, not yet game-tested** (`docs/th07_boss_hp_scaling.md`).
 - 🟡 Fork A (netcode↔game wiring): integration DLL written + compile-verified, **not yet
   game-tested**. Seams are pinned (`docs/th07_fork_a_integration.md`).
 - ⬜ Menu lockstep (A1), real seed handshake (needs ConnectionUI port), per-player
-  cherry/lives, boss-HP scaling, 3-player. See the handoff §5 next-steps.
+  cherry/lives, auto-resurrection trigger, 3-player. See the handoff §5 next-steps.

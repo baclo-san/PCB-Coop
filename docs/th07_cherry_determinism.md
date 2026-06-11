@@ -39,33 +39,73 @@ value = `<global> − cherry_base`; the HUD draws all three this way (PCBdecomp.
 - **Item collection adds to NO cherry value** — it only *reads* Cherry to scale
   point items. See `docs/th07_item_collect_credit.md`.
 
-### ⚠️ Co-op implication for the SHARED-border decision (border = bombing)
-**In PCB, bombing IS activating the border.** Border-*start* = `FUN_00441960`
-(state→4, inits the per-player border timer `+0x16a08`=0x21c / duration `+0x16a14`),
-called from **`FUN_004409f0`**, which reads the **bomb bit of `g_InputGameplay`**
-(`DAT_004b9e50 & 2`). coop.c swaps `g_InputGameplay` to P2's input during P2's
-update, so **P2 already bombs/borders independently** off its own (separate) bombs.
-`FUN_00441330` (state-4 handler) then recomputes the **single global gauge**
-`DAT_0062f890` from the *per-player* timer — so P2's border clobbers P1's gauge.
+### ⚠️ Co-op implication for the SHARED-border decision (border ≠ bombing — CORRECTED)
+**The cherry border and the spell-card bomb are TWO SEPARATE systems** (user, verified
+in-binary 2026-06-11). An earlier note here wrongly claimed "bombing IS the border" —
+it is not:
 
-⇒ "Shared border" is a **design fork**, not just a clobber to patch, because the
-border is per-player bombing but the gauge is one global.
+- **Cherry border = AUTOMATIC, FREE.** When the shared Cherry+ value (`+0x9620` on the
+  score struct) reaches `cherry_base + 50000`, `FUN_0042f5a2` clamps it and calls the
+  border-start `FUN_00441960` directly (`PCBdecomp.c:18655`; also the load-with-full-gauge
+  case at `:27439`). No bomb bit, no bomb stock — just the gauge hitting max. Border-start
+  sets state→4 and the per-player border timer `+0x16a08`=0x21c / duration `+0x16a14`.
+- **Spell-card bomb = separate.** Pressing bomb runs the `+0x16a20` "bombing" path in
+  `FUN_004409f0` (`:26676`); it never starts a border. **No bombs are ever spent by the
+  cherry border.**
+- **Pressing bomb DURING the border pops it early** (vanilla): in state 4, `FUN_004409f0`
+  takes the break branch → `FUN_00441bd0` (`:26720`) — no spell card, no bomb spent, just
+  ends the border with no bonus.
+- **Getting hit DURING the border pops it early** (vanilla): the collision primitives
+  `FUN_0043e260`/`FUN_0043e6b0` see state 4 and call `FUN_00441bd0` param-relative
+  (`:26003`/`:26125`) instead of the death path — break, not death.
+- **Timeout ends + banks:** `FUN_00441330` state-4 calls `FUN_00441670` when `+0x16a08`<1
+  → banks `(Cherry)·10` to score and resets `DAT_0062f890` to base (`:26971`/`:26974`).
+  `FUN_00441330` also recomputes the single global gauge `DAT_0062f890` from the
+  *per-player* timer each frame during state 4 — so two players each in state 4 must run
+  identical timers or the gauge fights.
 
-> **DECIDED (user): option A — ONE team border. IMPLEMENTED in coop.c (F4),
-> compile + injection smoke-tested; needs in-game play test.** P2's bomb edge calls
-> the border-start `FUN_00441960` on **P1** (the single Cherry+ gauge); P2's own
-> bomb input is masked so it can't start a second border; P2 is invulnerable while
-> P1 is in border state 4 (the collision detours skip P2 then).
+#### Two constraints discovered when the naive "two real borders" version was play-tested
+1. **The border ring is a SINGLE fixed effect slot.** `FUN_00441960` spawns the ring via
+   `FUN_0041c610(0x1c, pos, 4, …)`, and `FUN_0041c610` computes the slot as
+   `base + 0x1c + (4+400)*0x2d8` (`PCBdecomp.c:10882`) — **index 404 is hardcoded for the
+   border ring**. So running `FUN_00441960` a second time for P2 re-grabs slot 404 and
+   *steals P1's ring*: only one ring can exist, and whichever player updates last (P2)
+   owns its position → "ring only on P2" bug.
+2. **`FUN_00441bd0` is `__thiscall(player, int flag)` with `ret 4`** (prologue
+   `mov [ebp-0x24],ecx`; epilogue `ret 0x0004`, verified in the binary). The `(0)`/`(1)`
+   at its call sites are the real stack flag, not Ghidra noise. Calling it as ECX-only
+   over-pops the stack by 4 → crash (was the "P2 hit crashes" symptom). `FUN_00441960`
+   and `FUN_00441670` are plain `ret` (ECX-only), so those are fine.
+
+> **DECIDED (user): option A — ONE synced team border. IMPLEMENTED in coop.c (F4),
+> builds clean; needs in-game play test.** Because of constraint (1), P2 does NOT get its
+> own ZUN border. **P1 runs the one real, fully-vanilla border** (ring + gauge + bonus,
+> auto-triggered, no bomb involvement). **P2 rides along in a ringless "shadow" border:**
+> `UpdateTeamBorder` (polled each frame, just before P2's update) sets P2's state to 4 +
+> the border-active flag `0x240d`=1 + copies P1's six border-timer dwords (`0x16a00..14`),
+> but leaves P2's ring ptr `0xb7e6c`=0 so P1 keeps the single ring (it follows P1). P2 is
+> then genuinely in state 4, so it is invincible AND ZUN's own collision
+> (`FUN_0043e260/6b0`) + bomb handler (`FUN_004409f0`) pop the border on a hit / bomb
+> exactly like P1 (no death, no spell, no bomb spent). We hook ONLY the break leaf
+> `FUN_00441bd0` (correct `__thiscall(player,int flag)` signature, flag forwarded) to
+> propagate a pop by either player to the other → one team border ends for both.
+> - **Timeout:** P1 ends in its own update first; the poll then retires P2's shadow
+>   (state→3, no bank) before P2's update reaches the bank — so it banks once. (User:
+>   double-bank would also be acceptable as long as it doesn't break sync.)
+> - **P2's bomb is NOT masked** — outside the border it casts a normal spell card (spends
+>   P2's own bomb); during the border `0x240d`=1 routes it to the pop path instead.
+> - **P2's collision runs while bordered** (`P2CollisionSkipped` only skips P2 when P1 is
+>   bordered and P2 is *not*, e.g. respawning), so a hit on P2 pops the team border.
 >
-> **Bomb COST rule (user, verified gameplay): a bomb is spent only to START a
-> border; bombing while a border is already active is FREE.** coop.c honours this —
-> it only spends one of P2's bombs (and only triggers) when P1 is in state 0; a P2
-> bomb during an active border is a no-op (no spend). Known gaps to refine:
-> (1) P2 gets no free *re-clear* when bombing inside an active border; (2) P2 can't
-> deathbomb while team-border is on.
+> Superseded attempts: (i) P2's bomb *starts* a border and *spends a bomb* — wrong, the
+> cherry border is automatic and free; (ii) mirror `FUN_00441960` onto P2 for a second
+> real border — broke on the single ring slot (1) and the wrong `FUN_00441bd0` signature
+> (2). Known cosmetic gap: only P1 shows the ring (engine has one). A second visible ring
+> would need spawning a type-0x1c effect in a free player-effect slot (5–7) via the
+> effect-manager pointer — more RE; deferred.
 >
-> Rejected: (B) independent borders + gauge-follows-P1 (meter wrong when only P2
-> borders); (C) full per-player borders + 2nd HUD (user: trivializing).
+> Rejected earlier: (B) independent borders + gauge-follows-P1; (C) full per-player
+> borders + 2nd HUD (user: trivializing).
 
 Determinism is unaffected in all cases (cherry globals are lockstep sim state).
 

@@ -514,6 +514,36 @@ this transcript. First action next session: verify write access, then `git push`
    (it currently reads a local keyboard) — then do step 1.
 8. ✅ ~~**Tier 1 boss HP**: implement the `FUN_00424290` detour.~~ Done (§5c).
 
+## 5d. Session progress — 2026-06-12 (cherry border rework + P2 bullet-collision fix)
+
+- **Shared cherry border — REWORKED + game-tested OK.** The border is the AUTOMATIC
+  Cherry+ supernatural border (fires when the shared gauge hits 50000); it costs NO
+  bombs (bombs are a separate spell-card mechanic — the prior "P2 bomb starts/pays for a
+  border" model was wrong). The engine has a SINGLE border-ring effect slot (index 404,
+  hardcoded in `FUN_0041c610`), so P2 can't run its own `FUN_00441960` (it would steal
+  P1's ring). Design: **P1 keeps the one real ZUN border; P2 rides a ringless "shadow"**
+  (state 4 + flag `0x240d` + P1's timer copied each frame, ring ptr left null) so both are
+  invincible and either can pop it. Only the break leaf `FUN_00441bd0` is hooked (to
+  propagate a pop to the partner). Full design + the two gotchas (single ring slot;
+  `FUN_00441bd0` is `__thiscall(player,int flag)` `ret 4`, NOT ECX-only) are in
+  `docs/th07_cherry_determinism.md §0`.
+- **P2 BULLET COLLISION FIXED — the big one.** P2 could be killed by lasers/enemy-contact
+  but NOT regular bullets, and P2 grazing was dead. Root cause (verified): **the per-bullet
+  HIT test `FUN_0043e260` is GATED behind the bullet's "grazed" flag (`+0xc01`)** — a
+  regular bullet must graze the player before its hit test runs (`PCBdecomp.c:14718-14731`;
+  the laser path `FUN_00420490` is ungated, which is why lasers worked). coop.c hooked the
+  hit but not the graze (`FUN_0043e3b0`), so P2 grazed nothing → bullets near P2 never got
+  flagged → never hit-tested against P2. **Fix: hook `FUN_0043e3b0` and re-invoke for P2,
+  returning "grazed" if either player did** — sets the flag (unlocking P2 bullet hits) and
+  credits P2's graze. Confirmed in-game: P2 now grazes and pichuuns from bullets.
+  - Confirmed along the way (keep for reference): P2's hitbox tracks its `+0x930` position
+    param-relatively; `FUN_00441fb0`'s sub-calls (incl. movement `FUN_0043ee50`) all pass
+    ECX = the saved player (so they DO drive P2); the sprite draws at `origin+(+0x930)` (no
+    sprite/hitbox offset); P2's death FSM is correct. All collision/graze call sites use
+    `mov ecx,0x4bdad8`.
+- **Cleanup:** all temporary DIAG logging + the F2 (fat-hitbox) / F3 (force-hit) debug keys
+  were removed after the fix landed.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

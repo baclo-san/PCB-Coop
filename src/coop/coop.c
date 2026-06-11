@@ -16,13 +16,21 @@
  *   own state to 2 (dying) and spawn the pichuun at the player's own position.
  *     FUN_0043e260  bullets + enemy-body contact
  *     FUN_0043e6b0  lasers
- *   So we DETOUR these two: after each runs for P1, we call the trampoline once
- *   more with ECX = P2. P2's clone then dies through ZUN's own FSM (the state-2
+ *     FUN_0043e3b0  GRAZE  (must also be detoured — see below)
+ *   So we DETOUR these: after each runs for P1, we call the trampoline once more
+ *   with ECX = P2. P2's clone then dies through ZUN's own FSM (the state-2
  *   deathbomb window, life loss, respawn) which already runs via P2's piggyback
  *   update. No re-implementation of the hit math or pool iteration.
  *   Resources (lives/cherry) are still SHARED at this stage — P2's death FSM
  *   drives the same global counters P1's does (separate resources come next).
- *   Graze (FUN_0043e3b0) is a resource concern, deferred. Item collection: P2
+ *   !!! GRAZE IS LOAD-BEARING, not just points: for regular bullets the per-bullet
+ *   HIT test (FUN_0043e260) is GATED behind the bullet's "grazed" flag (+0xc01) —
+ *   a bullet must graze the player before its hit test runs (PCBdecomp.c:14718).
+ *   So without detouring graze, P2 grazes nothing -> bullets near P2 never get
+ *   flagged -> P2 is never hit-tested against them (only ungated lasers/contact
+ *   could hurt it). HookedGraze re-invokes graze for P2 and reports "grazed" if
+ *   either player did, setting the flag so P2's bullet hits work + P2 grazes.
+ *   Item collection: P2
  *   collects items it overlaps, and items P2 collects are credited to P2's OWN
  *   lives/bombs/power (the collect-time field-swap in HookedCollectOverlap), so
  *   P2's power/bombs grow from its own pickups; team score stays shared. NOTE:
@@ -50,13 +58,24 @@
  *   P2 is live (factor = 1 + P2-present); F5 toggles off. Scales all enemies
  *   (TTK-neutral for popcorn, correct for bosses). See docs/th07_boss_hp_scaling.md.
  *
- * SHARED TEAM BORDER (user decision): in PCB bombing IS activating the cherry
- *   border. We give the team ONE border: P2's bomb starts the border on P1 (the
- *   single Cherry+ gauge), spending one of P2's bombs only when it actually starts
- *   a border (free while one is already active, per PCB); P2's own bomb input is
- *   masked so it can't start a second border that would clobber the gauge. Both
- *   players are invulnerable while the border is up (P2 collision is skipped while
- *   P1 is in border state 4). F4 toggles. See docs/th07_cherry_determinism.md §0.
+ * SHARED TEAM BORDER (user-corrected design): the cherry border is the AUTOMATIC
+ *   supernatural border that fires when the shared Cherry+ gauge reaches 50000 — it
+ *   costs NO bombs (bombs are a SEPARATE spell-card mechanic). ZUN's border ring is a
+ *   SINGLE fixed effect slot (index 404, hardcoded in FUN_0041c610), so we CANNOT run
+ *   the border-start FUN_00441960 a second time for P2 — it would steal P1's ring.
+ *   Instead P1 keeps the one real, fully-vanilla border (ring + gauge + bonus), and P2
+ *   rides along in a RINGLESS "shadow" border: we set P2's state to 4 + the border
+ *   flag (0x240d) + copy P1's timer each frame (UpdateTeamBorder, polled before P2's
+ *   update), but leave P2's ring ptr null. P2 is then genuinely in state 4 so it is
+ *   invincible AND ZUN's own collision (FUN_0043e260/6b0) and bomb handler
+ *   (FUN_004409f0) pop the border on a hit / bomb-press exactly like P1 — no death, no
+ *   spell card, no bomb spent. We hook only the break leaf FUN_00441bd0
+ *   (__thiscall(player,int flag)) to propagate a pop by either player to the other, so
+ *   one team border ends for both. Timeout: P1 ends in its own update first, then the
+ *   poll retires P2's shadow (score may bank twice — user: acceptable, sync-safe).
+ *   P2's bomb is NOT masked: outside the border it casts a normal spell card (spends
+ *   P2's own bomb); during the border it pops instead. F4 toggles.
+ *   See docs/th07_cherry_determinism.md §0.
  *
  * Controls (in-stage):
  *   F9  = spawn P2 (clone of P1, offset +24px X). Only when a char is loaded.
@@ -65,7 +84,7 @@
  *   F7  = toggle P2 shot damage (default ON).
  *   F6  = toggle P2 separate resources (default ON).
  *   F5  = toggle boss/enemy HP scaling (default ON).
- *   F4  = toggle shared team border (default ON).
+ *   F4  = toggle synced cherry team border (default ON).
  *   F11 = revive P2 out of ghost mode (debug stand-in for the proximity/graze
  *         resurrection trigger; grants a life if needed, drops P2 into the
  *         respawn-invuln state next to P1).
@@ -107,6 +126,13 @@
  * in ECX through ZUN's death FSM. We detour + re-invoke each with ECX=P2. */
 #define ADDR_COLLIDE_BULLET ((LPVOID)0x0043e260) /* bullets + enemy-body contact */
 #define ADDR_COLLIDE_LASER  ((LPVOID)0x0043e6b0) /* lasers                       */
+/* GRAZE test (FUN_0043e3b0, __thiscall(player,pos,size)). CRITICAL: for regular bullets
+ * the player-HIT test (FUN_0043e260) is GATED behind the bullet's "grazed" flag (+0xc01)
+ * — a bullet must graze the player before its hit test runs (PCBdecomp.c:14718-14731). So
+ * P2 only becomes hittable by such bullets if it ALSO grazes them; we re-invoke graze for
+ * P2 and report "grazed" if either player did, which sets the bullet flag + credits P2's
+ * graze. */
+#define ADDR_COLLIDE_GRAZE  ((LPVOID)0x0043e3b0)
 /* Player-area OVERLAP test (param-relative bool). The item-update loop calls it
  * per item as the "touched the player -> collect" check, and it is that loop's
  * only caller. We detour it so an item overlapping a live P2 is collected too. */
@@ -115,10 +141,19 @@
  * caller of the overlap test. We bracket it to undo any P2-collected resource
  * swap that the last collected item left in place. */
 #define ADDR_ITEM_LOOP ((LPVOID)0x00432990)
-/* Border-start = the "bomb": FUN_00441960 __fastcall(player) sets state 4 + inits
- * the border timer. In PCB, bombing IS activating the supernatural border. We CALL
- * this directly (not hook it) to start the single TEAM border on P1 when P2 bombs. */
-#define ADDR_BORDER_START 0x00441960u
+/* Cherry-border FSM. The border is the AUTOMATIC supernatural border (fires when the
+ * shared Cherry+ gauge hits 50000); it costs no bombs. P1 runs ZUN's real border
+ * (vanilla, untouched): FUN_00441960 start (state->4, single ring slot 404),
+ * FUN_00441670 timeout-bank, FUN_00441bd0 break. We hook ONLY the break (to propagate a
+ * pop between players); P2 rides along in a ringless shadow state we drive directly. */
+#define ADDR_BORDER_BREAK ((LPVOID)0x00441bd0) /* __thiscall(player,int flag): hit/bomb pop */
+/* border-timer + state fields the FSM writes (player-relative) */
+#define OFF_BORDER_T0   0x16a08   /* border countdown (0x21c at start)                 */
+#define OFF_BORDER_T1   0x16a04
+#define OFF_BORDER_T2   0x16a00   /* first of the 6 border-timer dwords (0x16a00..14)  */
+#define OFF_RESPAWN_T   0x23fc    /* post-border/respawn invuln countdown (0x28)       */
+#define OFF_BORDER_REQ  0x240d    /* border request/active flag (1 = pressing bomb pops)*/
+#define OFF_BORDER_SPR  0xb7e6c   /* border-ring sprite object ptr                     */
 
 /* Tier-1 boss/enemy HP scaling. The per-phase max-life cap is (re)written once
  * per phase by the "set life" opcode inside the per-enemy ECL command
@@ -139,7 +174,9 @@ typedef int (__fastcall *CollideLaserFn_t )(void *self, void *edx,
 typedef int (__fastcall *CollectOverlapFn_t)(void *self, void *edx,
                                              float *pos, float *size);
 typedef void (__fastcall *ItemLoopFn_t)(void *self);
-typedef void (__fastcall *BorderStartFn_t)(void *self);
+/* FUN_00441bd0 is __thiscall(player[ECX], int flag[stack]) with `ret 4` (verified vs the
+ * binary). Model as __fastcall: ECX=self, EDX unused, flag on the stack. */
+typedef void (__fastcall *BorderBreakFn_t)(void *self, void *edx, int flag);
 
 /* ---- separate resources (lives/bombs/power) ----
  * They live in the struct at *(player+8) == DAT_00626278, stored as floats, and
@@ -193,6 +230,7 @@ typedef int (__fastcall *EclInterpFn_t)(void *self);
 static PlayerFn_t s_origUpdate = NULL;
 static PlayerFn_t s_origDraw   = NULL;
 static CollideBulletFn_t s_origCollideBullet = NULL;
+static CollideBulletFn_t s_origGraze         = NULL;   /* FUN_0043e3b0, same signature */
 static CollideLaserFn_t  s_origCollideLaser  = NULL;
 static CollectOverlapFn_t s_origCollectOverlap = NULL;
 static EclInterpFn_t     s_origEclInterp     = NULL;
@@ -223,12 +261,14 @@ static int   s_p2Ghost = 0;
 static int   s_bossHpScale = 1;
 static int   s_bossScaleLogged = 0;
 
-/* SHARED TEAM BORDER: P2's bomb activates ONE border on P1 (one gauge, both
- * players protected); P2's own bomb is masked so it can't start a second border.
- * On by default; F4 toggles. Only active alongside separate resources (P2's own
- * bomb count). Known limitation: P2 can't deathbomb while this is on. */
+/* SHARED TEAM BORDER: the automatic Cherry+ supernatural border. P1 keeps the one real
+ * ZUN border (single ring slot); P2 rides along in a ringless "shadow" state 4 synced to
+ * P1, so both are invincible and either can pop it. On by default; F4 toggles. */
 static int   s_p2TeamBorder = 1;
-static int   s_p2BombPrev = 0;
+static int   s_p2Shadow     = 0;   /* P2 currently in the ringless shadow border        */
+static int   s_borderMirror = 0;   /* re-entrancy guard around break propagation        */
+static int   s_borderLogged = 0;
+static BorderBreakFn_t s_origBorderBreak = NULL;
 
 static FILE *s_log = NULL;
 static char  s_dir[MAX_PATH];
@@ -400,14 +440,28 @@ static void PollHotkeys(void)
  * (ECX == P1 base) and P2 is live + killable — run it once more with ECX = P2.
  * The primitive is param-relative, so any hit drives P2's own death FSM. We
  * discard P2's return (bullets don't despawn on hitting a player in PCB, so the
- * caller's bullet bookkeeping stays tied to P1's return only). */
+ * caller's bullet bookkeeping stays tied to P1's return only).
+ *
+ * Border interaction: with the team border ON and BOTH players in state 4, P2's
+ * collision is ALLOWED to run — a hit then breaks P2's border via ZUN's own state-4
+ * path (FUN_00441bd0), which our break hook propagates to P1 (a hit pops the team
+ * border, vanilla behaviour). We only SKIP P2 when P1 is bordered but P2 is NOT
+ * (e.g. P2 respawning), so it isn't unfairly killed during the team border; with the
+ * team border OFF we skip P2 for all of P1's border (legacy "both invuln"). */
+static int P2CollisionSkipped(void *p2)
+{
+    int p1border = *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE) == 4;
+    int p2border = *(unsigned char *)((char *)p2 + OFF_STATE) == 4;
+    if (s_p2TeamBorder) return p1border && !p2border;
+    return p1border;
+}
+
 static int __fastcall HookedCollideBullet(void *self, void *edx, float *pos, float *size)
 {
     int r = s_origCollideBullet(self, edx, pos, size);   /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    /* P2 is invulnerable while the team border is up (P1 in state 4). */
     if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost &&
-        *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE) != 4)
+        !P2CollisionSkipped(p2))
         s_origCollideBullet(p2, edx, pos, size);          /* P2 — param-relative */
     return r;
 }
@@ -418,8 +472,24 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
     int r = s_origCollideLaser(self, edx, a, b, c, d, e); /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
     if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost &&
-        *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE) != 4)
+        !P2CollisionSkipped(p2))
         s_origCollideLaser(p2, edx, a, b, c, d, e);        /* P2 */
+    return r;
+}
+
+/* ---- graze detour: make P2 graze, AND unlock regular-bullet hits on P2 ----
+ * Re-invoke the graze test for P2. Returning "grazed" (1) when EITHER player grazes makes
+ * the caller set the bullet's grazed flag (+0xc01), which is what gates the per-bullet HIT
+ * test (FUN_0043e260) — so without this, regular bullets never get hit-tested against P2.
+ * FUN_0043e3b0 returns 1=grazed, 2=cancelled-by-field, 0=nothing; we only upgrade 0->1. */
+static int __fastcall HookedGraze(void *self, void *edx, float *pos, float *size)
+{
+    int r = s_origGraze(self, edx, pos, size);            /* P1 (unchanged) */
+    void *p2 = (void *)s_p2;
+    if (p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost && !P2CollisionSkipped(p2)) {
+        int r2 = s_origGraze(p2, edx, pos, size);          /* P2 — param-relative */
+        if (r == 0 && r2 == 1) r = 1;   /* P2 grazed -> mark bullet grazed so its hit test runs */
+    }
     return r;
 }
 
@@ -521,6 +591,75 @@ static int __fastcall HookedEclInterp(void *self)
     return r;
 }
 
+/* ---- shared team cherry border ----
+ * ZUN's border ring is a SINGLE fixed effect slot (index 404, hardcoded in
+ * FUN_0041c610 via the border's slot arg=4), so we CANNOT run FUN_00441960 a second
+ * time for P2 — it would re-grab slot 404 and steal P1's ring (only one ring can
+ * exist). Instead P1 keeps the one real ZUN border (ring + gauge + bonus, fully
+ * vanilla) and we put P2 into a RINGLESS "shadow" border: state 4 + the border-active
+ * flag (0x240d) + P1's timer copied in, but border-sprite ptr left null. P2 is then
+ * genuinely in state 4 — invincible, and ZUN's own collision (FUN_0043e260/6b0) and
+ * bomb handler (FUN_004409f0) pop it on a hit / bomb-press exactly like P1 — without
+ * owning a ring, so P1's single ring survives and follows P1.
+ *
+ * Lifecycle is driven by polling P1's state each frame in HookedUpdate (UpdateTeamBorder,
+ * run just before P2's update): enter/sync the shadow while P1 is in state 4, retire it
+ * when P1 leaves. Timeout needs no special handling — P1 ends in its own update first, the
+ * poll then retires P2's shadow before P2's update reaches the bank. Premature pops are
+ * propagated by the break hook below. */
+static void UpdateTeamBorder(void *p2)
+{
+    if (!s_p2TeamBorder || s_p2Ghost) return;
+    char *p1 = (char *)ADDR_PLAYER_BASE, *pp = (char *)p2;
+    int p1border = *(unsigned char *)(p1 + OFF_STATE) == 4;
+    int p2state  = *(unsigned char *)(pp + OFF_STATE);
+    if (p1border) {
+        if (p2state == 0 || (s_p2Shadow && p2state == 4)) {
+            /* enter / maintain P2's ringless shadow border, timer synced to P1 */
+            memcpy(pp + OFF_BORDER_T2, p1 + OFF_BORDER_T2, 0x18); /* 0x16a00..0x16a14 */
+            *(unsigned char *)(pp + OFF_STATE)     = 4;
+            *(unsigned char *)(pp + OFF_BORDER_REQ) = 1;          /* so P2's bomb pops it */
+            *(int *)(pp + OFF_BORDER_SPR)           = 0;          /* never own a ring */
+            if (!s_p2Shadow) {
+                s_p2Shadow = 1;
+                if (!s_borderLogged) { Log("TEAM cherry border: P2 shares P1's border (shadow)"); s_borderLogged = 1; }
+            }
+        }
+    } else if (s_p2Shadow) {
+        if (p2state == 4) {                          /* P1's border ended; retire P2's shadow */
+            *(int *)(pp + OFF_BORDER_SPR)           = 0;
+            *(unsigned char *)(pp + OFF_STATE)      = 3;          /* post-border invuln */
+            *(int *)(pp + OFF_BORDER_T0)            = 0x28;
+            *(int *)(pp + OFF_BORDER_T1)            = 0;
+            *(int *)(pp + OFF_BORDER_T2)            = 0xfffffc19;
+            *(int *)(pp + OFF_RESPAWN_T)            = 0x28;
+            *(unsigned char *)(pp + OFF_BORDER_REQ) = 0;
+        }
+        s_p2Shadow = 0;
+    }
+}
+
+/* Border BREAK (hit or bomb-press during the border). FUN_00441bd0 is __thiscall(player,
+ * int flag) — ECX=player, ONE stack arg (the 0/1 flag), `ret 4` (verified in-binary). It
+ * is called param-relative for whichever player was hit / bombed; we propagate the pop to
+ * the partner so the one team border ends for both. No bonus either way (vanilla: breaking
+ * forfeits it). The flag is forwarded so the callee's stack stays balanced. */
+static void __fastcall HookedBorderBreak(void *self, void *edx, int flag)
+{
+    s_origBorderBreak(self, edx, flag);
+    if (!s_p2TeamBorder || s_borderMirror) return;
+    void *p2 = (void *)s_p2;
+    if (!p2) return;
+    void *other = NULL;
+    if ((uint32_t)self == ADDR_PLAYER_BASE) other = p2;
+    else if (self == p2)                    other = (void *)ADDR_PLAYER_BASE;
+    if (other && *(unsigned char *)((char *)other + OFF_STATE) == 4) {
+        s_borderMirror = 1;
+        s_origBorderBreak(other, edx, flag);        /* a pop by either pops both */
+        s_borderMirror = 0;
+    }
+}
+
 /* ---- detours ---- */
 static int __fastcall HookedUpdate(void *self)
 {
@@ -553,29 +692,12 @@ static int __fastcall HookedUpdate(void *self)
             if (p2in && !s_p2InputLogged) { Log("P2 input read OK: 0x%03x (key path works)", p2in); s_p2InputLogged = 1; }
             if (s_p2Ghost) p2in &= ~(IN_SHOOT | IN_BOMB);  /* a ghost only wanders */
 
-            /* TEAM BORDER: P2's bomb starts the single border on P1 (one gauge,
-             * both players protected — P2 invuln via the collision detours while
-             * P1 is in border state 4).
-             *   Bomb COST follows PCB: a bomb is spent ONLY to START a border (here
-             *   gated on P1 state 0). Pressing bomb while a border is already active
-             *   is FREE in PCB — so we must NOT charge it; with our state-0 gate that
-             *   case is simply a no-op for P2 (no spend, no extra clear — a refinement
-             *   to add later).
-             * We MASK P2's bomb so its own update can't start a second,
-             * gauge-clobbering border. Needs separate resources (P2's own bomb
-             * count). NOTE: P2 can't deathbomb while this is on — known limitation. */
-            if (s_p2TeamBorder && s_p2SepRes && !s_p2Ghost) {
-                int p2bomb = (p2in & IN_BOMB) != 0;
-                if (p2bomb && !s_p2BombPrev && (int)s_p2Bombs >= 1 &&
-                    *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE) == 0) {
-                    s_p2Bombs -= 1.0f;
-                    ((BorderStartFn_t)ADDR_BORDER_START)((void *)ADDR_PLAYER_BASE);
-                    Log("P2 bomb -> TEAM border on P1 (P2 bombs now %.0f)", s_p2Bombs);
-                }
-                s_p2BombPrev = p2bomb;
-                p2in &= ~IN_BOMB;              /* P2 never starts its own border */
-            }
-
+            /* P2's bomb is its own spell card (spent from P2's separate bomb count
+             * via the resource field-swap below) and is NOT masked. ZUN's bomb handler
+             * casts a spell outside the border, and DURING the cherry border it just
+             * pops the border early instead (no spell, no bomb spent) — the team-border
+             * break hook then pops P1's half too. The cherry border never reads the
+             * bomb bit; it auto-fires off the shared Cherry+ gauge. */
             *ADDR_INPUT_GAMEPLAY = p2in;
 
             /* FIELD-SWAP P2's own LIVES + BOMBS + POWER into the shared struct for
@@ -594,6 +716,10 @@ static int __fastcall HookedUpdate(void *self)
                 ckBefore = *(volatile uint32_t *)(res + RES_CHECKSUM);
                 *rl = s_p2Lives; *rb = s_p2Bombs; *rp = s_p2Power;
             }
+
+            /* Drive P2's ringless shadow border to track P1's (enter/sync/retire) BEFORE
+             * P2's update, so P2 updates in the correct border state. */
+            UpdateTeamBorder(p2);
 
             s_origUpdate(p2);               /* trampoline → no detour re-entry */
 
@@ -654,16 +780,20 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_PLAYER_DRAW,   (LPVOID)&HookedDraw,   (LPVOID*)&s_origDraw)   != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLIDE_BULLET, (LPVOID)&HookedCollideBullet, (LPVOID*)&s_origCollideBullet) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLIDE_LASER,  (LPVOID)&HookedCollideLaser,  (LPVOID*)&s_origCollideLaser)  != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_COLLIDE_GRAZE,  (LPVOID)&HookedGraze,         (LPVOID*)&s_origGraze)         != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ECL_INTERP,     (LPVOID)&HookedEclInterp,     (LPVOID*)&s_origEclInterp)     != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_LASER)  != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_COLLIDE_GRAZE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_ECL_INTERP)     != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLECT_OVERLAP)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_ITEM_LOOP)      != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;
     return 1;
 }
 
@@ -684,8 +814,9 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
                         "th07_coop", MB_ICONERROR);
         else
             Log("hooks installed (update @0x441fb0, draw @0x4420b0, "
-                "collide-bullet @0x43e260, collide-laser @0x43e6b0, ecl-interp @0x424290, "
-                "collect-overlap @0x43e4e0, item-loop @0x432990)");
+                "collide-bullet @0x43e260, collide-laser @0x43e6b0, graze @0x43e3b0, "
+                "ecl-interp @0x424290, collect-overlap @0x43e4e0, item-loop @0x432990, "
+                "border-break @0x441bd0)");
         break;
     case DLL_PROCESS_DETACH:
         if (s_log) { Log("detach"); fclose(s_log); }

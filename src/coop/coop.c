@@ -40,6 +40,9 @@
  *   F8  = toggle P2 killability (default ON).
  *   F7  = toggle P2 shot damage (default ON).
  *   F6  = toggle P2 separate resources (default ON).
+ *   F11 = revive P2 out of ghost mode (debug stand-in for the proximity/graze
+ *         resurrection trigger; grants a life if needed, drops P2 into the
+ *         respawn-invuln state next to P1).
  *
  * !!! ALL ADDRESSES are build-specific to th07.exe ver 1.00b
  * !!! SHA256 35467EAF8DC7FC85F024F16FB2037255F151CEFDA33CF4867BC9122AAA2E80CA
@@ -302,16 +305,19 @@ static void PollHotkeys(void)
     int f8  = (GetAsyncKeyState(VK_F8)  & 0x8000) != 0;
     int f7  = (GetAsyncKeyState(VK_F7)  & 0x8000) != 0;
     int f6  = (GetAsyncKeyState(VK_F6)  & 0x8000) != 0;
+    int f11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     if (f9  && !s_prevF9)  { Log("F9 edge detected");  SpawnP2(); }
     if (f10 && !s_prevF10) { Log("F10 edge detected"); DespawnP2(); }
     if (f8  && !s_prevF8)  { s_p2Killable = !s_p2Killable; Log("P2 killable %s", s_p2Killable ? "ON" : "OFF"); }
     if (f7  && !s_prevF7)  { s_shotXfer = !s_shotXfer; Log("shot xfer %s", s_shotXfer ? "ON" : "OFF"); }
     if (f6  && !s_prevF6)  { s_p2SepRes = !s_p2SepRes; Log("P2 separate-resources %s", s_p2SepRes ? "ON" : "OFF"); }
+    if (f11 && !s_prevF11) { Log("F11 edge detected"); ReviveP2(); }
     s_prevF9  = f9;
     s_prevF10 = f10;
     s_prevF8  = f8;
     s_prevF7  = f7;
     s_prevF6  = f6;
+    s_prevF11 = f11;
 }
 
 /* ---- collision detours: make P2 killable ----
@@ -467,7 +473,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         { char *s = strrchr(s_dir, '\\'); if (s) s[1] = '\0'; }
         { char p[MAX_PATH]; snprintf(p, sizeof(p), "%scoop_log.txt", s_dir); s_log = fopen(p, "w"); }
         Log("th07_coop attached. AUTO-spawn P2 ~3s. P2: IJKL move, Space shot, U focus, O bomb. "
-            "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn.");
+            "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, F11=revive.");
         if (!InstallHooks())
             MessageBoxA(NULL, "th07_coop: hook install failed (wrong build/addresses?)",
                         "th07_coop", MB_ICONERROR);

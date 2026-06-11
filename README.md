@@ -19,6 +19,8 @@ by an RNG-seed comparison every frame.
   change).
 - **`docs/th07_cherry_determinism.md`** — the cherry↔item-drop RNG coupling and how to
   do per-player cherry without breaking lockstep.
+- **`docs/th07_item_collect_credit.md`** — verified item-collection credit map
+  (power/bombs/points/1up) + the per-player resource attribution design.
 - **`docs/th07_player_struct.md`** — verified PCB Player-object offset map (for the
   Fork-B second-player graft).
 

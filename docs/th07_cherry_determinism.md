@@ -9,6 +9,44 @@ Build-specific to th07.exe ver 1.00b (SHA256 `35467EAF…E80CA`).
 
 ---
 
+## 0. The three cherry values (PCB) — verified mapping
+
+PCB tracks **three** cherry quantities, all stored as deltas from a shared base
+`cherry_base = *(int*)(DAT_00626278 + 0x88)` (res index `[0x22]`). Each on-screen
+value = `<global> − cherry_base`; the HUD draws all three this way (PCBdecomp.c:
+4216 / 4253 / 4284):
+
+| Value | Global | On-screen | Drives |
+|---|---|---|---|
+| **Cherry** | `DAT_0062f88c` | `DAT_0062f88c − base` | **point-item value** (collect cases 1 & 7) and the **item-drop roll** (10445/10495). The "usual" cherry — gameplay-secondary. |
+| **Cherry Max** | `DAT_0062f888` | `DAT_0062f888 − base` | the cap / roll denominator |
+| **Cherry+** | `DAT_0062f890` | `DAT_0062f890 − base` | **the cherry BORDER** (supernatural border / bullet-cancel). The critical one. |
+
+- `cherry_base` (`+0x88`) is a *reference*, written once (a reset @18124) — NOT a
+  running per-cherry counter. (Earlier notes here that called `+0x88` "the live
+  cherry counter" were imprecise; the meaningful quantities are the three deltas.)
+- **Cherry+ is recomputed every frame while the border is active** (player STATE 4),
+  from the player's own border timer:
+  `DAT_0062f890 = (player+0x16a08 * 50000) / (player+0x16a14) + cherry_base`
+  (PCBdecomp.c:26914, in the state processor `FUN_00441330`). `+0x16a08` = border
+  countdown, `+0x16a14` = border duration — both **per-player**. When the border
+  ends (`+0x16a08 < 1`), `FUN_00441670` banks the bonus (score += `Cherry·10`) and
+  collapses Cherry+ back to base (26971–26974).
+- **Item collection adds to NO cherry value** — it only *reads* Cherry to scale
+  point items. See `docs/th07_item_collect_credit.md`.
+
+### ⚠️ Co-op implication for the SHARED-border decision
+`FUN_00441330` runs for P2 too (coop.c's `FUN_00441fb0` piggyback). If P2 is in
+border state 4, **P2's update overwrites `DAT_0062f890` with P2's border progress**,
+so the border gauge follows whichever player updated last (P2). For the chosen
+**shared border**, coop.c must reconcile `DAT_0062f890` after P2's piggyback update
+(e.g. snapshot P1's `DAT_0062f890` before P2's update and restore it after, so the
+single border follows P1; or compute an agreed function of both). Determinism-safe
+either way — all cherry globals are lockstep sim state; this is a gameplay-
+correctness fix, not a sync fix.
+
+---
+
 ## 1. The coupling, verified
 
 Two enemy/bullet-death item-drop sites — `FUN_0041b3xx` @ PCBdecomp.c:10445 and
@@ -23,16 +61,18 @@ if (roll % 100 <= ratio) {       // cherry-gated branch
 }
 ```
 
-Symbols:
+Symbols (see §0 for the full three-value model):
 | Symbol | Meaning |
 |---|---|
-| `*(int *)(DAT_00626278 + 0x88)` | **live cherry counter** (= `((int*)DAT_00626278)[0x22]`) |
-| `DAT_0062f88c` | cherry numerator base (set at game/replay load, line 27895) |
-| `DAT_0062f888` | cherry denominator / CherryMax (set at load, line 27896) |
+| `*(int *)(DAT_00626278 + 0x88)` | `cherry_base` — the shared reference all three values subtract from (= `((int*)DAT_00626278)[0x22]`) |
+| `DAT_0062f88c` | **Cherry** raw (on-screen Cherry = `DAT_0062f88c − base`); drives this roll + point-item value |
+| `DAT_0062f888` | **Cherry Max** raw (= cap / roll denominator) |
 | `FUN_004318d0` | `Rng_Next32` (handoff §1) — the shared RNG |
 
-Load-time setup (PCBdecomp.c:27895–27896) ties both bounds to the same live-cherry
-base: `DAT_0062f88c = replay[+8] + cherryBase; DAT_0062f888 = replay[+0xc] + cherryBase`.
+So `ratio = (Cherry · 100) / CherryMax` with `Cherry = DAT_0062f88c − base`,
+`CherryMax = DAT_0062f888 − base`. Load-time setup (PCBdecomp.c:27895–27896) ties all
+three raws to the same base: `DAT_0062f88c = replay[+8] + cherry_base`,
+`DAT_0062f888 = replay[+0xc] + cherry_base`, `DAT_0062f890 = replay[+0x10] + cherry_base`.
 
 ---
 
@@ -165,9 +205,26 @@ attribute each collected cherry item to P1 vs P2 — i.e. P2 must participate in
    feeds `s_p1Cherry`; the engine's shared `+0x88` keeps rising as today.
 3. **HUD:** draw the two counts (deferred until a P2 HUD exists — today P2 resources
    are logged to `coop_log.txt`).
-4. **Border:** no change — it already reads the shared `+0x88` = team total, which
-   is exactly "shared border" per the decision.
+4. **Border (CORRECTED — see §0):** the border is driven by **Cherry+**
+   (`DAT_0062f890`), which `FUN_00441330` recomputes from the *per-player* border
+   timer during state 4 — so P2's piggyback update clobbers it. For the chosen
+   **shared border**, coop.c must reconcile `DAT_0062f890` around P2's update
+   (snapshot P1's value before, restore after — so the one border follows P1). This
+   is a gameplay-correctness fix; determinism is unaffected (all cherry globals are
+   lockstep sim state).
 
 Net: the gameplay/determinism surface is untouched (shared cherry); the new code is
 a display attribution layer gated on P2 item collection. Validate later with the
 `0x49fe24` oracle on a border-heavy stage (per the deferred netplay test).
+
+### Update (2026-06-11): cherry fill ≠ item collection — see the credit map
+Tracing the item-collect loop (`FUN_00432990`) showed it only **reads** cherry
+(`+0x88`) to scale point values; it never adds to it. The live cherry `+0x88` is
+written just once (a reset), and cherry-*gain* is driven by the bound
+`DAT_0062f88c` **decrementing** (PCBdecomp.c:12491/26707/26821), likely off the
+shot/graze path — **not yet traced**. So per-player CHERRY is a separate attribution
+problem from per-player POWER/BOMBS (which DO come from the collect loop). Full
+verified map + the power/bombs attribution design (collector-flag + field-swap+heal,
+determinism-safe) is in **`docs/th07_item_collect_credit.md`**. Implement separate
+power/bombs from there now; separate cherry display needs the `DAT_0062f88c`-gain
+trace first.

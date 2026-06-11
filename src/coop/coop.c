@@ -34,12 +34,22 @@
  *   with ghost mode, which handles P2's death directly instead of via the commit.
  *   P2's bombs/power are logged to coop_log.txt on change until the P2 HUD exists.
  *
+ * BOSS / ENEMY HP SCALING (Tier-1): two players ~= 2x DPS, so spell/life phases
+ *   end twice as fast. We detour the per-enemy ECL interpreter (FUN_00424290)
+ *   and multiply the per-phase max-life cap (+0xd30) by the active player count
+ *   the frame the "set life" opcode (re)writes it. PCB's HP model is inverted:
+ *   damage climbs in the accumulator (+0xd18) toward the cap, phase ends when
+ *   acc >= cap; doubling the cap restores the solo fight length. Auto-arms when
+ *   P2 is live (factor = 1 + P2-present); F5 toggles off. Scales all enemies
+ *   (TTK-neutral for popcorn, correct for bosses). See docs/th07_boss_hp_scaling.md.
+ *
  * Controls (in-stage):
  *   F9  = spawn P2 (clone of P1, offset +24px X). Only when a char is loaded.
  *   F10 = despawn P2 (stop piggyback + free).
  *   F8  = toggle P2 killability (default ON).
  *   F7  = toggle P2 shot damage (default ON).
  *   F6  = toggle P2 separate resources (default ON).
+ *   F5  = toggle boss/enemy HP scaling (default ON).
  *   F11 = revive P2 out of ghost mode (debug stand-in for the proximity/graze
  *         resurrection trigger; grants a life if needed, drops P2 into the
  *         respawn-invuln state next to P1).
@@ -81,6 +91,15 @@
  * in ECX through ZUN's death FSM. We detour + re-invoke each with ECX=P2. */
 #define ADDR_COLLIDE_BULLET ((LPVOID)0x0043e260) /* bullets + enemy-body contact */
 #define ADDR_COLLIDE_LASER  ((LPVOID)0x0043e6b0) /* lasers                       */
+
+/* Tier-1 boss/enemy HP scaling. The per-phase max-life cap is (re)written once
+ * per phase by the "set life" opcode inside the per-enemy ECL command
+ * interpreter; we detour it and multiply the cap by the player count on the
+ * frame it changes. Cap is stored via a float write but read as int everywhere
+ * that matters (death check, bar math) — treat it as int. */
+#define ADDR_ECL_INTERP ((LPVOID)0x00424290) /* __fastcall(enemy) ECL cmd interp */
+#define OFF_HP_MAX  0xd30   /* int: max life of the current phase (scale target) */
+#define OFF_HP_ACC  0xd18   /* int: accumulated damage; ==0 right after set-life */
 
 /* __thiscall modelled as __fastcall: ECX=this, EDX=unused, rest on stack.
  * Stack-arg count + order match, so callee stack cleanup (ret N) matches too. */
@@ -137,16 +156,18 @@ typedef void (__fastcall *HudRefreshFn_t)(uint32_t singleton);
 #define P2_SPAWN_OFFSET_X  24.0f
 
 typedef int (__fastcall *PlayerFn_t)(void *self);
+typedef int (__fastcall *EclInterpFn_t)(void *self);
 
 static PlayerFn_t s_origUpdate = NULL;
 static PlayerFn_t s_origDraw   = NULL;
 static CollideBulletFn_t s_origCollideBullet = NULL;
 static CollideLaserFn_t  s_origCollideLaser  = NULL;
+static EclInterpFn_t     s_origEclInterp     = NULL;
 
 static volatile void *s_p2   = NULL;   /* P2 object base, NULL until spawned     */
 static int   s_p2Killable = 1;         /* on by default; F8 toggles              */
 static unsigned char s_p2PrevState = 0;/* for death-transition logging           */
-static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0;
+static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0, s_prevF5 = 0;
 
 /* P2's own LIVES + BOMBS + POWER, field-swapped into the shared struct around P2's
  * update; ZUN's anti-tamper checksum is re-healed afterward (see the heal below).
@@ -162,6 +183,12 @@ static int   s_p2PrevLives = -1, s_p2PrevBombs = -1, s_p2PrevPower = -1;
  * wandering, invulnerable, non-shooting "ghost" until revived (revive-by-graze
  * + 1up drop come next). Collision is skipped for a ghost so it can't re-die. */
 static int   s_p2Ghost = 0;
+
+/* Tier-1: scale enemy/boss HP cap by the active player count. On by default;
+ * only takes effect while P2 is live (factor = 1 + (s_p2 != NULL)). F5 toggles. */
+static int   s_bossHpScale = 1;
+static int   s_bossScaleLogged = 0;
+
 static FILE *s_log = NULL;
 static char  s_dir[MAX_PATH];
 
@@ -305,18 +332,21 @@ static void PollHotkeys(void)
     int f8  = (GetAsyncKeyState(VK_F8)  & 0x8000) != 0;
     int f7  = (GetAsyncKeyState(VK_F7)  & 0x8000) != 0;
     int f6  = (GetAsyncKeyState(VK_F6)  & 0x8000) != 0;
+    int f5  = (GetAsyncKeyState(VK_F5)  & 0x8000) != 0;
     int f11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     if (f9  && !s_prevF9)  { Log("F9 edge detected");  SpawnP2(); }
     if (f10 && !s_prevF10) { Log("F10 edge detected"); DespawnP2(); }
     if (f8  && !s_prevF8)  { s_p2Killable = !s_p2Killable; Log("P2 killable %s", s_p2Killable ? "ON" : "OFF"); }
     if (f7  && !s_prevF7)  { s_shotXfer = !s_shotXfer; Log("shot xfer %s", s_shotXfer ? "ON" : "OFF"); }
     if (f6  && !s_prevF6)  { s_p2SepRes = !s_p2SepRes; Log("P2 separate-resources %s", s_p2SepRes ? "ON" : "OFF"); }
+    if (f5  && !s_prevF5)  { s_bossHpScale = !s_bossHpScale; Log("boss/enemy HP scaling %s", s_bossHpScale ? "ON" : "OFF"); }
     if (f11 && !s_prevF11) { Log("F11 edge detected"); ReviveP2(); }
     s_prevF9  = f9;
     s_prevF10 = f10;
     s_prevF8  = f8;
     s_prevF7  = f7;
     s_prevF6  = f6;
+    s_prevF5  = f5;
     s_prevF11 = f11;
 }
 
@@ -343,6 +373,32 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
     void *p2 = (void *)s_p2;
     if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost)
         s_origCollideLaser(p2, edx, a, b, c, d, e);        /* P2 */
+    return r;
+}
+
+/* ---- boss/enemy HP scaling detour ----
+ * Multiply the per-phase max-life cap by the active player count on the frame
+ * the "set life" ECL opcode (re)writes it. Guard: the cap actually changed AND
+ * the damage accumulator was just reset to 0 — that pair is unique to the
+ * set-life command, so a fresh phase is scaled exactly once and never
+ * re-multiplied on subsequent frames (when the interpreter leaves the cap as-is,
+ * after == before). Only arms while P2 is live, so solo play is untouched. */
+static int __fastcall HookedEclInterp(void *self)
+{
+    int before = *(int *)((char *)self + OFF_HP_MAX);
+    int r = s_origEclInterp(self);
+    if (s_bossHpScale) {
+        int players = s_p2 ? 2 : 1;               /* active player count */
+        int after   = *(int *)((char *)self + OFF_HP_MAX);
+        if (players > 1 && after != before && after > 0 &&
+            *(int *)((char *)self + OFF_HP_ACC) == 0) {
+            *(int *)((char *)self + OFF_HP_MAX) = after * players;
+            if (!s_bossScaleLogged) {
+                Log("boss/enemy HP scaled x%d (%d -> %d)", players, after, after * players);
+                s_bossScaleLogged = 1;
+            }
+        }
+    }
     return r;
 }
 
@@ -456,10 +512,12 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_PLAYER_DRAW,   (LPVOID)&HookedDraw,   (LPVOID*)&s_origDraw)   != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLIDE_BULLET, (LPVOID)&HookedCollideBullet, (LPVOID*)&s_origCollideBullet) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLIDE_LASER,  (LPVOID)&HookedCollideLaser,  (LPVOID*)&s_origCollideLaser)  != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_ECL_INTERP,     (LPVOID)&HookedEclInterp,     (LPVOID*)&s_origEclInterp)     != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_LASER)  != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_ECL_INTERP)     != MH_OK) return 0;
     return 1;
 }
 
@@ -473,13 +531,13 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         { char *s = strrchr(s_dir, '\\'); if (s) s[1] = '\0'; }
         { char p[MAX_PATH]; snprintf(p, sizeof(p), "%scoop_log.txt", s_dir); s_log = fopen(p, "w"); }
         Log("th07_coop attached. AUTO-spawn P2 ~3s. P2: IJKL move, Space shot, U focus, O bomb. "
-            "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, F11=revive.");
+            "F5=boss-HP-scale, F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, F11=revive.");
         if (!InstallHooks())
             MessageBoxA(NULL, "th07_coop: hook install failed (wrong build/addresses?)",
                         "th07_coop", MB_ICONERROR);
         else
             Log("hooks installed (update @0x441fb0, draw @0x4420b0, "
-                "collide-bullet @0x43e260, collide-laser @0x43e6b0)");
+                "collide-bullet @0x43e260, collide-laser @0x43e6b0, ecl-interp @0x424290)");
         break;
     case DLL_PROCESS_DETACH:
         if (s_log) { Log("detach"); fclose(s_log); }

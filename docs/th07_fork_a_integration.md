@@ -151,13 +151,36 @@ pre-stage menus (char/difficulty select). Two options (handoff §3b Fork A):
 - **A2 (minimal, recommended first):** lockstep gameplay only (§2 hook) + force the
   seed (§3 hook). Players coordinate char/difficulty manually. Smallest surface;
   enough to validate the whole lockstep premise end-to-end in a real stage.
-- **A1 (clean):** also hook an *always-runs* per-logic-frame seam and overwrite
-  `g_InputMenu` (0x004b9e4c) with the merged word (`is_in_UI=true` → `self|rcv`), so
-  menus navigate together. The handoff names GameUpdate `FUN_0042fd60` for this, but
-  **that exact symbol is not present in this dump** — it must be re-resolved (likely a
-  thunk/inlined or a different label). TODO for a future session: find the function the
-  frame governor `FUN_004346e0` calls once per logic frame and hook there. Until then,
-  A2 is the path.
+- **A1 (clean):** also hook an *always-runs* per-frame seam and overwrite `g_InputMenu`
+  (0x004b9e4c) with the merged word (`is_in_UI=true` → `self|rcv`), so menus navigate
+  together.
+
+  **A1 seam resolved to `FUN_00437c70` (0x00437c70)** — the per-scene-tick input
+  function (`__fastcall(int param_1)`, param_1 = supervisor/scene object). At
+  PCBdecomp.c:22804–22805 it does the menu poll:
+  ```c
+  DAT_004b9e54 = DAT_004b9e4c;          // g_InputMenuPrev = g_InputMenu
+  DAT_004b9e4c = FUN_00430b50();         // g_InputMenu = Input_Poll()
+  ... autofire counter on 0x4b9e60 ...
+  ```
+  then dispatches scene transitions (it logs `"scene %d -> %d"`). The handoff's
+  "scene-tick callers of Input_Poll" at 0x00437d80 / 0x00437dfc are NOT separate
+  functions — they are the two `FUN_00430b50` **call sites inside** `FUN_00437c70`
+  (0x437d80 ≈ line 22805, 0x437dfc ≈ line 22819; the fn starts at 0x437c70).
+
+  **A1 hook recipe:** detour `FUN_00437c70`; after the original sets `g_InputMenu` from
+  the poll, overwrite it with `Netcode_GetInput_Net(frame, /*is_in_UI=*/true, ctrl)`.
+  Use a DLL-owned per-logic-frame counter for `frame` here (this seam has no replay
+  frame counter of its own, unlike `FUN_00442cd0`). Verify in-game that `FUN_00437c70`
+  ticks exactly once per logic frame before relying on it for the frame index.
+
+  **Caveat — the dump is partial:** `GameUpdate FUN_0042fd60`, the frame governor
+  `FUN_004346e0`, and the task-chain manager `0x626218` (all named in the handoff §1)
+  are **absent from `PCBdecomp.c`** — not even referenced. The export covers ~94% of
+  functions (1283/1369 with bodies) but omits some top-level loop functions. If
+  `FUN_00437c70` proves not-once-per-frame, the true GameUpdate seam needs the user's
+  fuller Ghidra db (`th07.exe.c` on their Desktop). Until A1 is validated in-game, A2
+  is the path.
 
 ---
 

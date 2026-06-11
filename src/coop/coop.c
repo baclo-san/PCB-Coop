@@ -143,7 +143,7 @@ static CollideLaserFn_t  s_origCollideLaser  = NULL;
 static volatile void *s_p2   = NULL;   /* P2 object base, NULL until spawned     */
 static int   s_p2Killable = 1;         /* on by default; F8 toggles              */
 static unsigned char s_p2PrevState = 0;/* for death-transition logging           */
-static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0;
+static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0;
 
 /* P2's own LIVES + BOMBS + POWER, field-swapped into the shared struct around P2's
  * update; ZUN's anti-tamper checksum is re-healed afterward (see the heal below).
@@ -277,6 +277,24 @@ static void DespawnP2(void)
     Log("despawn: P2 freed");
 }
 
+static void ReviveP2(void)
+{
+    void *p2 = (void *)s_p2;
+    if (!p2 || !s_p2Ghost) return;
+
+    /* exit ghost mode and grant a life if needed */
+    s_p2Ghost = 0;
+    if ((int)s_p2Lives <= 0) s_p2Lives = 1.0f;
+
+    /* set P2 into respawn-invulnerable state and place near P1 */
+    *(unsigned char *)((char *)p2 + OFF_STATE) = 3; /* respawn-invuln */
+    *(float *)((char *)p2 + OFF_POS_X) = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X) + P2_SPAWN_OFFSET_X;
+    *(float *)((char *)p2 + OFF_POS_Y) = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_Y);
+
+    Log("P2 revived from GHOST: lives=%.0f state=3 pos=(%.1f,%.1f)", s_p2Lives,
+        *(float *)((char *)p2 + OFF_POS_X), *(float *)((char *)p2 + OFF_POS_Y));
+}
+
 static void PollHotkeys(void)
 {
     int f9  = (GetAsyncKeyState(VK_F9)  & 0x8000) != 0;
@@ -307,7 +325,7 @@ static int __fastcall HookedCollideBullet(void *self, void *edx, float *pos, flo
 {
     int r = s_origCollideBullet(self, edx, pos, size);   /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE)
+    if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost)
         s_origCollideBullet(p2, edx, pos, size);          /* P2 — param-relative */
     return r;
 }
@@ -317,7 +335,7 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
 {
     int r = s_origCollideLaser(self, edx, a, b, c, d, e); /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE)
+    if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost)
         s_origCollideLaser(p2, edx, a, b, c, d, e);        /* P2 */
     return r;
 }

@@ -71,6 +71,16 @@ echo "  LD  th07_coop.dll"
     "$ROOT/src/coop/coop.c" "${MH_OBJS[@]}" \
     -o "$BUILD/th07_coop.dll" -static -lkernel32 -luser32
 
+# ---- 2c. netcode integration DLL (Fork A: wires the netcode into th07) ----
+# C++ (links netcode + Connection + MinHook). NOT yet game-tested — see
+# docs/th07_fork_a_integration.md.
+echo "  LD  th07_coop_net.dll"
+"$CXX" "${CFLAGS[@]}" -std=c++17 -I"$MH/include" -I"$ROOT/src/netplay" -shared \
+    "$ROOT/src/netplay/coop_net.cpp" \
+    "$ROOT/src/netplay/netcode.cpp" \
+    "$ROOT/src/netplay/Connection.cpp" "${MH_OBJS[@]}" \
+    -o "$BUILD/th07_coop_net.dll" -static -lkernel32 -luser32 -lws2_32
+
 # ---- 3. injector EXE ----
 echo "  LD  injector.exe"
 "$CC" "${CFLAGS[@]}" "$ROOT/src/injector/injector.c" \
@@ -107,9 +117,30 @@ EOF
     echo "  GEN harness.ini"
 fi
 
+NETINI="$BUILD/coop_net.ini"
+if [ ! -f "$NETINI" ]; then
+    cat > "$NETINI" <<'EOF'
+[net]
+; role  = host   (listens) | guest (connects to host)
+role  = host
+; guest only: host's IP to connect to
+peer  = 127.0.0.1
+; host: port to listen on / guest: host's port
+port  = 47000
+; guest only: local UDP bind port
+local = 47001
+; input delay in frames — BOTH sides must use the same value
+delay = 2
+; shared start RNG seed (host authoritative). Both sides must match until a
+; proper seed handshake is implemented (see docs/th07_fork_a_integration.md).
+seed  = 0x1234
+EOF
+    echo "  GEN coop_net.ini"
+fi
+
 echo ""
 echo "Built:"
-for f in th07_harness.dll th07_coop.dll injector.exe netloop_test.exe netsim.exe; do
+for f in th07_harness.dll th07_coop.dll th07_coop_net.dll injector.exe netloop_test.exe netsim.exe; do
     printf '  %-22s %8d bytes\n' "$f" "$(stat -c%s "$BUILD/$f")"
 done
 

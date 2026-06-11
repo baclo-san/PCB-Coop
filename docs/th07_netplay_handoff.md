@@ -449,6 +449,13 @@ this transcript. First action next session: verify write access, then `git push`
   toggle. Builds clean, 32-bit. **Not game-tested** (see the doc's status).
 - Build now completes all targets again (the stderr-warning abort is gone with
   the warning fixed).
+- **Per-player cherry — design decided + groundwork laid.** Verified the cherry
+  model and re-framed determinism (lockstep makes the shared `+0x88` cherry
+  auto-identical on both ends, so keeping the gameplay cherry shared is safe by
+  construction; "separate counts" is a display attribution layer). Corrected
+  `FUN_0043e4e0`'s label (it's the player-area overlap test, not the collect
+  logic). **Implemented step 1: P2 now collects items it overlaps** (detour
+  `FUN_0043e4e0`, ECX=P2; credit shared for now). Plan + caveats in cherry doc §6.
 
 ### Updated next steps
 > **User directive (2026-06-11): postpone all *manual netplay* testing until the
@@ -467,9 +474,12 @@ this transcript. First action next session: verify write access, then `git push`
    **DECIDED (user, 2026-06-11): separate counts per player, SHARED border.** This
    is determinism-safe by construction — the gameplay cherry `+0x88` (drives the
    roll AND the border) stays the shared lockstep value, untouched; "separate
-   counts" is a display attribution layer. Prerequisite = **P2 item collection**
-   (detour the overlap test `FUN_0043e4e0`, ECX=P2); attribution needs the collect
-   loop's disasm (decomp is ambiguous there). Plan in cherry doc §6.
+   counts" is a display attribution layer. Prerequisite **P2 item collection is
+   DONE** (`HookedCollectOverlap` detours `FUN_0043e4e0`, ECX=P2). **Remaining:**
+   per-player *attribution* — detour the collect caller (item-update loop @ ~20435)
+   to credit P1's vs P2's overlap branch separately + a P2 cherry HUD. The collect
+   loop is decompiled ambiguously, so this step likely needs the th07.exe
+   **disassembly** (the binary isn't in-repo). Plan + caveats in cherry doc §6.
 4. **Game-side: auto-resurrection trigger** — replace the F11 stand-in with the
    th06 mechanic (hold focus + release shot near the ghost for ~90 frames → spend
    a life). The `+0xb7e68` spirit ptr + state 2/3 are the hooks (player-struct doc).

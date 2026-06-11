@@ -22,11 +22,12 @@
  *   update. No re-implementation of the hit math or pool iteration.
  *   Resources (lives/cherry) are still SHARED at this stage — P2's death FSM
  *   drives the same global counters P1's does (separate resources come next).
- *   Graze (FUN_0043e3b0) and item collection are resource concerns, deferred.
- *   NOTE: FUN_0043e4e0 is the player-area OVERLAP test (param-relative bool),
- *   NOT the collect/credit logic — that lives in the item-update loop that calls
- *   it. Per-player cherry attribution must hook that caller; see
- *   docs/th07_cherry_determinism.md §6.
+ *   Graze (FUN_0043e3b0) is a resource concern, deferred. Item collection: P2
+ *   now collects items it overlaps, credited to the SHARED pool (see the
+ *   HookedCollectOverlap detour below). NOTE: FUN_0043e4e0 is the player-area
+ *   OVERLAP test (param-relative bool), NOT the collect/credit logic — that
+ *   lives in the item-update loop that calls it. Per-player cherry attribution
+ *   must hook that caller; see docs/th07_cherry_determinism.md §6.
  *
  * SEPARATE RESOURCES (this step): P2 has its own BOMBS + POWER, field-swapped
  *   into the shared resource struct (*0x626278) around P2's update (write P2's
@@ -94,6 +95,10 @@
  * in ECX through ZUN's death FSM. We detour + re-invoke each with ECX=P2. */
 #define ADDR_COLLIDE_BULLET ((LPVOID)0x0043e260) /* bullets + enemy-body contact */
 #define ADDR_COLLIDE_LASER  ((LPVOID)0x0043e6b0) /* lasers                       */
+/* Player-area OVERLAP test (param-relative bool). The item-update loop calls it
+ * per item as the "touched the player -> collect" check, and it is that loop's
+ * only caller. We detour it so an item overlapping a live P2 is collected too. */
+#define ADDR_COLLECT_OVERLAP ((LPVOID)0x0043e4e0)
 
 /* Tier-1 boss/enemy HP scaling. The per-phase max-life cap is (re)written once
  * per phase by the "set life" opcode inside the per-enemy ECL command
@@ -111,6 +116,8 @@ typedef int (__fastcall *CollideBulletFn_t)(void *self, void *edx,
 typedef int (__fastcall *CollideLaserFn_t )(void *self, void *edx,
                                             void *a, void *b, void *c,
                                             void *d, int e);
+typedef int (__fastcall *CollectOverlapFn_t)(void *self, void *edx,
+                                             float *pos, float *size);
 
 /* ---- separate resources (lives/bombs/power) ----
  * They live in the struct at *(player+8) == DAT_00626278, stored as floats, and
@@ -165,6 +172,7 @@ static PlayerFn_t s_origUpdate = NULL;
 static PlayerFn_t s_origDraw   = NULL;
 static CollideBulletFn_t s_origCollideBullet = NULL;
 static CollideLaserFn_t  s_origCollideLaser  = NULL;
+static CollectOverlapFn_t s_origCollectOverlap = NULL;
 static EclInterpFn_t     s_origEclInterp     = NULL;
 
 static volatile void *s_p2   = NULL;   /* P2 object base, NULL until spawned     */
@@ -379,6 +387,23 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
     return r;
 }
 
+/* ---- item collection: let P2 collect items too ----
+ * The per-item "touched the player -> collect" overlap test (single caller =
+ * the item-update loop). After it runs for P1, if P1 did NOT collect this item
+ * but a live, non-ghost P2 overlaps it, return 1 so the caller collects it for
+ * the team. P2's position is the synced merged input, so both netplay machines
+ * collect identically (determinism-safe). Credit goes to the SHARED pool — the
+ * caller is P2-unaware; per-player cherry attribution is the next step (the
+ * item-loop disasm is needed for it). See docs/th07_cherry_determinism.md §6. */
+static int __fastcall HookedCollectOverlap(void *self, void *edx, float *pos, float *size)
+{
+    int r = s_origCollectOverlap(self, edx, pos, size);   /* P1 (unchanged) */
+    void *p2 = (void *)s_p2;
+    if (!r && p2 && !s_p2Ghost && (uint32_t)self == ADDR_PLAYER_BASE)
+        r = s_origCollectOverlap(p2, edx, pos, size);      /* P2 — param-relative */
+    return r;
+}
+
 /* ---- boss/enemy HP scaling detour ----
  * Multiply the per-phase max-life cap by the active player count on the frame
  * the "set life" ECL opcode (re)writes it. Guard: the cap actually changed AND
@@ -516,11 +541,13 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_COLLIDE_BULLET, (LPVOID)&HookedCollideBullet, (LPVOID*)&s_origCollideBullet) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLIDE_LASER,  (LPVOID)&HookedCollideLaser,  (LPVOID*)&s_origCollideLaser)  != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ECL_INTERP,     (LPVOID)&HookedEclInterp,     (LPVOID*)&s_origEclInterp)     != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_LASER)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_ECL_INTERP)     != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_COLLECT_OVERLAP)!= MH_OK) return 0;
     return 1;
 }
 
@@ -540,7 +567,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
                         "th07_coop", MB_ICONERROR);
         else
             Log("hooks installed (update @0x441fb0, draw @0x4420b0, "
-                "collide-bullet @0x43e260, collide-laser @0x43e6b0, ecl-interp @0x424290)");
+                "collide-bullet @0x43e260, collide-laser @0x43e6b0, ecl-interp @0x424290, "
+                "collect-overlap @0x43e4e0)");
         break;
     case DLL_PROCESS_DETACH:
         if (s_log) { Log("detach"); fclose(s_log); }

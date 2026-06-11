@@ -363,8 +363,79 @@ advancing when a demo replay loaded. `input_log.bin` + `sync_record.csv` written
 4. **Graft g_Player2 entity** (Tier-3). Then layer per-player cherry/lives + resurrection on top.
 5. (v2) 3rd player: widen transport, second entity, host-relay topology.
 
+## 5b. Session progress — 2026-06-11 (night routine)
+
+**Headline: there is now a full build+test loop that runs ON LINUX (no Windows
+needed), and the netcode lockstep core is verified end-to-end.**
+
+- **`build.sh`** — Linux/mingw counterpart of `build.ps1`. Builds the harness DLL,
+  co-op DLL, the new netcode-integration DLL, the injector, and both netcode tests
+  with `i686-w64-mingw32-g++`. `./build.sh --test` also RUNS the tests under wine.
+  Toolchain to reproduce: `apt-get install gcc-mingw-w64-i686 g++-mingw-w64-i686`,
+  and to run: `dpkg --add-architecture i386 && apt-get install wine wine32:i386`
+  (wine binary ends up at `/usr/lib/wine/wine`). Confirmed working.
+- **Lockstep integration test** (`tests/netsim.cpp` + `tests/run_netsim.sh`) — the
+  in-process `netloop_test` only covered transport + `MergeKeys`. The new test runs
+  a REAL host+guest in two processes exchanging UDP frames through
+  `Netcode_GetInput_Net()`. **All checks pass:** both peers compute identical merged
+  words over 200 frames, the seed-sync flag holds when seeds agree, and the desync
+  oracle flips correctly on an induced seed divergence (while inputs still merge
+  consistently). This validates the delay buffer + sync detector that were never
+  exercised before. *Bug found & fixed in the test harness only* (mingw/wine writes
+  CRLF; the awk column checks needed `tr -d '\r'`). The netcode itself was correct.
+- **Fork A — integration seams pinned** in **`docs/th07_fork_a_integration.md`**, read
+  straight from `PCBdecomp.c`: `FUN_00442cd0` (input-inject seam, frame index =
+  `*param_1`), `FUN_00442c60` (seed-sync seam), `FUN_00443aa0` (record/playback task
+  registration), mode flags in `DAT_0062f648` (bit 0x4 recording, 0x8 playback),
+  replay-mgr object `DAT_004b9e48`. **Note:** `GameUpdate FUN_0042fd60` (named in §1
+  for the menu-lockstep hook) is NOT present in this dump under that label — the A1
+  menu-lockstep seam must be re-resolved (find what the frame governor `FUN_004346e0`
+  calls once per logic frame). A2 (gameplay-only) is fully specified and is the path.
+- **Fork A — integration DLL written** (`src/netplay/coop_net.cpp` → `th07_coop_net.dll`).
+  Detours `FUN_00442cd0` (overwrite `g_InputGameplay` with the merged word) and
+  `FUN_00442c60` (force shared seed); reads `coop_net.ini`; resets netcode on
+  new-game frame reset. **Compile-verified only — NOT game-tested.** This is the next
+  thing to put in front of the actual game (two PCs / two instances).
+- **Tier 1 — boss HP scaling pinned** in **`docs/th07_boss_hp_scaling.md`**. Verified
+  the inverted HP model: damage accumulates into enemy `+0xd18` toward cap `+0xd30`;
+  phase ends when `d18 >= d30` (`FUN_00425400/580/700`). Scale target = `+0xd30`, set
+  at the ECL set-life opcode in `FUN_00424290:14066`. Runtime-detour recipe included.
+  **Caution recorded:** `FUN_0043958d` is a generic counter-lerp helper (~50 call
+  sites) — do NOT hook it to scale HP.
+- **Address audit:** spot-checked the load-bearing constants in `coop.c`/`harness.c`
+  against the dump — `Input_Poll FUN_00430b50` (19469, writes `g_InputMenu`), player
+  base `0x4bdad8`, collision fns `0x43e260`/`0x43e6b0`, res ptr `0x626278`, etc. — all
+  present and consistent. No constant bugs found. `coop.c`'s struct offsets are also
+  empirically validated by its successful runtime log (P2 spawns/updates/draws).
+- **Observation for a future session:** in the last `build/coop_log.txt`, P2 spawns in
+  **state 3 (respawn-invuln) and never leaves it** (the tail is all "P2 draw st=3").
+  Worth checking whether P2 cloned mid-invuln and is stuck non-interactive, or if the
+  state machine just isn't advancing for the piggyback clone. Needs the game to debug.
+
+### ⚠️ BLOCKER for whoever runs next: git push was DENIED this session.
+`git push` to the proxy returns **403 "Permission to baclo-san/PCB-Coop.git denied"**,
+and the GitHub MCP returns **403 "Resource not accessible by integration"** (can't
+create a branch or push files either). Reads (fetch/ls-remote) work; writes do not.
+The work above is committed **locally** on `claude/optimistic-brown-xe5tz6` but could
+not be pushed — if the container was reclaimed before a human re-pushed, recover from
+this transcript. First action next session: verify write access, then `git push`.
+
+### Updated next steps
+1. **Game-test `th07_coop_net.dll`** (A2): inject into two th07.exe instances with
+   matching `coop_net.ini` (one host, one guest, same delay+seed), reach a stage, and
+   confirm both see the merged input + the RNG counter `0x0049fe24` stays locked. This
+   is the live proof of the determinism premise (supersedes the old record/replay-diff
+   plan — the netsim test already proved the lockstep logic in isolation).
+2. **Resolve the A1 menu-lockstep seam** (once-per-logic-frame hook) so char/difficulty
+   select syncs; until then coordinate menus manually.
+3. **Real seed handshake**: host sends `Ctrl_Set_InitSetting.rng_seed_init`; guest
+   adopts it (today both read the seed from config).
+4. **Merge Fork A + Fork B**: feed the merged word's high bits to `coop.c`'s P2 (it
+   currently reads a local keyboard); investigate the P2 state-3 observation above.
+5. **Tier 1 boss HP**: implement the `FUN_00424290` detour from the boss-HP doc.
+
 ## 6. Reference file locations
-- Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`
+- Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)
 - th06 decomp base: GensokyoClub/happyhavoc
 - Persistent memory index: `C:\Users\rndmdck\.claude\projects\C--Users-rndmdck\memory\MEMORY.md`

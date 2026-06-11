@@ -39,15 +39,25 @@ value = `<global> − cherry_base`; the HUD draws all three this way (PCBdecomp.
 - **Item collection adds to NO cherry value** — it only *reads* Cherry to scale
   point items. See `docs/th07_item_collect_credit.md`.
 
-### ⚠️ Co-op implication for the SHARED-border decision
-`FUN_00441330` runs for P2 too (coop.c's `FUN_00441fb0` piggyback). If P2 is in
-border state 4, **P2's update overwrites `DAT_0062f890` with P2's border progress**,
-so the border gauge follows whichever player updated last (P2). For the chosen
-**shared border**, coop.c must reconcile `DAT_0062f890` after P2's piggyback update
-(e.g. snapshot P1's `DAT_0062f890` before P2's update and restore it after, so the
-single border follows P1; or compute an agreed function of both). Determinism-safe
-either way — all cherry globals are lockstep sim state; this is a gameplay-
-correctness fix, not a sync fix.
+### ⚠️ Co-op implication for the SHARED-border decision (border = bombing)
+**In PCB, bombing IS activating the border.** Border-*start* = `FUN_00441960`
+(state→4, inits the per-player border timer `+0x16a08`=0x21c / duration `+0x16a14`),
+called from **`FUN_004409f0`**, which reads the **bomb bit of `g_InputGameplay`**
+(`DAT_004b9e50 & 2`). coop.c swaps `g_InputGameplay` to P2's input during P2's
+update, so **P2 already bombs/borders independently** off its own (separate) bombs.
+`FUN_00441330` (state-4 handler) then recomputes the **single global gauge**
+`DAT_0062f890` from the *per-player* timer — so P2's border clobbers P1's gauge.
+
+⇒ "Shared border" is a **design fork**, not just a clobber to patch, because the
+border is per-player bombing but the gauge is one global. Options (await user):
+- **(A) P2's bomb triggers ONE team border** — both players get invuln + bullet
+  clear, one gauge. Most faithful; needs routing P2's trigger to a single border
+  (P1-owned) + mirroring border invuln onto P2.
+- **(B) Independent borders, gauge follows P1** — least work (snapshot/restore
+  `DAT_0062f890` around P2's update); but the meter is wrong when only P2 borders.
+- **(C) Full per-player borders** — second gauge global + HUD (user leaned away
+  from this earlier as trivializing).
+Determinism is unaffected in all cases (cherry globals are lockstep sim state).
 
 ---
 

@@ -22,8 +22,11 @@
  *   update. No re-implementation of the hit math or pool iteration.
  *   Resources (lives/cherry) are still SHARED at this stage — P2's death FSM
  *   drives the same global counters P1's does (separate resources come next).
- *   Graze (FUN_0043e3b0) and item collect (FUN_0043e4e0) are resource concerns,
- *   deferred.
+ *   Graze (FUN_0043e3b0) and item collection are resource concerns, deferred.
+ *   NOTE: FUN_0043e4e0 is the player-area OVERLAP test (param-relative bool),
+ *   NOT the collect/credit logic — that lives in the item-update loop that calls
+ *   it. Per-player cherry attribution must hook that caller; see
+ *   docs/th07_cherry_determinism.md §6.
  *
  * SEPARATE RESOURCES (this step): P2 has its own BOMBS + POWER, field-swapped
  *   into the shared resource struct (*0x626278) around P2's update (write P2's

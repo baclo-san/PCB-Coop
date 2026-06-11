@@ -463,8 +463,13 @@ this transcript. First action next session: verify write access, then `git push`
 2. **Game-side: investigate the P2 state-3 observation** (handoff §5b) with the
    *current* build — does P2 advance through respawn-invuln? This gates revive
    and the auto-resurrection trigger feeling right.
-3. **Game-side: per-player cherry** (Tier-2, `docs/th07_cherry_determinism.md`) —
-   the RNG-coupled one; do it carefully (shared item-drop roll stays deterministic).
+3. **Game-side: per-player cherry** (Tier-2, `docs/th07_cherry_determinism.md`).
+   **DECIDED (user, 2026-06-11): separate counts per player, SHARED border.** This
+   is determinism-safe by construction — the gameplay cherry `+0x88` (drives the
+   roll AND the border) stays the shared lockstep value, untouched; "separate
+   counts" is a display attribution layer. Prerequisite = **P2 item collection**
+   (detour the overlap test `FUN_0043e4e0`, ECX=P2); attribution needs the collect
+   loop's disasm (decomp is ambiguous there). Plan in cherry doc §6.
 4. **Game-side: auto-resurrection trigger** — replace the F11 stand-in with the
    th06 mechanic (hold focus + release shot near the ghost for ~90 frames → spend
    a life). The `+0xb7e68` spirit ptr + state 2/3 are the hooks (player-struct doc).

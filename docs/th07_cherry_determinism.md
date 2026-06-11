@@ -104,3 +104,70 @@ read the agreed value directly.
 - (handoff §4 also lists the score sub-struct cherry/point/graze display fields off the
   game-manager object: `+0x20a28` cherry, `+0x20a24` points, `+0x20a2c` graze, border
   state `+0x209f0` — those are display/score, NOT the roll input above.)
+
+---
+
+## 6. Decision + implementation plan (2026-06-11)
+
+**User decision (2026-06-11): "separate counts per player, SHARED border."** Each
+player gets their own cherry count for score/display; the border (bullet-cancel)
+activates off the TEAM total; the shared item-drop roll is fed by the team value.
+(The other options — P1-drives-all, fully-per-player-borders, keep-shared — were
+declined.)
+
+### The determinism re-framing that makes this SAFE by construction
+Delay-based lockstep means **both machines run the entire game sim on the same
+merged input word every frame**, so every value that is a pure function of
+inputs+seed is *already* byte-identical on both ends — including the live cherry
+counter `+0x88`, item positions, collisions, and the border state. The §2
+"second-order desync" warning bites **only if a per-player counter is fed into
+the roll** (a value the two machines might compute differently). The user's choice
+keeps the gameplay-affecting cherry SHARED, so:
+
+> **Leave `+0x88` (the live cherry that drives the roll AND the border) exactly as
+> the engine maintains it — the shared team value. Do NOT swap per-player values
+> into it.** Then the roll site (10445/10495) and border read need NO change and
+> stay deterministic for free. "Separate counts" becomes a **display/score
+> attribution layer** that never feeds the sim.
+
+### What "separate counts" actually requires
+A per-player count = "how much cherry did THIS player collect." That needs to
+attribute each collected cherry item to P1 vs P2 — i.e. P2 must participate in
+**item collection**, and the credit must be split. Findings:
+
+- **`FUN_0043e4e0` (PCBdecomp.c:26056) is NOT the item-collect routine** — it is the
+  player-area **overlap test**: `__thiscall(player, float *pos, float *size)` →
+  returns 1 if the box overlaps the player's collect box (`+0x978/+0x97c/+0x984/
+  +0x988`) and player state ∈ {0,3,4}. It is param-relative (like the bullet/laser
+  primitives coop.c already detours). **coop.c's comment mislabels it "item
+  collect" — corrected there.**
+- The **collection EFFECT** (credit power/points/cherry, spawn bonuses) lives in
+  the **caller** (the item-update loop around PCBdecomp.c:20435), not the
+  primitive. So crediting cherry per-player means detouring/raeding that *caller*,
+  not the overlap test.
+- ⚠️ **The item-collection loop is decompiled ambiguously** (parameter-type
+  confusion — e.g. `FUN_0043e4e0(local_28 + 0x24c, &local_20)` passes an item
+  field where the player base is expected). Reversing the exact cherry-credit
+  store reliably will likely need the **disassembly** of the collect loop, not just
+  `PCBdecomp.c`. The live-cherry increment was not pinned to a single `+=` site;
+  cherry is managed via the bounds (`DAT_0062f88c/888/890`) and the live counter
+  `[0x22]`, with resource accessors `FUN_004325c0/5e0` in the collect path.
+
+### Implementation plan (determinism-safe, staged)
+1. **P2 item collection** (prerequisite, also a standalone co-op win): make items
+   collectable near P2. Cleanest seam = detour the overlap test `FUN_0043e4e0` and
+   re-invoke with ECX=P2 (mirror the bullet/laser detours); the caller then
+   collects items near either player into the shared pool. Determinism-safe: P2's
+   position is the synced merged input, so both machines collect identically.
+2. **Per-player attribution (display only):** to split the count, detour the
+   collect caller (needs the disasm per the caveat) so a cherry collected via the
+   P2-overlap branch increments a DLL-owned `s_p2Cherry` while the P1-overlap branch
+   feeds `s_p1Cherry`; the engine's shared `+0x88` keeps rising as today.
+3. **HUD:** draw the two counts (deferred until a P2 HUD exists — today P2 resources
+   are logged to `coop_log.txt`).
+4. **Border:** no change — it already reads the shared `+0x88` = team total, which
+   is exactly "shared border" per the decision.
+
+Net: the gameplay/determinism surface is untouched (shared cherry); the new code is
+a display attribution layer gated on P2 item collection. Validate later with the
+`0x49fe24` oracle on a border-heavy stage (per the deferred netplay test).

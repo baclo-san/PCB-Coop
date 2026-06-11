@@ -464,6 +464,15 @@ this transcript. First action next session: verify write access, then `git push`
   pool; cherry is NOT credited by collection. ⇒ **separate power/bombs is
   implementable now**; separate cherry display + shared border need the cherry-gain
   trace + the `DAT_0062f890` fix.
+- **3a IMPLEMENTED + GAME-TESTED: P2 collects items into its OWN power/bombs/lives.**
+  `HookedCollectOverlap` + `HookedItemLoop` hold a whole-struct field-swap across each
+  P2-collected item's credit (reuses the proven heal pattern; covers accessors AND
+  direct power writes). User confirmed in-game: P2's power is separate, grows only
+  from P2's pickups, and P2's shot-type levels off its own power — no anti-tamper
+  crash. Score/cherry stay shared.
+- **Cherry-gain: grazing does NOT give cherry** (user re-checked in-game; the wiki was
+  wrong — matches the RE: graze credit `FUN_0043eb90` bumps graze counters + a score
+  bonus, no cherry). Remaining cherry-gain lead = the shot→enemy hit handler.
 
 ### Updated next steps
 > **User directive (2026-06-11): postpone all *manual netplay* testing until the

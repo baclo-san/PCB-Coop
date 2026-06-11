@@ -93,9 +93,13 @@ machines set it identically and credit `s_p2*` identically; the shared struct al
 changes identically. No desync. (Gameplay does change — P2's items feed P2, not the
 team pool — but deterministically.)
 
-**⚠️ Anti-tamper caveat:** `FUN_004325e0`/`FUN_0042d612` validate the checksum on
-entry and fill a cap array with `0xffffffff` (→ crash) if it's inconsistent. The
-heal dance above is required and is exactly coop.c's existing pattern, but it is NOT
-yet runtime-validated for these call sites — a quick **local (non-netplay) smoke
-test** (inject coop.dll, collect items near P2, watch `coop_log.txt` for P2 power
-rising and no crash) is the cheap way to de-risk it before relying on it.
+**Anti-tamper:** `FUN_004325e0`/`FUN_0042d612` validate the checksum on entry and
+fill a cap array with `0xffffffff` (→ crash) if it's inconsistent. The heal dance is
+required (coop.c's existing pattern).
+
+> **✅ IMPLEMENTED & GAME-TESTED (2026-06-11).** coop.c does this via a whole-struct
+> field-swap held across each P2-collected item's credit (see `HookedCollectOverlap`
+> + `HookedItemLoop`), rather than per-accessor detours — that also covers the direct
+> power writes. The user confirmed in-game: **P2's power is separate, grows only from
+> P2's own pickups, and P2's shot-type levels up off its own power** — no anti-tamper
+> crash. Bombs/lives ride the same swap. (Cherry/points stay shared.)

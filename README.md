@@ -66,9 +66,9 @@ isn't game-tested yet.
 ## Status (2026-06-11)
 - ✅ Netcode core: built + unit-tested + **lockstep verified end-to-end** (`netsim`).
 - ✅ Determinism harness + injector: built, smoke-tested in-game.
-- ✅ Fork B (P2 entity): substantial — spawns, killable, collects items, separate
-  bombs/power, ghost mode, F11 revive-from-ghost (stand-in for proximity/graze
-  resurrection).
+- ✅ Fork B (P2 entity): substantial — spawns, killable, collects items into its OWN
+  power/bombs/lives (game-tested: P2 levels its own shot type off its own power),
+  ghost mode, F11 revive-from-ghost (stand-in for proximity/graze resurrection).
 - 🟡 Tier-1 boss/enemy HP scaling: implemented in `coop.c` (scales with player count,
   F5 toggle), **compile-verified, not yet game-tested** (`docs/th07_boss_hp_scaling.md`).
 - 🟡 Fork A (netcode↔game wiring): integration DLL written + compile-verified, **not yet

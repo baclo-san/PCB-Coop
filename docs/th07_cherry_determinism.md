@@ -237,11 +237,10 @@ trace first.
 
 ## 7. Cherry-GAIN investigation (2026-06-11, IN PROGRESS)
 
-User (PCB domain knowledge) says cherry rises from: (a) shots landing on enemies
+User's initial (wiki-level) claims: cherry rises from (a) shots landing on enemies
 (less when focused; also feeds Cherry+), (b) certain item pickups (cherry items /
-petals / bullet-deletion stars from spell captures), (c) grazing (slower in focus).
-"Verify each — it's surface-level." Status below; **the exact `+N cherry` magnitudes
-and the accumulator→cherry hop are NOT fully pinned yet.**
+petals / bullet-deletion stars), (c) grazing. **Update: (c) grazing was re-checked
+in-game and is FALSE** (see below). (a) and (b) still need tracing.
 
 ### Structural finding that complicates this
 The three cherry raws (`DAT_0062f88c/888/890`) are, in every site found, only
@@ -250,20 +249,18 @@ is **not** a direct increment of those globals; it is indirect (a running counte
 accumulator the cherry values derive from, or `cherry_base` moving). That running
 counter is not yet isolated — the crux still open.
 
-### (c) Graze — traced; the simple claim is NOT confirmed as written
+### (c) Graze — ✅ RESOLVED: grazing does NOT give cherry (wiki was wrong)
+**User re-checked in-game (2026-06-11): grazing does not raise cherry at all.** This
+matches the RE exactly:
 - Per-bullet player interaction `FUN_00420490` calls the **graze range test
   `FUN_0043e3b0`** (graze box = player `+0x960/+0x964/+0x96c/+0x970` ± 20px),
   throttled per bullet (`+0x2bcc % 6 == 0` plus a flag, `+0x2e29` bit 5).
 - On a graze, `FUN_0043e3b0` calls credit fn **`FUN_0043eb90`**, which increments the
   graze counters `res+0x14` (cap 9999) & `res+0x18` (cap 999999), adds **200** to
-  score (`res+0x04`), and bumps a cherry-SCALED bonus accumulator
-  `DAT_012fe0d0 += 0x9c4 + ((Cherry)/0x5dc)*0x14` (Cherry = `DAT_0062f88c − base`).
-- ⚠️ It does **NOT** directly raise a cherry *value*. So "grazing raises cherry" is
-  unconfirmed in the credit fn — cherry-from-graze (if real) is via
-  `DAT_012fe0d0`→cherry (untraced) or another path. The focus flag (`+0x240d`) here
-  changes only spark colour/sound, **not** the amounts ⇒ "slower when focused" is
-  more likely graze-*frequency* (the throttle in `FUN_00420490`) than a per-graze
-  cut. Needs the `DAT_012fe0d0` trace to settle.
+  score (`res+0x04`), and bumps `DAT_012fe0d0 += 0x9c4 + ((Cherry)/0x5dc)*0x14`.
+- It touches **no cherry value**. So `DAT_012fe0d0` is a **score/graze-bonus**
+  accumulator (cherry-scaled), NOT a cherry counter — drop it as a cherry lead. The
+  graze→cherry claim is dead.
 
 ### (a) Shots landing & (b) item pickups — NOT yet traced
 - Shot→enemy damage feeds the enemy accumulator `+0xd18` (boss-HP doc); whether it
@@ -273,8 +270,10 @@ counter is not yet isolated — the crux still open.
   seen there; the bullet-deletion-star (spell-capture clear) path is untraced.
 
 ### Next step for 3b
-Trace `DAT_012fe0d0` and the shot-hit handler to the single running cherry counter,
-then confirm which of Cherry (`DAT_0062f88c`) / Cherry+ (`DAT_0062f890`) each source
-feeds and the focus dependency. Only then is a faithful per-player cherry *display*
-possible. None of this blocks determinism — cherry stays shared and
-lockstep-identical regardless.
+Graze is ruled out and `DAT_012fe0d0` is a score-bonus (not cherry). So trace the
+**shot→enemy hit handler** (the most likely real source — the player said shots
+landing raise cherry, less when focused) to the single running cherry counter, then
+confirm which of Cherry (`DAT_0062f88c`) / Cherry+ (`DAT_0062f890`) it feeds and the
+focus dependency; then the bullet-deletion-star / cherry-item paths. Only then is a
+faithful per-player cherry *display* possible. None of this blocks determinism —
+cherry stays shared and lockstep-identical regardless.

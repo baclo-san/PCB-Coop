@@ -120,11 +120,9 @@ notes). Hooking it would corrupt half the game. Scale `+0xd30`, not the accumula
 ---
 
 ## 4. Open questions for a future session
-- Confirm the *actual damage-application* path (where a player shot adds to `+0xd18`
-  for a hit). The three `FUN_004254xx` functions only *advance/draw* the bar; the
-  damage events feed `+0xd18` from the shot↔enemy collision. Not required for
-  scaling (scaling the cap is sufficient), but needed if per-player damage tuning is
-  ever wanted.
+- ~~Confirm the *actual damage-application* path~~ ✅ **RESOLVED (2026-06-12
+  overnight session)** — see §5: damage is computed by `FUN_0043d9e0` and applied
+  by its caller, the per-enemy update `FUN_00420620` (PCBdecomp.c:12822).
 - Non-boss enemies use the same `FUN_00424290` interpreter; the same set-life opcode
   gives them HP too. Option A scales *all* enemies, which is usually desirable for
   co-op. If only bosses should scale, gate on the life-bar flag (`+0xbf4`) or a boss
@@ -132,3 +130,47 @@ notes). Hooking it would corrupt half the game. Scale `+0xd30`, not the accumula
 - Enemy array base/stride (agent-reported, NOT independently verified here):
   base `DAT_0063b218`, stride `0xd68`, state at `+0xbfc`. Verify before relying on a
   whole-array sweep; the detour approach above doesn't need them.
+
+---
+
+## 5. Alternative lever — scale the damage RETURN at `FUN_0043d9e0` (fallback)
+
+(From the 2026-06-12 overnight session, decomp-verified. NOT implemented in the
+shipped coop.c — Option A above is. Keep as the fallback if the ECL-cap detour
+misbehaves in the game test.)
+
+### `FUN_0043d9e0` @ `0x0043d9e0` — the player-shot damage function
+```c
+int __thiscall FUN_0043d9e0(int player /*ECX, has shot array*/,
+                            float *target_pos, float *target_size, int *out_flag);
+```
+- Sweeps the player shot array (`player + 0x2444`, 0x60 slots, stride 0x364;
+  active flag at slot `+0x34a`), AABB-tests each active shot against the target box,
+  and **returns the total damage** dealt this frame (per-shot damage read from slot
+  `+0x348`; reduced during a bomb via the `player+0x16a20` bombing flag, lines
+  25887–25895). Side effects: consumes hit shots (sets slot `+0x34a = 2`, line
+  25906) and spawns hit sparks (25902–25904).
+- **Caller = the per-enemy damage-apply loop** in `FUN_00420620` (def 12608), line
+  12822: the returned value is what gets subtracted from (accumulated into) the
+  enemy's HP.
+
+### Recipe: detour and scale only the return value
+```c
+int __fastcall HookedDamage(void* self, void* edx, float* pos, float* size, int* outf) {
+    int r = s_orig(self, edx, pos, size, outf);   // side effects happen once, normally
+    if (r > 0) { r = r / 2; if (r == 0) r = 1; }   // ~2x effective HP, never a no-op
+    return r;
+}
+```
+- Scaling the **return** (not the per-shot `+0x348` value) preserves shot consumption
+  and hit-spark side effects exactly once — only the HP subtraction shrinks.
+- **Floor at 1** when the original was >0, else 1-damage shots become no-ops.
+- Scales ALL player-shot damage (every enemy, not just bosses) — same scope as
+  Option A's all-enemies behavior, but as a damage divisor (rounding differs).
+
+### Trade-off vs Option A (the shipped ECL-cap detour)
+Option A scales the phase cap once per set-life opcode (exact ×N, no rounding loss,
+life bar drains visually correct). The damage-divisor changes every hit's value
+(integer division loses fractions; per-shot floor can overweight weak shots), but
+it needs no knowledge of the enemy struct. Prefer A; use this if A's game test
+surprises us.

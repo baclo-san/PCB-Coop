@@ -46,12 +46,43 @@ releases it on respawn. This is the death/respawn visual (the drifting spirit). 
 co-op **resurrection** mechanic (hold focus + release shot near a dead partner in
 PLAYER_STATE_SPIRIT for 90 frames → spend a life to revive) keys off exactly this
 death/spirit state. When porting resurrection to PCB, this pointer + state 3/2 are the
-hooks to investigate. (Not yet traced further — flagged for the resurrection task.)
+hooks to investigate — and the death FSM below is where the revive injects.
+
+## Death FSM & the resurrection seam (2026-06-12 overnight session, verified)
+
+The player update `FUN_00441fb0` dispatches on the state byte `+0x2408`. State `2`
+(dying) routes to the **death/respawn handler `FUN_00440cf0` @ `0x00440cf0`**
+(def line 26731) — the seam for a "revive your partner" mechanic:
+
+| Field / call | Meaning | PCBdecomp.c |
+|---|---|---|
+| `+0x16a08` | in state 2 = **deathbomb counter** — frames since the fatal hit; death COMMITS once `0x1d (29) < it` (the timer is state-multiplexed: invuln countdown in state 3, border countdown in state 4) | 26748 |
+| `+0x23f8` | **respawn timer** — set on death, decremented each frame; hits 0 → respawn (restore control, drop power items) | 26778–26779 |
+| `FUN_0042d5cd(-1)` | **lose a life** on death commit | 26763 |
+| `FUN_0048b8a0()` | lives-remaining query; `>0` → respawn (`return 1`), `==0` → set game-over | 26761–26770 |
+| `DAT_0062f64d = 1` | **game-over flag** (= coop.c `ADDR_GAMEOVER`) when out of lives | 26770 |
+| `DAT_00626278 + 0x7c = 0` | **power reset** to 0 on respawn (confirms coop.c `RES_POWER` 0x7c) | 26787 / 26799 |
+| `+0x930 / +0x934` | player X/Y reset to center on respawn (confirms `OFF_POS_X/Y`) | 26750–26751 |
+
+**Resurrection design (mirrors th06's "hold focus + release shot near dead partner
+for ~90 frames → spend a life to revive"):** while the partner is in state `2` inside
+its deathbomb window (`+0x16a08 <= 29`), if the reviver holds the revive input for
+the required frames, force the partner back to state `0`, clear `+0x16a08`/`+0x23f8`,
+and **spend the REVIVER's life** (`FUN_0042d5cd(-1)` on the reviver) instead of
+letting the partner's death commit. coop.c already intercepts the game-over flag for
+P2 (ghost mode); resurrection replaces ghost mode by catching the partner *before*
+the commit. The exact revive input, frame count, and whether revive should also work
+mid-respawn (state 1/3 — i.e. from ghost mode, like the current F11) are tuning
+calls for the live test.
+
+> This section independently re-confirms coop.c's `OFF_STATE` (0x2408), `RES_POWER`
+> (0x7c), `OFF_POS_X/Y` (0x930/0x934) and `ADDR_GAMEOVER` (0x62f64d).
 
 ## Open / unverified
 - Hitbox/graze radius offsets, focus-mode flag, and the power-shot level field are not
   yet located (collision uses the leaf primitives FUN_0043e260/6b0 that coop.c detours,
   which are param-relative — so P2 collision works without knowing the radius offset).
-- Whether `FUN_00441fb0`'s sub-calls pass `ECX = the cloned P2` (vs reloading the P1
-  static base) is the key open question for the clone's state machine — needs the
-  disassembly (ECX is hidden in the decompiled C). See handoff §5b.
+  The graze box is at `+0x960/+0x964/+0x96c/+0x970` (cherry doc §7c).
+- ~~Whether `FUN_00441fb0`'s sub-calls pass `ECX = the cloned P2`~~ ✅ **RESOLVED
+  (2026-06-12, disasm + in-game):** all sub-calls (incl. movement `FUN_0043ee50`)
+  pass ECX = the saved player, so they DO drive the P2 clone (handoff §5d).

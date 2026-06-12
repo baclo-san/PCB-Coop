@@ -97,6 +97,16 @@ team pool — but deterministically.)
 fill a cap array with `0xffffffff` (→ crash) if it's inconsistent. The heal dance is
 required (coop.c's existing pattern).
 
+> **⚠️ Determinism note (2026-06-12 overnight session, verified):** the heal
+> `FUN_004012b0` recomputes the checksum (`+0xb0`), a copy (`+0xac`), a derived
+> guard float at `player+0x9614`, **and two RANDOM canaries (`+0x3c`, `+0x98`) —
+> consuming 2 shared-RNG calls** (`Rng_Next32` at PCBdecomp.c:2868/2870). Every
+> heal advances the RNG counter `0x0049fe24`. Under lockstep netplay this is
+> harmless — both machines run P2's identical sim and consume the same calls —
+> but the co-op RNG stream diverges from a vanilla one, and anything that makes
+> P2's resource events differ *between machines* would desync exactly here.
+> Validate with the counter oracle after the netcode is wired in.
+
 > **✅ IMPLEMENTED & GAME-TESTED (2026-06-11).** coop.c does this via a whole-struct
 > field-swap held across each P2-collected item's credit (see `HookedCollectOverlap`
 > + `HookedItemLoop`), rather than per-accessor detours — that also covers the direct

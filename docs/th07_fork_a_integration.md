@@ -8,6 +8,11 @@ not inferred. It is the concrete recipe the integration DLL needs.
 **Binary:** th07.exe ver 1.00b, SHA256 `35467EAF…E80CA` (see handoff §0). All
 addresses are build-specific to this hash.
 
+> **Naming note:** `PCBdecomp.c` was exported *after* the user renamed one symbol
+> in Ghidra — `FUN_0042fd60` is spelled **`GameUpdate`** in the dump (def line
+> 18943, called at 21133). Every other function is still `FUN_<addr>` /
+> `DAT_<addr>`, and the hex in the name **is** the VA.
+
 ---
 
 ## 1. The replay subsystem is the injection surface
@@ -174,13 +179,26 @@ pre-stage menus (char/difficulty select). Two options (handoff §3b Fork A):
   frame counter of its own, unlike `FUN_00442cd0`). Verify in-game that `FUN_00437c70`
   ticks exactly once per logic frame before relying on it for the frame index.
 
-  **Caveat — the dump is partial:** `GameUpdate FUN_0042fd60`, the frame governor
-  `FUN_004346e0`, and the task-chain manager `0x626218` (all named in the handoff §1)
-  are **absent from `PCBdecomp.c`** — not even referenced. The export covers ~94% of
-  functions (1283/1369 with bodies) but omits some top-level loop functions. If
-  `FUN_00437c70` proves not-once-per-frame, the true GameUpdate seam needs the user's
-  fuller Ghidra db (`th07.exe.c` on their Desktop). Until A1 is validated in-game, A2
-  is the path.
+  **Registration evidence (overnight session, verified):** `FUN_00437c70` is
+  registered as a per-frame supervisor task via `FUN_00430090(FUN_00437c70)` at
+  PCBdecomp.c:23513 — it ticks every logic frame in menus AND gameplay, making it
+  th07's analog of th06's `Supervisor::OnUpdate`. Also note: because the detour
+  overwrites `g_InputMenu` *every* frame, next frame's `DAT_004b9e54` (prev) is the
+  *merged* value too, so menu edge-detection stays self-consistent.
+
+  **⚠️ Second menu poll site:** `FUN_0045bf15` (line 38341) also does
+  `DAT_004b9e4c = FUN_00430b50()` (line 38409) on a different scene path (likely a
+  specific submenu). The `FUN_00437c70` overwrite covers the common case; if a
+  particular menu desyncs, check whether this site clobbered the merged word.
+
+  **Caveat — the dump is partial (CORRECTED 2026-06-12):** `GameUpdate`
+  (`FUN_0042fd60`) **IS in the dump** — under its Ghidra rename `GameUpdate`
+  (line 18943), which is why a `FUN_0042fd60` search comes up empty. Still genuinely
+  absent: the frame governor `FUN_004346e0` and the task-chain manager `0x626218`
+  (the export covers ~94% of functions but omits some top-level loop functions —
+  the fuller db is the user's Desktop `th07.exe.c`). With the `FUN_00437c70`
+  registration evidence above, A1 has a verified seam; until it's validated
+  in-game, A2 remains the safe path.
 
 ---
 
@@ -201,3 +219,48 @@ pre-stage menus (char/difficulty select). Two options (handoff §3b Fork A):
    high bits.
 
 All hook addresses verified present in PCBdecomp.c at the lines cited above.
+
+---
+
+## 8. Wiring the netcode INTO coop.c (the single-DLL integration)
+
+(From the 2026-06-12 overnight session.) Goal: replace `coop.c`'s
+`ReadP2InputLocal()` (keyboard) with the netcode's merged P2 bits, so the existing,
+already-working P2 entity is driven over UDP — one DLL instead of the separate
+`th07_coop_net.dll`.
+
+**Build:** `coop.c` is C, the netcode is C++. The C-callable seam exists:
+**`src/netplay/netcode_c_api.h` / `.cpp`** wrap the `Netcode_*` API with plain C
+linkage + C-friendly types (`Nc_StartHost`, `Nc_GetInputNet(frame, is_in_UI,
+&ctrl)`, etc.). To make the integrated DLL, compile `coop.c` and link the netcode
+TUs (`netcode.cpp`, `Connection.cpp`, `merge.cpp`, `netcode_c_api.cpp`) +
+`-lws2_32` into `th07_coop.dll`; `coop.c` then `#include "netcode_c_api.h"` and
+calls `Nc_*`.
+
+**One hook owns the frame counter and both input globals:**
+
+1. In the **`FUN_00437c70` detour** (runs every logic frame — §6 A1):
+   - `int frame = ++g_netFrame;` (DLL-owned, single source of truth).
+   - `uint16_t merged = Nc_GetInputNet(frame, is_in_UI, &ctrl);` where
+     `is_in_UI = (not in an active stage)` — derive from the same
+     `DAT_0062f648>>2 & 1` flag that gates `FUN_00442cd0`, or from scene state.
+   - Write `g_InputMenu = merged` (UI) so menus lockstep.
+   - `readLocalInput` callback returns the local poll (`*(u16*)0x4b9e4c` BEFORE
+     the overwrite, or call `Input_Poll` directly); `readRngSeed` returns
+     `*(u16*)0x0049fe20`.
+2. In-stage, `FUN_00442cd0` copies `g_InputMenu`→`g_InputGameplay` for free, so P1
+   (low bits) is already the merged P1. **For P2**, keep `coop.c`'s field-swap
+   update, but source P2's word from the **high bits of `merged`**:
+   `uint16_t p2 = (merged >> 9) & 0x7F` re-expanded to low-bit layout
+   (SHOOT2→SHOOT, …) — i.e. replace `ReadP2InputLocal()` with "unpack P2 from the
+   netcode merged word".
+3. Seed sync per §3 in a `FUN_00442c60` detour.
+
+**Net effect:** P1 = host low bits (native), P2 = guest input unpacked into coop.c's
+existing P2 entity. Both machines compute the identical `merged`, so both render the
+same two players. Determinism is gated by seed sync + the `0x0049fe24` counter check.
+
+**⚠️ Determinism interaction to keep in mind:** coop.c's anti-tamper heal
+`FUN_004012b0` **consumes 2 shared-RNG calls** per invocation (canaries) — see the
+note in `th07_item_collect_credit.md` §4. Harmless under lockstep (both machines run
+P2's identical sim), but it makes the co-op RNG stream differ from vanilla.

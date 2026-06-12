@@ -209,6 +209,22 @@ read the agreed value directly.
   game-manager object: `+0x20a28` cherry, `+0x20a24` points, `+0x20a2c` graze, border
   state `+0x209f0` — those are display/score, NOT the roll input above.)
 
+### Score-struct border/display functions (for the P2 cherry HUD work)
+(From the 2026-06-12 overnight session, decomp-verified. These are the SCORE-side
+border state machine — the banner/HUD layer — distinct from the player-side border
+`FUN_00441960`/`FUN_00441bd0`/`FUN_00441670` in §0.) Score sub-struct =
+`gameManager+8` (the `0x626278` struct); display-field line cites: border state
+`+0x209f0` set 15444 / read 15633, 16760; bonus `+0x209ec` 15449; banner anim
+counter `+0x209fc` 0→0xb3 (16761/16769/16770); banner float Y `+0x209e0` 15439;
+cherry display `+0x20a28` 15567/16392; points `+0x20a24` 15559; graze `+0x20a2c`
+15563; total score `+0x209b8` 15620/16812.
+
+| Fn | Role |
+|---|---|
+| `FUN_00427c81(this, bonus, state)` @ `0x00427c81` | **border banner activation** — sets `+0x209f0=state`, `+0x209ec=bonus`, resets the banner anim |
+| `FUN_0042adab(this)` @ `0x0042adab` | border-banner **tick** — advances `+0x209fc`, ends the banner at `>0xb3` |
+| `FUN_00429c42(this)` @ `0x00429c42` | **end-of-stage tally** — writes display cherry/point/graze from the shared totals |
+
 ---
 
 ## 6. Decision + implementation plan (2026-06-11)
@@ -326,6 +342,11 @@ matches the RE exactly:
 - Shot→enemy damage feeds the enemy accumulator `+0xd18` (boss-HP doc); whether it
   also feeds cherry (and the focus reduction) is unverified — find the shot-hit
   handler, look for a cherry / `DAT_012fe0d0` write.
+- **Lead pinned (2026-06-12 overnight): the shot-hit path is now located** —
+  damage calc = `FUN_0043d9e0` (boss-HP doc §5), applied by the per-enemy update
+  `FUN_00420620` at PCBdecomp.c:12822. The cherry-gain write, if shots are the
+  source, should be near that apply site (or inside `FUN_0043d9e0`'s per-hit loop,
+  which also knows the focus state via the player). Start the (a) trace there.
 - Cherry/petal/star items: collect cases 1 & 7 *read* Cherry but no cherry *add* was
   seen there; the bullet-deletion-star (spell-capture clear) path is untraced.
 

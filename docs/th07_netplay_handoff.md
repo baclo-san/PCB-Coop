@@ -903,6 +903,65 @@ afterwards and overlay ghost mode ourselves.
 - Awaiting test: SakuyaA P2 focused shot aims; then green light for
   P2 charselect.
 
+### 5f — round-12: P2 shot-type select (charselect stage 1) — F3
+
+- Round-11 verdict: **SakuyaA aim fix works.** User note for LATER: the
+  P1-centric target *selection* (both homing and aim source from P1's
+  position) is a noticeable gameplay-feel change for Sakuya — seek a
+  **per-player aiming/homing source** eventually (would mean running our own
+  target acquisition for P2 in the frame hook, mirroring PCBdecomp.c
+  12904-12943 with P2's position; the consumption side is already per-player).
+- **The loadout architecture, fully RE'd** (decomp + disasm of the init
+  call sites at 0x442400/0x442429):
+  - Globals: `0x62f645` char (0R/1M/2S), `0x62f646` type (0=A/1=B),
+    `0x62f647` combined sel 0-5. Set at game start from the menu choice.
+  - Player init `FUN_004423e0` (27340) consumes them once:
+    `FUN_00442b70(ECX=&player+0xb7e70, EDX=nameTbl0x49f530[sel])` loads the
+    UNFOCUSED `data/ply{00,01,02}{a,b}.sht`, and `+0xb7e74` /
+    `0x49f548[sel]` the FOCUSED `…s.sht` twin. The loader relocates the
+    buffer and resolves per-shot-entry cb indices via tables at 0x49ecb0+
+    (entry+0x24 spawn cb — 0x43c0d0 is SakuyaA's aim; +0x28 move — 0x43c250
+    is homing; +0x2c/+0x30 draw).
+  - Bomb logic is 4 per-sel fn ptrs IN THE PLAYER (+0x16a3c..48) from the
+    table at **0x49ec50** (6×4: unfoc-bomb upd/draw, foc-bomb upd/draw;
+    e.g. ReimuA 0x408710 = Fantasy Seal update). Update calls +0x16a3c/44,
+    draw calls +0x16a40/48.
+  - Init also bakes from the unfocused .sht header: speeds +0x994/+0x990 =
+    sht[0xc]/2, +0x9a0/+0x99c = sht[0x10]/2, hitbox +0x23f8 = sht[8]. The
+    item loop reads the GLOBAL header (POC line sht[0x20], attract sht[0x14])
+    — global copies of the buffers live at DAT_00575948/4c, freed at stage
+    end by FUN_004428e0.
+  - **Every gameplay consumer is param-relative** — the firing iterator
+    `FUN_0043d160` (25600) walks player+0xb7e70/74 (picks the power-bracket
+    list from header+0x34). So a per-player loadout = rewriting those fields.
+- **Implemented (F3 toggles P2 between A/B of P1's character):**
+  `ApplyP2Selection` loads P2's .sht pair through the engine's own loader
+  (cached per sel for the process lifetime — never freed, so live shots'
+  cb pointers stay valid across re-applies/stages), writes P2's +0xb7e70/74,
+  installs the 4 bomb cbs, re-bakes the header stats. `SwapSelGlobals`
+  swaps the three selection globals to P2's identity around P2's update,
+  draw, and damage-sweep calls — covers char-gated GLOBAL branches that run
+  inside the player path (MarisaB's fire-suppress during a border
+  `FUN_0043d880`:25804, SakuyaB checks at 26391). HUD now shows `P2A`/`P2B`.
+- **Known/accepted (stage-1):**
+  - ReimuA's damage nerf in the enemy update (12844, gates on GLOBAL f647==0)
+    applies P1's identity to the COMBINED damage — rebalance bucket.
+  - SakuyaA's aim-target acquisition gates on GLOBAL char==Sakuya (12913) —
+    same-char teams fine; cross-char is a stage-2 problem.
+- **Stage 2 (different CHARACTER) notes:** the init loads
+  `data/player0N.anm` into the single ANM slot 10 with script-id base 0x400
+  (`FUN_0044df90(10, file, 0x400)` — the third arg IS the id base, and shot
+  anm ids resolve via mgr+0x28ef0+id*4). Plan: load P2's char anm into a
+  free slot with a shifted id base, then remap P2's sprite ids (the .sht
+  entry anm ids at entry+0x20 can be patched in OUR cached buffer; the
+  player/option/bomb hardcoded ids need a P2-context remap in the anm-fetch
+  path). Plus the per-char movement/hit constants come along in the .sht
+  already.
+- Awaiting test (Reimu suggested): F3 before/after spawn → P2 fires the
+  other type (ReimuB needles + Evil-Sealing Circle bomb while P1 stays A);
+  HUD letter flips; revive/border/lasers regression-free; (MarisaA+B: B's
+  lasers under the swap; SakuyaB knife spread + own bomb).
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

@@ -119,6 +119,8 @@
  *   F6  = toggle P2 separate resources (default ON).
  *   F5  = toggle boss/enemy HP scaling (default ON).
  *   F4  = toggle synced cherry team border (default ON).
+ *   F3  = toggle P2's shot TYPE (A <-> B within P1's character) — P2 gets its
+ *         own .sht pair + bomb callbacks (charselect stage 1; live re-apply OK).
  *   F11 = debug instant-revive of a ghost P2 (the graze resurrection above is
  *         the real mechanic; this stays as a test shortcut).
  *
@@ -281,7 +283,7 @@ static ItemLoopFn_t      s_origItemLoop       = NULL;
 static volatile void *s_p2   = NULL;   /* P2 object base, NULL until spawned     */
 static int   s_p2Killable = 1;         /* on by default; F8 toggles              */
 static unsigned char s_p2PrevState = 0;/* for death-transition logging           */
-static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0, s_prevF5 = 0, s_prevF4 = 0;
+static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0, s_prevF5 = 0, s_prevF4 = 0, s_prevF3 = 0;
 
 /* P2's own LIVES + BOMBS + POWER, field-swapped into the shared struct around P2's
  * update; ZUN's anti-tamper checksum is re-healed afterward (see the heal below).
@@ -457,6 +459,48 @@ static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch             
 #define OFF_HOMING_TGT 0x2428          /* base of the target block               */
 #define HOMING_TGT_LEN 0x1c            /* homing xyz + aim xyz + valid flag      */
 
+/* ---- P2 SHOT-TYPE SELECT (charselect stage 1: same character, own A/B) ----
+ * The engine keeps the chosen loadout in three globals and a per-player cache:
+ *   0x62f645 char id (0 Reimu / 1 Marisa / 2 Sakuya), 0x62f646 type (0=A 1=B),
+ *   0x62f647 combined sel 0-5 (= char*2 + type).
+ * The player init FUN_004423e0 (PCBdecomp.c:27340) consumes them ONCE:
+ *   - loads data/ply{00,01,02}{a,b}[s].sht via FUN_00442b70(ECX=&player+0xb7e70
+ *     / +0xb7e74, EDX=nameTbl[sel]) — name tables at 0x49f530 (unfocused) and
+ *     0x49f548 (focused; disasm-verified at 0x442400/0x442429). The loader
+ *     relocates the buffer and resolves per-shot-entry cb indices to fn ptrs.
+ *   - installs 4 per-sel BOMB cbs (player+0x16a3c..48) from the table at
+ *     0x49ec50 (6 sels x 4: unfoc-bomb upd/draw, foc-bomb upd/draw).
+ *   - bakes speed/hitbox stats from the unfocused .sht header (+0xc/+0x10/+8).
+ * EVERY gameplay consumer is then param-relative — the firing iterator
+ * FUN_0043d160 (25600) walks player+0xb7e70/74 — so P2 gets its own loadout by
+ * rewriting exactly these fields. Char-gated GLOBAL branches that run inside
+ * the player's own code path (e.g. MarisaB's border fire-suppress, 25804) are
+ * covered by swapping the three globals around P2-context engine calls.
+ * Same character only for now: a different char needs its own .anm (the init
+ * loads data/player0N.anm into the single ANM slot 10 — P2 would need a free
+ * slot + a script-id remap; that is charselect stage 2). */
+#define ADDR_CHAR_ID      ((volatile unsigned char *)0x0062f645)
+#define ADDR_TYPE_ID      ((volatile unsigned char *)0x0062f646)
+#define ADDR_SEL_ID       ((volatile unsigned char *)0x0062f647)
+#define ADDR_SHT_NAMES_N  ((const char *const *)0x0049f530)  /* by sel, unfocused */
+#define ADDR_SHT_NAMES_F  ((const char *const *)0x0049f548)  /* by sel, focused   */
+#define ADDR_SEL_NAMES    ((const char *const *)0x0049f4ec)  /* "ReimuA".."SakuyaB" */
+#define ADDR_BOMB_CB_TBL  ((void *const *)0x0049ec50)        /* [sel*4 + 0..3]    */
+typedef int (__fastcall *ShtLoadFn_t)(void **out, const char *name); /* 0 = ok */
+#define ADDR_SHT_LOAD     ((ShtLoadFn_t)0x00442b70)
+#define OFF_SHT_UNFOC     0xb7e70      /* void*: unfocused .sht buffer            */
+#define OFF_SHT_FOC       0xb7e74      /* void*: focused .sht buffer              */
+#define OFF_BOMB_CB       0x16a3c     /* 4 consecutive cb ptrs                    */
+#define OFF_SPD_UNF_CUR   0x990
+#define OFF_SPD_UNF       0x994       /* = sht[+0xc]/2                            */
+#define OFF_SPD_FOC_CUR   0x99c
+#define OFF_SPD_FOC       0x9a0       /* = sht[+0x10]/2                           */
+#define OFF_HITBOX        0x23f8      /* = sht[+0x8]                              */
+static int   s_p2Sel = -1;             /* P2's sel 0-5; -1 = mirror P1. F3 toggles A/B */
+static void *s_shtCache[6][2];         /* loaded .sht pairs (game heap, kept for life) */
+static unsigned char s_selSaved[3];    /* global-swap save slots                  */
+static int   s_selSwapped = 0;
+
 static void Log(const char *fmt, ...)
 {
     if (!s_log) return;
@@ -522,6 +566,89 @@ static void TransferP2Shots(void *p2)
     }
 }
 
+/* Swap the three selection globals to P2's identity around a P2-context engine
+ * call so char/type-gated branches (MarisaB fire-suppress during a border,
+ * SakuyaB checks, ...) see P2, not P1. No-op when P2 mirrors P1. */
+static void SwapSelGlobals(int enter)
+{
+    if (enter) {
+        int sel = (s_p2Sel < 0) ? *ADDR_SEL_ID : s_p2Sel;
+        if (sel == *ADDR_SEL_ID) return;
+        s_selSaved[0] = *ADDR_CHAR_ID;
+        s_selSaved[1] = *ADDR_TYPE_ID;
+        s_selSaved[2] = *ADDR_SEL_ID;
+        *ADDR_CHAR_ID = (unsigned char)(sel / 2);
+        *ADDR_TYPE_ID = (unsigned char)(sel & 1);
+        *ADDR_SEL_ID  = (unsigned char)sel;
+        s_selSwapped = 1;
+    } else if (s_selSwapped) {
+        *ADDR_CHAR_ID = s_selSaved[0];
+        *ADDR_TYPE_ID = s_selSaved[1];
+        *ADDR_SEL_ID  = s_selSaved[2];
+        s_selSwapped = 0;
+    }
+}
+
+/* Install P2's selected loadout into its struct: own .sht pair (loaded through
+ * the engine's own loader, cached per selection), the 4 per-sel bomb cbs, and
+ * the .sht-header-derived stats the init bakes. Re-applying mid-stage is safe:
+ * live shots/lasers keep cb pointers into the previously cached buffer, which
+ * stays valid for the process lifetime. Called from SpawnP2 and the F3 toggle. */
+static void ApplyP2Selection(void *p2)
+{
+    char *pp = (char *)p2, *p1 = (char *)ADDR_PLAYER_BASE;
+    int p1sel = *ADDR_SEL_ID;
+    int sel = (s_p2Sel < 0) ? p1sel : s_p2Sel;
+    int k;
+
+    /* stage 1: clamp to P1's character, keep the chosen A/B type */
+    if (sel / 2 != p1sel / 2) sel = (p1sel & ~1) | (sel & 1);
+    s_p2Sel = sel;
+
+    if (sel == p1sel) {
+        /* mirror P1's loadout (also the path BACK after a toggle away) */
+        memcpy(pp + OFF_SHT_UNFOC, p1 + OFF_SHT_UNFOC, 8);
+        for (k = 0; k < 4; k++)
+            *(void **)(pp + OFF_BOMB_CB + 4 * k) =
+                *(void **)(p1 + OFF_BOMB_CB + 4 * k);
+        *(float *)(pp + OFF_SPD_UNF) = *(float *)(p1 + OFF_SPD_UNF);
+        *(float *)(pp + OFF_SPD_UNF_CUR) = *(float *)(p1 + OFF_SPD_UNF_CUR);
+        *(float *)(pp + OFF_SPD_FOC) = *(float *)(p1 + OFF_SPD_FOC);
+        *(float *)(pp + OFF_SPD_FOC_CUR) = *(float *)(p1 + OFF_SPD_FOC_CUR);
+        *(uint32_t *)(pp + OFF_HITBOX) = *(uint32_t *)(p1 + OFF_HITBOX);
+        Log("P2 loadout: %s (mirrors P1)", ADDR_SEL_NAMES[sel]);
+        return;
+    }
+
+    if (!s_shtCache[sel][0]) {
+        void *bufN = NULL, *bufF = NULL;
+        if (ADDR_SHT_LOAD(&bufN, ADDR_SHT_NAMES_N[sel]) != 0 ||
+            ADDR_SHT_LOAD(&bufF, ADDR_SHT_NAMES_F[sel]) != 0) {
+            Log("P2 loadout: .sht load FAILED (%s / %s) — keeping P1's",
+                ADDR_SHT_NAMES_N[sel], ADDR_SHT_NAMES_F[sel]);
+            s_p2Sel = p1sel;
+            return;
+        }
+        s_shtCache[sel][0] = bufN;
+        s_shtCache[sel][1] = bufF;
+        Log("P2 loadout: loaded %s + %s", ADDR_SHT_NAMES_N[sel], ADDR_SHT_NAMES_F[sel]);
+    }
+
+    *(void **)(pp + OFF_SHT_UNFOC) = s_shtCache[sel][0];
+    *(void **)(pp + OFF_SHT_FOC)   = s_shtCache[sel][1];
+    for (k = 0; k < 4; k++)
+        *(void **)(pp + OFF_BOMB_CB + 4 * k) = ADDR_BOMB_CB_TBL[sel * 4 + k];
+    {
+        char *sht = (char *)s_shtCache[sel][0];
+        *(float *)(pp + OFF_SPD_UNF) = *(float *)(sht + 0xc) / 2.0f;
+        *(float *)(pp + OFF_SPD_UNF_CUR) = *(float *)(pp + OFF_SPD_UNF);
+        *(float *)(pp + OFF_SPD_FOC) = *(float *)(sht + 0x10) / 2.0f;
+        *(float *)(pp + OFF_SPD_FOC_CUR) = *(float *)(pp + OFF_SPD_FOC);
+        *(uint32_t *)(pp + OFF_HITBOX) = *(uint32_t *)(sht + 8);
+    }
+    Log("P2 loadout: %s (P1 = %s)", ADDR_SEL_NAMES[sel], ADDR_SEL_NAMES[p1sel]);
+}
+
 static void SpawnP2(void)
 {
     if (s_p2) return;                       /* already spawned */
@@ -541,6 +668,8 @@ static void SpawnP2(void)
 
     /* the clone copied P1's focus-ring handle — P2 must not own P1's ring */
     *(uint32_t *)((char *)p2 + OFF_PLAYER_FX) = 0;
+
+    ApplyP2Selection(p2);                   /* P2's own shot type (F3 toggles) */
 
     s_p2PrevState = *(unsigned char *)((char *)p2 + OFF_STATE);
 
@@ -864,7 +993,14 @@ static void PollHotkeys(void)
     int f5  = (GetAsyncKeyState(VK_F5)  & 0x8000) != 0;
     int f4  = (GetAsyncKeyState(VK_F4)  & 0x8000) != 0;
     int f11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    int f3  = (GetAsyncKeyState(VK_F3)  & 0x8000) != 0;
     if (f9  && !s_prevF9)  { Log("F9 edge detected");  SpawnP2(); }
+    if (f3  && !s_prevF3) {
+        int cur = (s_p2Sel < 0) ? *ADDR_SEL_ID : s_p2Sel;
+        s_p2Sel = cur ^ 1;                  /* A <-> B within P1's character */
+        Log("F3: P2 shot type -> %s", ADDR_SEL_NAMES[s_p2Sel]);
+        if (s_p2) ApplyP2Selection((void *)s_p2);   /* live re-apply is safe */
+    }
     if (f10 && !s_prevF10) { Log("F10 edge detected"); DespawnP2(); }
     if (f8  && !s_prevF8)  { s_p2Killable = !s_p2Killable; Log("P2 killable %s", s_p2Killable ? "ON" : "OFF"); }
     if (f7  && !s_prevF7)  { s_shotXfer = !s_shotXfer; Log("shot xfer %s", s_shotXfer ? "ON" : "OFF"); }
@@ -883,6 +1019,7 @@ static void PollHotkeys(void)
     s_prevF5  = f5;
     s_prevF4  = f4;
     s_prevF11 = f11;
+    s_prevF3  = f3;
 }
 
 /* ---- collision detours: make P2 killable ----
@@ -1042,7 +1179,10 @@ static int __fastcall HookedDamage(void *self, void *edx,
      * array, so nothing is double-counted. */
     if (p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost) {
         int f2 = 0;
-        int r2 = s_origDamage(p2, edx, pos, size, &f2);
+        int r2;
+        SwapSelGlobals(1);
+        r2 = s_origDamage(p2, edx, pos, size, &f2);
+        SwapSelGlobals(0);
         if (r2 > 0) r += r2;
         if (f2 && out_flag && !*out_flag) *out_flag = f2;
     }
@@ -1272,7 +1412,9 @@ static int __fastcall HookedUpdate(void *self)
             UpdateTeamBorder(p2);
 
             s_inP2Update = 1;               /* effect-spawn detour: redirect slot */
+            SwapSelGlobals(1);              /* char/type-gated branches see P2 */
             s_origUpdate(p2);               /* trampoline → no detour re-entry */
+            SwapSelGlobals(0);
             s_inP2Update = 0;
 
             if (s_p2SepRes && rb) {
@@ -1371,7 +1513,8 @@ static void DrawCoopHud(void *p2)
     if (s_p2Ghost)
         ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P2 GHOST");
     else
-        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P2 L%d B%d P%d",
+        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P2%c L%d B%d P%d",
+                         ((s_p2Sel >= 0 ? s_p2Sel : *ADDR_SEL_ID) & 1) ? 'B' : 'A',
                          (int)s_p2Lives, (int)s_p2Bombs, (int)s_p2Power);
     if (s_p1Ghost) {
         pos[1] = 312.f;
@@ -1409,7 +1552,9 @@ static int __fastcall HookedDraw(void *self)
              * enemy update only ever fills static P1's block */
             memcpy((char *)p2 + OFF_HOMING_TGT,
                    (char *)ADDR_PLAYER_BASE + OFF_HOMING_TGT, HOMING_TGT_LEN);
+            SwapSelGlobals(1);
             s_origDraw(p2);
+            SwapSelGlobals(0);
             DrawCoopHud(p2);
         }
     }

@@ -114,9 +114,13 @@ PY
 }
 echo ""
 echo "Built:"
+arch_fail=0
 for f in th07_harness.dll th07_coop.dll injector.exe netloop_test.exe; do
-    printf "  %-22s %8d bytes  %s\n" "$f" "$(stat -c%s "$BUILD/$f")" "$(pe_machine "$BUILD/$f")"
+    m="$(pe_machine "$BUILD/$f")"
+    printf "  %-22s %8d bytes  %s\n" "$f" "$(stat -c%s "$BUILD/$f")" "$m"
+    case "$m" in *"32-bit) OK"*) ;; *) arch_fail=1 ;; esac
 done
+[ "$arch_fail" = 0 ] || { echo "ERROR: one or more artifacts are not 32-bit PEs" >&2; exit 1; }
 
 if [ "$RUNTEST" = 1 ]; then
     echo ""

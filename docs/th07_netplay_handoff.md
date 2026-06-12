@@ -792,6 +792,23 @@ afterwards and overlay ghost mode ourselves.
 - Awaiting test: stage 1→2 with P2 alive AND with P2 ghost (rebuild both ways),
   HUD legibility/position, focus-ring blip gone.
 
+### 5f — round-8: FUN_00442c60 is NOT once-per-stage (P2 rebuild cycled)
+
+- Round-7 test: HUD renders correctly; but **P2 was destroyed in a loop** —
+  the log shows 12× `stage init -> rebuild -> despawn -> 3s -> spawn` cycles in
+  one stage-1 run. **`FUN_00442c60` RE-FIRES mid-stage** (so it also re-zeroes
+  the RNG counter mid-stage in vanilla — the fork-a doc §3 claim "runs once" is
+  corrected; harmless for the idempotent seed-sync detour, fatal as a
+  stage-start signal). Symptoms explained: invisible P2 (despawned), one-frame
+  flickers (its single live frame), stuck spell-name/bomb-circle (despawn
+  mid-bomb left the global spell state dangling).
+- **Fix: stage start = the logic-frame counter going BACKWARDS.** coop.c now
+  hooks **`FUN_00442cd0`** (the per-frame record task — the netcode's
+  input-inject seam, now installed and warm for the netplay wiring): `*param`
+  increments once per logic frame and restarts from 0 when a stage load
+  re-news the task object; a decrease triggers the one-shot session rebuild
+  (same carry semantics). Pause-safe (counter only pauses, never decreases).
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

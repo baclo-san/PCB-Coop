@@ -97,7 +97,15 @@ if (DAT_0062f640 != 0)                             // 2-player/PVP start flag
 DAT_0062f640 = 0;
 ```
 
-This runs once at game/stage start and **reads `DAT_0049fe20`** (the seed) to snapshot
+> **⚠️ CORRECTED (2026-06-12, game-proven):** this does NOT run once — it
+> **RE-FIRES repeatedly mid-stage** (coop.c hooked it for a stage-start signal
+> and got 12 fires in one stage-1 run; each fire also re-zeroes the RNG
+> counter, so the counter restarts mid-stage in vanilla too). For the
+> seed-sync detour this is fine (re-forcing the same seed is idempotent), but
+> NEVER use it as a once-per-stage signal — use the `FUN_00442cd0` logic-frame
+> counter going BACKWARDS instead (coop.c `HookedFrameTask`).
+
+This runs at game/stage start (and again mid-stage, see above) and **reads `DAT_0049fe20`** (the seed) to snapshot
 it, then zeroes the counter. To make both machines deterministic from the same seed:
 
 **Hook recipe (seed sync):**

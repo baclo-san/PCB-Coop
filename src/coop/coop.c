@@ -363,17 +363,18 @@ static void KillP2FocusFx(void)
 }
 
 /* ---- stage-start signal + on-screen text ----
- * FUN_00442c60 = the record-start init task (saves the RNG seed into the replay
- * obj, zeroes the call counter — fork-a doc §3). It is re-registered by
- * FUN_00443aa0 at EVERY stage load and runs once per stage — the positive
- * stage-start signal. (The previous >2s update-gap detector NEVER fired: PCB
- * keeps the player task ticking straight through stage transitions — proven by
- * a revive channel charging during the results tally. The stale P2 clone then
- * crossed into stage 2 holding freed stage-1 pointers -> the observed crash.)
- * This is also the future seed-sync detour point for netplay. */
-#define ADDR_STAGE_INIT ((LPVOID)0x00442c60)
-typedef int (__fastcall *StageInitFn_t)(void *self);
-static StageInitFn_t s_origStageInit = NULL;
+ * The reliable stage-start signal is the LOGIC-FRAME COUNTER: FUN_00442cd0 is
+ * the per-frame replay-record task (the netcode's input-inject seam) and
+ * `*param` increments once per logic frame, restarting from 0 when a stage
+ * load re-news the task object. A DECREASE in the counter = a real stage/game
+ * start. (Two prior attempts failed: a >2s update-gap detector never fired —
+ * PCB keeps ticking through transitions; and hooking FUN_00442c60 cycled P2
+ * forever — that init RE-FIRES mid-stage, 12 rebuild cycles in one run. The
+ * handoff's "runs once at game start" note was wrong.) */
+#define ADDR_FRAME_TASK ((LPVOID)0x00442cd0)
+typedef int (__fastcall *FrameTaskFn_t)(int *self);
+static FrameTaskFn_t s_origFrameTask = NULL;
+static int s_lastLogicFrame = 0x7fffffff;
 
 /* ZUN's on-screen text: FUN_00402060(ascii_mgr, float pos[3], fmt, ...) —
  * vsprintf into a local buffer, then queue on the ascii manager (static at
@@ -1067,22 +1068,23 @@ static void __fastcall HookedBorderBreak(void *self, void *edx, int flag)
 }
 
 /* ---- detours ---- */
-/* STAGE START: every stage load re-registers and runs this init task once.
- * The P2 clone's internal pointers reference the PREVIOUS stage's assets,
- * which the load just recycled (proven crash: stale P2 locked in place, then
- * crashed on shoot in stage 2) — so rebuild the whole co-op session here:
+/* STAGE START: the logic-frame counter went BACKWARDS = a fresh stage/game
+ * task. The P2 clone's internal pointers reference the PREVIOUS stage's
+ * assets, which the load just recycled (proven crash: stale P2 locked in
+ * place, then crashed on shoot in stage 2) — rebuild the co-op session:
  * despawn the stale clone, re-arm auto-spawn (P2 returns ~3s in, cloned from
  * the FRESH P1). Resources carry across stages; after a game over the next
  * run reseeds from P1. A ghost is revived by the transition (still 0 spares). */
-static int __fastcall HookedStageInit(void *self)
+static int __fastcall HookedFrameTask(int *self)
 {
-    int r = s_origStageInit(self);
-    if (s_p2 || s_p1Ghost || s_runOver) {
+    int r = s_origFrameTask(self);
+    int f = *self;
+    if (f < s_lastLogicFrame && (s_p2 || s_p1Ghost || s_runOver)) {
         if (s_runOver) {
-            Log("stage init after game over -> full co-op reset");
+            Log("frame counter reset after game over -> full co-op reset");
             s_p2Carry = 0;              /* fresh run: reseed P2 from P1 */
         } else {
-            Log("stage init -> P2 rebuild (resources carried)");
+            Log("frame counter reset (stage start) -> P2 rebuild (resources carried)");
             s_p2Carry = (s_p2 != NULL);
         }
         s_runOver = 0;
@@ -1095,6 +1097,7 @@ static int __fastcall HookedStageInit(void *self)
         s_autoSpawned = 0;          /* re-arm auto-spawn */
         s_readyFrames = 0;
     }
+    s_lastLogicFrame = f;
     return r;
 }
 
@@ -1361,7 +1364,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_COLLIDE_GRAZE,  (LPVOID)&HookedGraze,         (LPVOID*)&s_origGraze)         != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DAMAGE,         (LPVOID)&HookedDamage,        (LPVOID*)&s_origDamage)        != MH_OK) return 0;
     if (MH_CreateHook(ADDR_EFFECT_SPAWN,   (LPVOID)&HookedEffectSpawn,   (LPVOID*)&s_origEffectSpawn)   != MH_OK) return 0;
-    if (MH_CreateHook(ADDR_STAGE_INIT,     (LPVOID)&HookedStageInit,     (LPVOID*)&s_origStageInit)     != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_FRAME_TASK,     (LPVOID)&HookedFrameTask,     (LPVOID*)&s_origFrameTask)     != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
@@ -1372,7 +1375,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_COLLIDE_GRAZE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DAMAGE)         != MH_OK) return 0;
     if (MH_EnableHook(ADDR_EFFECT_SPAWN)   != MH_OK) return 0;
-    if (MH_EnableHook(ADDR_STAGE_INIT)     != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_FRAME_TASK)     != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLECT_OVERLAP)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_ITEM_LOOP)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;

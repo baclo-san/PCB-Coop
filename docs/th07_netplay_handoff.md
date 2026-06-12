@@ -841,6 +841,20 @@ afterwards and overlay ghost mode ourselves.
   the result** (out_flag propagated; no shot double-count — P2's regular shots
   live in P1's array via the transfer). Awaiting test: P2 bomb damage + whether
   the homing also resumes (suspected downstream of sweep contact).
+- **Bomb damage CONFIRMED in-game; homing was separate — root-caused + fixed:**
+  the per-enemy update writes the frame's chosen homing-target position ONLY
+  into the **static P1's `+0x2428/+0x242c`** (absolute `DAT_004bff00/04`,
+  PCBdecomp.c:12908-12932; `+0x2440` = chooser's "have candidate" flag). All
+  homing READERS are param-relative: bomb orbs steer at `player+0x2428`
+  (6061, in the bomb fn `FUN_004091b0` — orb slots at `player+0x16a4c`,
+  stride 0x1428, ×8; the bomb damage boxes live at `player+0x9dc`, ×8 ×0x20)
+  and homing shots likewise (25226) — P2's normal shots only home because
+  they're transferred into P1's array. P2's own field stayed at the ≤-100
+  sentinel forever. **Fix: copy P1's `+0x2428` (8 bytes) into P2 at draw time**
+  (the bomb fns run from the player draw). Both players home at P1's chosen
+  enemy (the chooser ranks by distance to P1) — acceptable. Bomb DIAG logging
+  stripped. Bomb damage balance (currently also halved by the co-op divisor)
+  deferred to a later rebalance pass (user).
 
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)

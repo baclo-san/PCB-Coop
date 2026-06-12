@@ -431,10 +431,16 @@ static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch             
                                           fly-in, then spawn P2 (user: both players
                                           up together at stage start) */
 
-/* DIAG (P2 bomb lethality questioned): log bombing transitions for both
- * players and the first damage-fn returns while any bomb is active. */
-static int s_p1WasBombing = 0, s_p2WasBombing = 0;
-static int s_bombDmgLogged = 0;
+/* HOMING TARGET: the per-enemy update writes the frame's chosen homing target
+ * position ONLY into the static P1's field (absolute DAT_004bff00/04 =
+ * 0x4bdad8+0x2428, PCBdecomp.c:12908-12932). Every homing READER is
+ * param-relative — bomb orbs (6061) and homing shots (25226) steer toward
+ * player+0x2428/+0x242c, with <= -100 as the "no target" sentinel that the
+ * player's own update re-arms each frame. P2's copy was therefore never
+ * filled -> its bomb orbs never homed. coop.c copies P1's target into P2 at
+ * draw time (the bomb fns run from the player draw). Note both players home
+ * at P1's chosen enemy (the chooser ranks by distance to P1) — close enough. */
+#define OFF_HOMING_TGT 0x2428          /* float x, float y                       */
 
 static void Log(const char *fmt, ...)
 {
@@ -1013,13 +1019,7 @@ static int __fastcall HookedDamage(void *self, void *edx,
         *(int *)((char *)p2 + OFF_BOMBING) != 0) {
         int f2 = 0;
         int r2 = s_origDamage(p2, edx, pos, size, &f2);
-        if (r2 > 0) {
-            r += r2;
-            if (s_bombDmgLogged < 10) {
-                s_bombDmgLogged++;
-                Log("dmg(P2 bomb): r2=%d f2=%d", r2, f2);
-            }
-        }
+        if (r2 > 0) r += r2;
         if (f2 && out_flag && !*out_flag) *out_flag = f2;
     }
 
@@ -1176,15 +1176,6 @@ static int __fastcall HookedUpdate(void *self)
                 ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);
             }
         }
-        /* DIAG: P1 bombing transitions */
-        {
-            int b = *(int *)((char *)ADDR_PLAYER_BASE + OFF_BOMBING) != 0;
-            if (b != s_p1WasBombing) {
-                s_p1WasBombing = b;
-                if (b) s_bombDmgLogged = 0;
-                Log("P1 bomb %s", b ? "START" : "end");
-            }
-        }
         /* track P1's last ALIVE pos + bomb stock (1up drop spot / revive bombs) */
         if (!s_p1Ghost) {
             unsigned char st = *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE);
@@ -1303,17 +1294,6 @@ static int __fastcall HookedUpdate(void *self)
                 }
             }
 
-            /* DIAG: P2 bombing transitions */
-            {
-                int b = *(int *)((char *)p2 + OFF_BOMBING) != 0;
-                if (b != s_p2WasBombing) {
-                    s_p2WasBombing = b;
-                    if (b) s_bombDmgLogged = 0;
-                    Log("P2 bomb %s (p1.bombing=%d)", b ? "START" : "end",
-                        *(int *)((char *)ADDR_PLAYER_BASE + OFF_BOMBING));
-                }
-            }
-
             /* P2 focus ring: the effect-spawn detour redirected P2's vanilla
              * spawn into slot 406, so ZUN's machine owns the lifecycle via
              * p2+0x9d8. We only counter the updater's per-frame P1-snap. */
@@ -1400,6 +1380,10 @@ static int __fastcall HookedDraw(void *self)
             if (s_p2FocusFx)
                 memcpy((char *)s_p2FocusFx + OFF_FX_POS,
                        (char *)p2 + OFF_POS_X, 12);
+            /* feed P2 this frame's homing target (see OFF_HOMING_TGT note) —
+             * the bomb fns run from the draw we're about to call */
+            memcpy((char *)p2 + OFF_HOMING_TGT,
+                   (char *)ADDR_PLAYER_BASE + OFF_HOMING_TGT, 8);
             s_origDraw(p2);
             DrawCoopHud(p2);
         }

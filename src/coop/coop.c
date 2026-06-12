@@ -288,6 +288,7 @@ static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 =
 static int   s_p2SepRes = 1;           /* separate lives/bombs/power on; F6 toggles*/
 static float s_p2Lives = 0.f, s_p2Bombs = 0.f, s_p2Power = 0.f;
 static int   s_p2PrevLives = -1, s_p2PrevBombs = -1, s_p2PrevPower = -1;
+static int   s_p2Carry = 0;            /* next SpawnP2 keeps s_p2* (stage transition) */
 
 /* GHOST MODE (symmetric, both players): the PHANTOM SPARE in HookedUpdate
  * keeps ZUN's death commit from ever seeing 0 lives, so a last-life death runs
@@ -332,8 +333,24 @@ static float s_p1AliveBombs = 0.f, s_p2AliveBombs = 0.f;
 typedef void *(__fastcall *EffectSpawnFn_t)(void *mgr, void *edx, int type,
                                             float *pos, int slotArg, int a5,
                                             uint32_t color);
-#define ADDR_EFFECT_SPAWN ((EffectSpawnFn_t)0x0041c610)
+#define ADDR_EFFECT_SPAWN ((LPVOID)0x0041c610)
+static EffectSpawnFn_t s_origEffectSpawn = NULL;
 static void *s_p2FocusFx = NULL;
+static volatile int s_inP2Update = 0;   /* inside s_origUpdate(P2) right now */
+
+/* Redirect P2's vanilla focus-ring spawn (type 0x18, slot 2 = P1's slot 402)
+ * into P2's own slot 406. ZUN's option-mode machine then runs P2's ring
+ * lifecycle natively via p2+0x9d8 — spawn on press, kill on release — and
+ * P1's slot is never touched (the old kill-the-stray defang made P1's ring
+ * blink whenever P2 tapped focus while P1 held it). */
+static void *__fastcall HookedEffectSpawn(void *mgr, void *edx, int type,
+                                          float *pos, int slotArg, int a5,
+                                          uint32_t color)
+{
+    if (s_inP2Update && type == FX_TYPE_FOCUS && slotArg == 2)
+        slotArg = FX_SLOT_P2_FOCUS;
+    return s_origEffectSpawn(mgr, edx, type, pos, slotArg, a5, color);
+}
 
 static void KillP2FocusFx(void)
 {
@@ -466,13 +483,18 @@ static void SpawnP2(void)
     /* nudge P2 X so it's a visibly distinct sprite */
     *(float *)((char *)p2 + OFF_POS_X) += P2_SPAWN_OFFSET_X;
 
+    /* the clone copied P1's focus-ring handle — P2 must not own P1's ring */
+    *(uint32_t *)((char *)p2 + OFF_PLAYER_FX) = 0;
+
     s_p2PrevState = *(unsigned char *)((char *)p2 + OFF_STATE);
 
     /* P2 gets its own LIVES + BOMBS + POWER (field-swapped around its update),
      * seeded from P1's current counts. Running out of lives -> ghost mode. */
     {
         uint32_t res = *ADDR_RES_PTR;
-        if (res) {
+        if (s_p2Carry) {
+            s_p2Carry = 0;          /* stage transition: P2 keeps its own resources */
+        } else if (res) {
             s_p2Lives = *(float *)(res + RES_LIVES);
             s_p2Bombs = *(float *)(res + RES_BOMBS);
             s_p2Power = *(float *)(res + RES_POWER);
@@ -1030,24 +1052,36 @@ static int __fastcall HookedUpdate(void *self)
     int p1Fake = 0;
     uint16_t p1GhostSavedIn = 0;
 
-    /* SESSION RESET: after our both-down game over, player updates stop (game
-     * over -> results -> menu) and resume only when a NEW game starts — but all
-     * the co-op session state (ghost flags, the stale P2 clone) survives in the
-     * DLL and bled into the next run (observed: new game started with P1 "in
-     * ghost mode"). A >2s gap in P1 update ticks while s_runOver is the new-game
-     * signal: full reset + re-arm the auto-spawn. */
+    /* SESSION RESET / P2 REBUILD: player updates stop for seconds between
+     * games (game over -> results -> menu -> new game) AND across stage
+     * transitions (results -> loading) — and the P2 clone's internal pointers
+     * reference the PREVIOUS stage's assets, which the load recycles (the
+     * observed stage-2 crash). Any >2s gap in P1 ticks while co-op state
+     * exists ⇒ despawn the stale clone and re-arm auto-spawn so P2 is rebuilt
+     * from the fresh P1. Resources carry over unless the run ended (after a
+     * game over the next run reseeds from P1). A ghost is revived by the
+     * transition (alive again, still 0 spares). Worst-case false positive is
+     * a >2s PAUSE: P2 blips out and auto-respawns ~3s later with carried
+     * resources — tolerable until a real stage-start hook replaces this. */
     if (isP1) {
         DWORD now = GetTickCount();
-        if (s_runOver && s_lastP1TickMs && (now - s_lastP1TickMs) > 2000) {
-            Log("new game after game over -> co-op session reset");
+        if (s_lastP1TickMs && (now - s_lastP1TickMs) > 2000 &&
+            (s_p2 || s_p1Ghost || s_runOver)) {
+            if (s_runOver) {
+                Log("new game after game over -> full co-op reset");
+                s_p2Carry = 0;          /* fresh run: reseed P2 from P1 */
+            } else {
+                Log("stage transition / long gap -> P2 rebuild (resources carried)");
+                s_p2Carry = (s_p2 != NULL);
+            }
             s_runOver = 0;
             s_p1Ghost = 0;
             s_p2Ghost = 0;
             s_reviveFrames = 0;
             s_shareFrames = 0;
             *(uint32_t *)((char *)ADDR_PLAYER_BASE + OFF_TINT) = 0xffffffffu;
-            DespawnP2();            /* the old clone references the previous game */
-            s_autoSpawned = 0;      /* re-arm auto-spawn for the new run */
+            DespawnP2();            /* the old clone references the previous stage */
+            s_autoSpawned = 0;      /* re-arm auto-spawn */
             s_readyFrames = 0;
         }
         s_lastP1TickMs = now;
@@ -1160,7 +1194,9 @@ static int __fastcall HookedUpdate(void *self)
              * P2's update, so P2 updates in the correct border state. */
             UpdateTeamBorder(p2);
 
+            s_inP2Update = 1;               /* effect-spawn detour: redirect slot */
             s_origUpdate(p2);               /* trampoline → no detour re-entry */
+            s_inP2Update = 0;
 
             if (s_p2SepRes && rb) {
                 s_p2Lives = *rl; s_p2Bombs = *rb; s_p2Power = *rp;  /* capture P2's */
@@ -1205,28 +1241,14 @@ static int __fastcall HookedUpdate(void *self)
                 }
             }
 
-            /* P2 focus ring (see the block comment at the defines) */
+            /* P2 focus ring: the effect-spawn detour redirected P2's vanilla
+             * spawn into slot 406, so ZUN's machine owns the lifecycle via
+             * p2+0x9d8. We only counter the updater's per-frame P1-snap. */
             {
-                int p2Foc = (p2in & IN_FOCUS) != 0 && !s_p2Ghost;
-                /* defang P2's vanilla spawn: it grabbed slot 402 (P1's ring).
-                 * Kill the stray ring unless P1 is legitimately focused, and
-                 * zero the handle so P2's release can't kill P1's ring later.
-                 * (p2+0x9d8 may also hold a stale/cloned handle — same cure.) */
-                uint32_t zfx = *(uint32_t *)((char *)p2 + OFF_PLAYER_FX);
-                if (zfx) {
-                    if (!*(unsigned char *)((char *)ADDR_PLAYER_BASE + 0x240b) &&
-                        *(unsigned char *)(zfx + OFF_FX_TYPE) == FX_TYPE_FOCUS)
-                        *(uint16_t *)(zfx + OFF_FX_KILL) = 1;
-                    *(uint32_t *)((char *)p2 + OFF_PLAYER_FX) = 0;
-                }
-                if (p2Foc && !s_p2FocusFx)
-                    s_p2FocusFx = ADDR_EFFECT_SPAWN(ADDR_EFFECT_MGR, NULL,
-                                                    FX_TYPE_FOCUS,
-                                                    (float *)((char *)p2 + OFF_POS_X),
-                                                    FX_SLOT_P2_FOCUS, 1, 0xffffffffu);
-                else if (!p2Foc)
-                    KillP2FocusFx();
-                if (s_p2FocusFx)        /* counter the updater's P1-snap */
+                uint32_t fx = *(uint32_t *)((char *)p2 + OFF_PLAYER_FX);
+                s_p2FocusFx = (fx && *(unsigned char *)(fx + OFF_FX_TYPE) == FX_TYPE_FOCUS)
+                            ? (void *)fx : NULL;
+                if (s_p2FocusFx)
                     memcpy((char *)s_p2FocusFx + OFF_FX_POS,
                            (char *)p2 + OFF_POS_X, 12);
             }
@@ -1288,6 +1310,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_COLLIDE_LASER,  (LPVOID)&HookedCollideLaser,  (LPVOID*)&s_origCollideLaser)  != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLIDE_GRAZE,  (LPVOID)&HookedGraze,         (LPVOID*)&s_origGraze)         != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DAMAGE,         (LPVOID)&HookedDamage,        (LPVOID*)&s_origDamage)        != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_EFFECT_SPAWN,   (LPVOID)&HookedEffectSpawn,   (LPVOID*)&s_origEffectSpawn)   != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
@@ -1297,6 +1320,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_COLLIDE_LASER)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_GRAZE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DAMAGE)         != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_EFFECT_SPAWN)   != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLECT_OVERLAP)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_ITEM_LOOP)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;

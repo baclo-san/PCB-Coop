@@ -735,6 +735,38 @@ afterwards and overlay ghost mode ourselves.
 - Cherry-border ring for P2 stays a known cosmetic gap (single ring slot);
   user: unnecessary.
 
+### 5f — round-6: ring-blip fix, stage-transition P2 rebuild, next goals
+
+- **P1 ring blip confirmed** (P1 holding focus + P2 taps → P1's ring blinks):
+  P2's vanilla machine re-initializes slot 402 before the defang acts. Fixed at
+  the source: **detour `FUN_0041c610`** — when called from inside P2's update
+  (`s_inP2Update`) with type 0x18 / slotArg 2, redirect to slotArg 6. ZUN's own
+  machine now runs P2's ring lifecycle natively in slot 406 via `p2+0x9d8`
+  (spawn on press, kill on release); coop.c keeps only the per-frame position
+  re-pin. All the manual defang/spawn/kill code is gone. The clone's copied
+  `+0x9d8` handle is zeroed at SpawnP2 (it pointed at P1's ring).
+- **Stage-transition crash (user: crashed shortly after stage 2 loaded):**
+  almost certainly the P2 clone's internal pointers referencing the previous
+  stage's recycled assets. The new-game gap detector is generalized: ANY >2s
+  gap in P1 update ticks while co-op state exists → despawn the stale clone +
+  re-arm auto-spawn (P2 rebuilds from the fresh P1 ~3s into the new stage).
+  **Resources carry across stages** (`s_p2Carry`); after a game over the next
+  run reseeds from P1. A ghost is revived by the transition (still 0 spares).
+  Known false positive: a >2s PAUSE rebuilds P2 with carried resources —
+  tolerable; replace with a real stage-start hook (`FUN_00442c60` candidate —
+  verify it fires per stage, not just per game) if it annoys.
+- **NEXT GOALS (user, 2026-06-12):**
+  1. **Test stage transitions** with the rebuild in place (the crash repro).
+  2. **P2 character select** — the big one. P2 currently clones P1's loaded
+     character. RE needed: where chardata (`+0xb7e70`), the char's anm sprite
+     bank, and the shot-type tables load at stage start (likely keyed off the
+     character/shot selection globals), and whether a SECOND character's
+     assets can be loaded alongside (th07.dat anm loader). Likely staging:
+     (a) same character, different shot type A/B first (asset overlap),
+     (b) full different-character load after the loader RE.
+  3. Then back to the netplay track (handoff §5e plan steps 4–5: netcode→
+     coop.c wiring via `Nc_*`, menu lockstep, seed handshake, live test).
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

@@ -856,6 +856,31 @@ afterwards and overlay ghost mode ourselves.
   stripped. Bomb damage balance (currently also halved by the co-op divisor)
   deferred to a later rebalance pass (user).
 
+### 5f — round-10: revive invuln armed; P2 shots stay home (MarisaB lasers)
+
+- Verdicts: stage transitions pass (alive + ghost P2); bomb damage + homing
+  confirmed working.
+- **Revive left P2 stuck flickering-invulnerable** (until a border rewrote the
+  fields): `ReviveP2/P1` set state=3 without arming the multiplexed timer
+  triplet. Now armed explicitly: `+0x16a08=240` (≈4 s invuln), `+0x16a04=0`,
+  `+0x16a00=0xfffffc19` (the −999 count target) — the state-3 handler counts
+  down and exits normally.
+- **MarisaB option lasers dead for P2 — root-caused:** player lasers ARE shot
+  slots, but they're maintained through owner-side slot POINTERS
+  (`player+0x169d0/+0x169e0/+0x169f0`, 3 slots ×0x10 with timers at
+  `+0x169c4/+0x169cc`; per-frame maintenance in the shot-update
+  `FUN_0043d2f0`, PCBdecomp.c:25665). `TransferP2Shots` moved the slot into
+  P1's array and cleared the original — orphaning the pointer; the laser died
+  instantly. **Fix: the transfer is OFF by default** (F7 re-enables as legacy
+  A/B); P2's shots now live in P2's OWN array — drawn/moved param-relatively
+  as always — and `HookedDamage` re-invokes the enemy sweep with ECX=P2
+  unconditionally (not just while bombing), covering P2's shots, lasers, and
+  bombs. No double-count: each shot lives in exactly one array. Side benefit:
+  P2's homing shots now read P2's own homing-target field (fed at draw time)
+  instead of riding P1's array.
+- Awaiting test: revive → invuln ends ~4 s; MarisaB P2 lasers fire/damage;
+  ReimuA P2 normal+bomb still fine (the array switch touches all shot types).
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

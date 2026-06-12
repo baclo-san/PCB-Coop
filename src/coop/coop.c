@@ -113,7 +113,9 @@
  *   F9  = spawn P2 (clone of P1, offset +24px X). Only when a char is loaded.
  *   F10 = despawn P2 (stop piggyback + free).
  *   F8  = toggle P2 killability (default ON).
- *   F7  = toggle P2 shot damage (default ON).
+ *   F7  = legacy: transfer P2 shots into P1's array (default OFF — P2's shots
+ *         now live in its own array, swept by the damage hook; the transfer
+ *         orphaned MarisaB's laser slot-pointers and killed the lasers).
  *   F6  = toggle P2 separate resources (default ON).
  *   F5  = toggle boss/enemy HP scaling (default ON).
  *   F4  = toggle synced cherry team border (default ON).
@@ -247,12 +249,13 @@ typedef void (__fastcall *BorderBreakFn_t)(void *self, void *edx, int flag);
 #define ADDR_SCORE_SINGLETON ((uint32_t)0x00626270)
 typedef void (__fastcall *HudRefreshFn_t)(uint32_t singleton);
 
-/* player SHOT array (in the player struct). Shots are created/moved param-
- * relative, so P2 makes its own shots — but the shot→enemy damage path only
- * services P1's array. We transfer P2's freshly-fired shots into P1's array so
- * the game's existing collision+draw handle them. Slot pointers reference only
- * shared globals (sprite templates in DAT_004b9e44, shot-type templates), so a
- * raw slot copy is safe. */
+/* player SHOT array (in the player struct). Shots are created/moved/drawn
+ * param-relative, so P2's shots live in P2's OWN array and the damage hook
+ * sweeps it (re-invoke with ECX=P2). The old TRANSFER into P1's array is OFF
+ * by default (F7 re-enables for A/B): it broke MarisaB's lasers — lasers ARE
+ * shot slots, but they're maintained through owner-side slot POINTERS
+ * (player+0x169d0/+0x169e0/+0x169f0, PCBdecomp.c:25665 FUN_0043d2f0); moving
+ * the slot orphaned the pointer and the laser died instantly. */
 #define OFF_SHOTS        0x2444    /* first shot slot                           */
 #define SHOT_STRIDE      0x364     /* bytes per slot                            */
 #define SHOT_COUNT       0x60      /* 96 slots                                  */
@@ -481,7 +484,9 @@ static int s_p2InputLogged = 0;
  * them from P2 (ownership transfer). Runs at the END of P2's update each frame,
  * so P2's array is empty by the time the draw chain runs (no double-draw) and
  * P1's machinery moves/draws/collides them from next frame on. */
-static int s_shotXfer = 1;            /* on by default; F7 toggles              */
+static int s_shotXfer = 0;            /* OFF: P2's shots stay in P2's array (the
+                                         damage hook sweeps it; transfer broke
+                                         MarisaB lasers). F7 re-enables for A/B. */
 static int s_shotXferLogged = 0;
 static void TransferP2Shots(void *p2)
 {
@@ -582,6 +587,13 @@ static void ReviveP2(void)
 
     /* set P2 into respawn-invulnerable state and place near the reviver (P1) */
     *(unsigned char *)((char *)p2 + OFF_STATE) = 3; /* respawn-invuln */
+    /* ARM the invuln countdown — state 3 exits when +0x16a08 drops below 1,
+     * counted toward the -999 target. Setting state=3 with a stale counter
+     * left P2 flickering-invulnerable forever (user-observed; a border "cured"
+     * it because state 4 rewrites these same multiplexed timer fields). */
+    *(int *)((char *)p2 + OFF_BORDER_T0) = 240;         /* ~4s invuln */
+    *(int *)((char *)p2 + OFF_BORDER_T1) = 0;
+    *(int *)((char *)p2 + OFF_BORDER_T2) = 0xfffffc19;  /* count target -999 */
     *(float *)((char *)p2 + OFF_POS_X) = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X) + P2_SPAWN_OFFSET_X;
     *(float *)((char *)p2 + OFF_POS_Y) = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_Y);
     *(uint32_t *)((char *)p2 + OFF_TINT) = 0xffffffffu;  /* drop the ghost tint */
@@ -601,6 +613,9 @@ static void ReviveP1(void)
     /* lives stay as-is (0 spares); bombs were set to the death stock at ghost
      * entry; power is the post-drop value the normal death left in the struct */
     *(unsigned char *)((char *)p1 + OFF_STATE) = 3;
+    *(int *)((char *)p1 + OFF_BORDER_T0) = 240;         /* arm the invuln countdown */
+    *(int *)((char *)p1 + OFF_BORDER_T1) = 0;
+    *(int *)((char *)p1 + OFF_BORDER_T2) = 0xfffffc19;
     *(float *)((char *)p1 + OFF_POS_X) = *(float *)((char *)p2 + OFF_POS_X) - P2_SPAWN_OFFSET_X;
     *(float *)((char *)p1 + OFF_POS_Y) = *(float *)((char *)p2 + OFF_POS_Y);
     *(uint32_t *)((char *)p1 + OFF_TINT) = 0xffffffffu;
@@ -1008,15 +1023,12 @@ static int __fastcall HookedDamage(void *self, void *edx,
     int r = s_origDamage(self, edx, pos, size, out_flag);
     void *p2 = (void *)s_p2;
 
-    /* P2 BOMB DAMAGE: the per-enemy sweep is hardwired to ECX = the static P1
-     * (bisect-proven: r=8/outflag=1 self=004bdad8 during P1's bomb; ZERO
-     * damage calls during P2's bomb, invariant under F5/F7) — so P2's bomb
-     * projectiles were never tested against anything. The fn is param-relative:
-     * re-invoke with ECX = P2 while P2 is bombing and merge. No double-count
-     * for regular shots — P2's live in P1's array via the shot transfer; P2's
-     * own struct holds only the bomb-side state. */
-    if (p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost &&
-        *(int *)((char *)p2 + OFF_BOMBING) != 0) {
+    /* P2 SHOT + BOMB DAMAGE: the per-enemy sweep is hardwired to ECX = the
+     * static P1 (bisect-proven), so re-invoke param-relative for a live P2 —
+     * its own array's shots, its lasers, and its bomb all get tested. With the
+     * shot transfer OFF (the default now), each shot lives in exactly one
+     * array, so nothing is double-counted. */
+    if (p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost) {
         int f2 = 0;
         int r2 = s_origDamage(p2, edx, pos, size, &f2);
         if (r2 > 0) r += r2;

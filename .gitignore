@@ -1,3 +1,7 @@
+# Runtime log from th07_coop.dll — pure run output; a stale committed copy once
+# sent a session chasing a phantom bug (handoff §5b). Never commit it.
+build/coop_log.txt
+
 # Generated test artifacts from tests/run_netsim.sh
 build/clean_host.csv
 build/clean_guest.csv

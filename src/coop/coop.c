@@ -314,8 +314,19 @@ static void PollHotkeys(void)
     if (f8  && !s_prevF8)  { s_p2Killable = !s_p2Killable; Log("P2 killable %s", s_p2Killable ? "ON" : "OFF"); }
     if (f7  && !s_prevF7)  { s_shotXfer = !s_shotXfer; Log("shot xfer %s", s_shotXfer ? "ON" : "OFF"); }
     if (f6  && !s_prevF6)  { s_p2SepRes = !s_p2SepRes; Log("P2 separate-resources %s", s_p2SepRes ? "ON" : "OFF"); }
-    if (f5  && !s_prevF5)  { s_bossHpScale = s_bossHpScale % 3 + 1; s_dmgHookLogged = 0;
-                             Log("boss-HP scale x%d (%s)", s_bossHpScale, s_bossHpScale == 1 ? "OFF" : "ON"); }
+    if (f5  && !s_prevF5)  {
+        int was = s_bossHpScale;
+        s_bossHpScale = s_bossHpScale % 3 + 1;
+        s_dmgHookLogged = 0;
+        /* Enable the damage detour ONLY while scaling is active. Default (x1) leaves
+         * it created-but-disabled, so the original damage code runs untouched and a
+         * possible __thiscall-arity mismatch can't crash the un-opted-in default. */
+        if (was == 1 && s_bossHpScale > 1)
+            Log("enable damage hook -> %s", MH_EnableHook(ADDR_DAMAGE) == MH_OK ? "OK" : "FAILED");
+        else if (s_bossHpScale == 1)
+            Log("disable damage hook -> %s", MH_DisableHook(ADDR_DAMAGE) == MH_OK ? "OK" : "FAILED");
+        Log("boss-HP scale x%d (%s)", s_bossHpScale, s_bossHpScale == 1 ? "OFF" : "ON");
+    }
     s_prevF9  = f9;
     s_prevF10 = f10;
     s_prevF8  = f8;
@@ -482,7 +493,9 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_LASER)  != MH_OK) return 0;
-    if (MH_EnableHook(ADDR_DAMAGE)         != MH_OK) return 0;
+    /* ADDR_DAMAGE is created but NOT enabled here — it stays dormant until the
+     * user opts into boss-HP scaling with F5 (see PollHotkeys). Keeps the default
+     * code path byte-for-byte the pre-scaling DLL even if its arity is imperfect. */
     return 1;
 }
 

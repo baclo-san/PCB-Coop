@@ -673,6 +673,35 @@ awaiting test round 4):
   1up refunds the donation (net zero). P1 donates from the shared struct
   (direct write + checksum heal); P2 donates from `s_p2Lives`.
 
+### 5f — symmetric ghosts + the phantom-spare system (round 4/5 fixes)
+
+Round-4 feedback: revive/share work; remaining issues — (a) the run still ended
+when P1 ran out of lives (ghost system was P2-only), (b) P2 resurrected with
+FULL lives+bombs (ZUN's lives==0 path continue-resets the resources — cheesy),
+(c) a last-life death emitted FULL-POWER items (only useful with continues).
+
+**One mechanism fixes all three — the PHANTOM SPARE:** while co-op is active, a
+player at 0 spares gets a phantom spare swapped into the lives field around
+every update (write + checksum heal for P1; folded into the existing field-swap
+for P2). ZUN's death commit therefore NEVER sees 0 lives → any death runs the
+NORMAL path: usual partial power drop (no full-power items), vanilla respawn,
+no continue reset, no engine game-over. We detect the consumed phantom
+afterwards and overlay ghost mode ourselves.
+
+- **P1 ghosts too now** (input masked around its update, MoveGhost drive, ghost
+  tint, collision/graze/item-collect all skipped via `s_p1Ghost` in the hooks);
+  P2 revives P1 by the same graze-90f + focus-release, donating from
+  `s_p2Lives`. `ReviveByGraze`/`GrazeFeedback` generalized to (ghost, reviver).
+- **GAME OVER is ours now:** only when a player goes down while the partner is
+  already a ghost (`EnterGhostP1/P2` raise ZUN's flag + `s_runOver`). A stray
+  engine game-over during P2's update is cancelled and logged.
+- **Revive values fixed (user spec):** NO bonus lives (0 spares), bombs = stock
+  at death (alive-tracked, overriding the vanilla respawn refill), power =
+  whatever the normal death drop left.
+- Untested edge flagged: the auto cherry border firing while P1 is a ghost
+  (gauge can fill from P2's play; `FUN_0042f5a2` will border a ghost P1).
+  Watch for weirdness in test; fix if it manifests.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

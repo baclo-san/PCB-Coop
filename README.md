@@ -77,13 +77,16 @@ co-op DLL: get into a stage, P2 auto-spawns after ~3 s; see the header comment i
   **grazes** (the graze flag gates bullet hit tests — found 2026-06-12), collects
   items into its OWN power/bombs/lives, shared team border (P2 rides P1's border as
   a ringless shadow), ghost mode. All game-tested.
-- 🟡 EoSD-style resurrection + life sharing: ghost behavior game-tested OK
-  (slow semi-transparent ghost in the lower band). Revive = graze the ghost
-  24px/90 frames then release focus → donate a life (free if broke); guaranteed
-  1up at the death spot on last-life death. NEW: **life sharing** — two live
-  players graze 90 frames without shooting, donor releases focus → drops a 1up
-  for the partner. Graze feedback is visual/SFX-only (stats restored). **Revive
-  + share confirm flow awaiting test.** F11 = debug instant-revive.
+- 🟡 EoSD-style resurrection + life sharing, now **symmetric** (either player
+  ghosts; the partner revives). A **phantom spare** keeps the engine from ever
+  seeing a 0-lives death, so last-life deaths take the normal path (partial
+  power drop — no full-power items, no continue-reset cheese) and **game over
+  only happens when both players are down at once**. Revive = graze the ghost
+  24px/90 frames then release focus → donate a life (free if broke); revives
+  with 0 spares + death-stock bombs + post-drop power; guaranteed 1up at the
+  death spot. **Life sharing**: two live players graze 90 frames without
+  shooting, donor releases focus → drops a 1up for the partner. Graze feedback
+  is visual/SFX-only. **Awaiting test.** F11 = debug instant-revive.
 - ✅ Tier-1 boss/enemy HP scaling: **damage-side divisor** (`FUN_0043d9e0`
   return ÷ player count) — game-tested (Cirno ~2× TTK). Known shelved
   trade-off: popcorn takes 2 homing amulets (`docs/th07_boss_hp_scaling.md`).

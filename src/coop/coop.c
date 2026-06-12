@@ -77,21 +77,30 @@
  *   P2's own bomb); during the border it pops instead. F4 toggles.
  *   See docs/th07_cherry_determinism.md §0.
  *
- * RESURRECTION (EoSD-mod style, user-specified 2026-06-12): when P2 runs out of
- *   lives it becomes a GHOST — invulnerable, no input, semi-transparent (half-
- *   alpha tint), drifting slowly (~1/3 focus speed, position driven directly)
- *   inside a band in the lower playfield, bouncing between the side walls. The
- *   survivor revives it by GRAZING the ghost (within 24px, focus state free)
- *   for 90 consecutive frames, then CONFIRMING with one focus release. While
- *   channeling, the real graze-credit leaf (FUN_0043eb90) fires every 6 frames
- *   for authentic graze SFX/spark feedback — with its stat effects (graze
- *   counters/score/bonus accumulator) snapshot-restored so nothing rises. The
- *   revive DONATES one of the survivor's lives (written into the shared struct
- *   + checksum re-heal) — or is FREE when the survivor has no spare extends.
- *   Additionally, dying on the LAST life drops a guaranteed 1-UP item at the
- *   death spot (tracked last-alive position; ZUN's item spawner FUN_004326f0,
- *   type 5), so the survivor can bank a life and then revive. F11 stays as the
- *   debug instant-revive.
+ * RESURRECTION (EoSD-mod style, user-specified 2026-06-12) — SYMMETRIC: EITHER
+ *   player dying on their last life becomes a GHOST — invulnerable, no input,
+ *   semi-transparent (half-alpha tint), drifting slowly (~1/3 focus speed,
+ *   position driven directly) inside a band in the lower playfield, bouncing
+ *   between the side walls. The survivor revives it by GRAZING the ghost
+ *   (within 24px, focus state free) for 90 consecutive frames, then CONFIRMING
+ *   with one focus release. While channeling, the real graze-credit leaf
+ *   (FUN_0043eb90) fires every 6 frames for authentic graze SFX/spark feedback
+ *   — with its stat effects (graze counters/score/bonus accumulator)
+ *   snapshot-restored so nothing rises. The revive DONATES one of the
+ *   survivor's lives — or is FREE when the survivor has no spare extends.
+ *   Revive values: NO bonus lives (0 spares), bombs = the stock held at death,
+ *   power = whatever the normal death drop left. Dying on the LAST life drops
+ *   a guaranteed 1-UP at the death spot (tracked last-alive position; ZUN's
+ *   item spawner FUN_004326f0, type 5). F11 = debug instant-revive.
+ *
+ * PHANTOM SPARE + GAME OVER: ZUN's lives==0 death path means game over (and
+ *   emits useless-without-continues full-power items, and continue-resets the
+ *   resources). So while co-op is active, a player at 0 spares gets a phantom
+ *   spare swapped in around every update — the engine then processes any death
+ *   as a NORMAL death (partial power drop, vanilla respawn) and never ends the
+ *   game on its own. We detect the consumed phantom, take the player into
+ *   ghost mode, and declare GAME OVER ourselves only when a player goes down
+ *   while the partner is already a ghost (both dead at once).
  *
  * LIFE SHARING (EoSD-mod mechanic, same session): two LIVE players graze each
  *   other (same 24px / 90 frames channel, same feedback) with NEITHER shooting;
@@ -280,19 +289,26 @@ static int   s_p2SepRes = 1;           /* separate lives/bombs/power on; F6 togg
 static float s_p2Lives = 0.f, s_p2Bombs = 0.f, s_p2Power = 0.f;
 static int   s_p2PrevLives = -1, s_p2PrevBombs = -1, s_p2PrevPower = -1;
 
-/* GHOST MODE: when P2's lives reach 0 its death-commit would set the team
- * game-over flag (DAT_0062f64d). We cancel that, and instead leave P2 as an
- * auto-wandering, invulnerable, non-shooting "ghost" until the survivor
- * graze-revives it (EoSD-mod style — see the header). Collision is skipped
- * for a ghost so it can't re-die. */
+/* GHOST MODE (symmetric, both players): the PHANTOM SPARE in HookedUpdate
+ * keeps ZUN's death commit from ever seeing 0 lives, so a last-life death runs
+ * the NORMAL death path (partial power drop, no full-power items, no continue
+ * reset, no game-over flag); we then detect the consumed phantom and turn that
+ * player into an auto-wandering, invulnerable, non-shooting "ghost" until the
+ * partner graze-revives it (EoSD-mod style — see the header). Collision is
+ * skipped for a ghost so it can't re-die. GAME OVER is OURS to declare: only
+ * when a player goes down while the partner is already a ghost. */
 static int   s_p2Ghost = 0;
+static int   s_p1Ghost = 0;            /* symmetric: P1 ghosts too (P2 revives it) */
+static int   s_runOver = 0;            /* both players downed -> we declared game over */
 static int   s_ghostDirX = 1, s_ghostDirY = 1;  /* auto-wander bounce direction */
-static int   s_reviveFrames = 0;       /* consecutive frames P1 grazed the ghost */
+static int   s_reviveFrames = 0;       /* consecutive frames the ghost was grazed */
 static int   s_p1PrevFocus = 0, s_p2PrevFocus = 0; /* focus-release edge tracking */
-static float s_p2AlivePos[3] = {192.f, 384.f, 0.f}; /* P2's last alive position —
-                                        the death FSM resets pos to center before
-                                        we see the last-life death, so the 1up
-                                        must drop at the position we tracked */
+/* Last ALIVE position + bomb stock, tracked per frame (state 0/4). The death FSM
+ * resets pos to center and refills bombs before we see the last-life death, so
+ * the 1up drop spot and the revive bomb count must come from these. */
+static float s_p2AlivePos[3] = {192.f, 384.f, 0.f};
+static float s_p1AlivePos[3] = {192.f, 384.f, 0.f};
+static float s_p1AliveBombs = 0.f, s_p2AliveBombs = 0.f;
 
 /* Graze credit leaf FUN_0043eb90: __thiscall(player, float *grazed_pos) — bumps
  * the graze counters, spawns the graze spark at the midpoint, queues the graze
@@ -427,7 +443,10 @@ static void SpawnP2(void)
             s_p2Power = *(float *)(res + RES_POWER);
         }
         s_p2Ghost = 0;
+        s_p1Ghost = 0;
+        s_runOver = 0;
         s_reviveFrames = 0;
+        s_p2AliveBombs = s_p2Bombs;
         memcpy(s_p2AlivePos, (char *)p2 + OFF_POS_X, sizeof(s_p2AlivePos));
         s_p2PrevLives = s_p2PrevBombs = s_p2PrevPower = -1;
         Log("spawn: P2 lives=%.0f bombs=%.0f power=%.0f (res=0x%08x separate=%d)",
@@ -450,22 +469,47 @@ static void DespawnP2(void)
     Log("despawn: P2 freed");
 }
 
+/* Revive values (user spec 2026-06-12): NO bonus lives (0 spares — the revived
+ * life IS the one you're playing on), bombs = the stock held when the player
+ * DIED (set at ghost entry from the alive-tracked value; the vanilla respawn
+ * refill is overridden), power = whatever the normal death drop left (the
+ * phantom-spare system routes a last-life death through ZUN's NORMAL death
+ * path, so the usual partial power drop already happened — nothing to do). */
 static void ReviveP2(void)
 {
     void *p2 = (void *)s_p2;
     if (!p2 || !s_p2Ghost) return;
 
-    /* exit ghost mode and grant a life if needed */
     s_p2Ghost = 0;
-    if ((int)s_p2Lives <= 0) s_p2Lives = 1.0f;
+    if (s_p2Lives < 0.f) s_p2Lives = 0.f;           /* 0 spares, never negative */
 
-    /* set P2 into respawn-invulnerable state and place near P1 */
+    /* set P2 into respawn-invulnerable state and place near the reviver (P1) */
     *(unsigned char *)((char *)p2 + OFF_STATE) = 3; /* respawn-invuln */
     *(float *)((char *)p2 + OFF_POS_X) = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X) + P2_SPAWN_OFFSET_X;
     *(float *)((char *)p2 + OFF_POS_Y) = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_Y);
+    *(uint32_t *)((char *)p2 + OFF_TINT) = 0xffffffffu;  /* drop the ghost tint */
 
-    Log("P2 revived from GHOST: lives=%.0f state=3 pos=(%.1f,%.1f)", s_p2Lives,
+    Log("P2 revived from GHOST: lives=%.0f bombs=%.0f power=%.0f pos=(%.1f,%.1f)",
+        s_p2Lives, s_p2Bombs, s_p2Power,
         *(float *)((char *)p2 + OFF_POS_X), *(float *)((char *)p2 + OFF_POS_Y));
+}
+
+static void ReviveP1(void)
+{
+    void *p1 = (void *)ADDR_PLAYER_BASE;
+    void *p2 = (void *)s_p2;
+    if (!s_p1Ghost || !p2) return;
+
+    s_p1Ghost = 0;
+    /* lives stay as-is (0 spares); bombs were set to the death stock at ghost
+     * entry; power is the post-drop value the normal death left in the struct */
+    *(unsigned char *)((char *)p1 + OFF_STATE) = 3;
+    *(float *)((char *)p1 + OFF_POS_X) = *(float *)((char *)p2 + OFF_POS_X) - P2_SPAWN_OFFSET_X;
+    *(float *)((char *)p1 + OFF_POS_Y) = *(float *)((char *)p2 + OFF_POS_Y);
+    *(uint32_t *)((char *)p1 + OFF_TINT) = 0xffffffffu;
+
+    Log("P1 revived from GHOST: state=3 pos=(%.1f,%.1f)",
+        *(float *)((char *)p1 + OFF_POS_X), *(float *)((char *)p1 + OFF_POS_Y));
 }
 
 /* ---- EoSD-style resurrection (user-specified 2026-06-12) ---- */
@@ -503,24 +547,55 @@ static void Spawn1Up(float *pos3)
     ADDR_ITEM_SPAWN(mgr, NULL, pos3, ITEM_TYPE_1UP, 0);
 }
 
-/* Guaranteed 1up at the DEATH SPOT when P2 dies on its last life, so the
- * survivor can bank a life and then graze-revive. Only P1 can collect it
- * (the collect-overlap hook skips a ghost P2). Uses the tracked last-alive
- * position — by the time we see the death, the FSM already reset P2's pos
- * to the respawn center (first test dropped the 1up at (192,384) into P1's
- * lap, instantly consumed). */
-static void DropOneUp(void)
+/* ---- ghost entry (phantom-spare aftermath) ----
+ * The phantom spare (see HookedUpdate) routes a last-life death through ZUN's
+ * NORMAL death path — partial power drop, no full-power items, no continue
+ * reset, no game-over flag. When the phantom got consumed we take over here:
+ * the player becomes a ghost (or, if the partner is already a ghost, the run
+ * is genuinely over and WE raise the game-over flag). A guaranteed 1up drops
+ * at the tracked death spot, and the revive bomb stock is pinned to the
+ * alive-tracked value (overriding the vanilla respawn refill). */
+static void EnterGhostP2(void)
 {
+    if (s_p1Ghost) {
+        *ADDR_GAMEOVER = 1; s_runOver = 1;
+        Log("P2 down while P1 is a ghost -> GAME OVER");
+        return;
+    }
+    s_p2Ghost = 1;
+    s_reviveFrames = 0;
+    s_p2Bombs = s_p2AliveBombs;            /* death stock, not the respawn refill */
     Spawn1Up(s_p2AlivePos);
-    Log("P2 last-life death -> dropped 1up at (%.1f,%.1f)",
-        s_p2AlivePos[0], s_p2AlivePos[1]);
+    Log("P2 last-life death -> 1up at (%.0f,%.0f); GHOST mode (bombs=%.0f power=%.0f)",
+        s_p2AlivePos[0], s_p2AlivePos[1], s_p2Bombs, s_p2Power);
+}
+
+static void EnterGhostP1(void)
+{
+    if (s_p2Ghost) {
+        *ADDR_GAMEOVER = 1; s_runOver = 1;
+        Log("P1 down while P2 is a ghost -> GAME OVER");
+        return;
+    }
+    s_p1Ghost = 1;
+    s_reviveFrames = 0;
+    {
+        uint32_t res = *ADDR_RES_PTR;
+        if (res) {
+            *(float *)(res + RES_BOMBS) = s_p1AliveBombs;   /* death stock */
+            ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);
+        }
+    }
+    Spawn1Up(s_p1AlivePos);
+    Log("P1 last-life death -> 1up at (%.0f,%.0f); GHOST mode (bombs=%.0f)",
+        s_p1AlivePos[0], s_p1AlivePos[1], s_p1AliveBombs);
 }
 
 /* Authentic graze feedback with NO stat effects: run the real graze-credit
  * leaf (spark + SFX), then put back the graze counters, the +200 score, and
  * the graze score-bonus accumulator it bumped. ZUN's own code writes these
  * fields directly (no accessor/checksum), so direct restore is equally safe. */
-static void GrazeFeedback(float *pos)
+static void GrazeFeedback(void *player, float *pos)
 {
     uint32_t res = *ADDR_RES_PTR;
     int g14 = 0, g18 = 0, sc = 0, acc = *ADDR_GRAZE_BONUS_ACC;
@@ -529,7 +604,7 @@ static void GrazeFeedback(float *pos)
         g18 = *(int *)(res + RES_GRAZE_TOTAL);
         sc  = *(int *)(res + RES_SCORE);
     }
-    ADDR_GRAZE_CREDIT((void *)ADDR_PLAYER_BASE, NULL, pos);
+    ADDR_GRAZE_CREDIT(player, NULL, pos);
     if (res) {
         *(int *)(res + RES_GRAZE_CUR)   = g14;
         *(int *)(res + RES_GRAZE_TOTAL) = g18;
@@ -543,39 +618,51 @@ static void GrazeFeedback(float *pos)
  * (down->up edge) -> donates one life (free when they have no spare extends)
  * and the ghost resurrects next to them. Radius = hitbox-inside-sprite-ish
  * (user-tuned). While channeling, GrazeFeedback fires every few frames —
- * authentic graze SFX + spark, no stat changes. Runs while the shared struct
- * holds P1's values (after the P2 field-swap restore), so the donation is a
- * direct write + checksum re-heal — the same proven pattern as the swap. */
+ * authentic graze SFX + spark, no stat changes. Symmetric: works for P1
+ * reviving P2 AND P2 reviving P1. Runs while the shared struct holds P1's
+ * values (after the P2 field-swap restore), so a P1 donation is a direct
+ * write + checksum re-heal — the same proven pattern as the swap. */
 #define REVIVE_RADIUS  24.0f
 #define REVIVE_FRAMES  90
 #define REVIVE_TICK     6          /* graze-feedback cadence while channeling */
 
-static void ReviveByGraze(void *p2, int p1FocusRelease)
+static void ReviveByGraze(void *ghost, void *reviver, int reviverIsP1,
+                          int focusRelease)
 {
-    unsigned char p1st = *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE);
-    float dx = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X)
-             - *(float *)((char *)p2 + OFF_POS_X);
-    float dy = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_Y)
-             - *(float *)((char *)p2 + OFF_POS_Y);
+    unsigned char rst = *(unsigned char *)((char *)reviver + OFF_STATE);
+    float dx = *(float *)((char *)reviver + OFF_POS_X)
+             - *(float *)((char *)ghost + OFF_POS_X);
+    float dy = *(float *)((char *)reviver + OFF_POS_Y)
+             - *(float *)((char *)ghost + OFF_POS_Y);
 
-    /* P1 must be in a controllable state (play / respawn-invuln / border) */
-    if ((p1st == 0 || p1st == 3 || p1st == 4) &&
+    /* the reviver must be in a controllable state (play / respawn / border) */
+    if ((rst == 0 || rst == 3 || rst == 4) &&
         dx > -REVIVE_RADIUS && dx < REVIVE_RADIUS &&
         dy > -REVIVE_RADIUS && dy < REVIVE_RADIUS) {
         if (s_reviveFrames % REVIVE_TICK == 0)      /* live feedback: real graze */
-            GrazeFeedback((float *)((char *)p2 + OFF_POS_X));
+            GrazeFeedback(reviver, (float *)((char *)ghost + OFF_POS_X));
         s_reviveFrames++;
-        if (s_reviveFrames >= REVIVE_FRAMES && p1FocusRelease) {
-            uint32_t res = *ADDR_RES_PTR;
-            if (res && *(float *)(res + RES_LIVES) >= 1.0f) {
-                *(float *)(res + RES_LIVES) -= 1.0f;        /* donate one */
-                ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);     /* re-heal checksum */
-                Log("revive: P1 donated a life (%.0f spare left)",
-                    *(float *)(res + RES_LIVES));
+        if (s_reviveFrames >= REVIVE_FRAMES && focusRelease) {
+            if (reviverIsP1) {
+                uint32_t res = *ADDR_RES_PTR;
+                if (res && *(float *)(res + RES_LIVES) >= 1.0f) {
+                    *(float *)(res + RES_LIVES) -= 1.0f;    /* donate one */
+                    ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON); /* re-heal checksum */
+                    Log("revive: P1 donated a life (%.0f spare left)",
+                        *(float *)(res + RES_LIVES));
+                } else {
+                    Log("revive: P1 has no spare extends -> free revive");
+                }
+                ReviveP2();
             } else {
-                Log("revive: P1 has no spare extends -> free revive");
+                if (s_p2Lives >= 1.0f) {
+                    s_p2Lives -= 1.0f;
+                    Log("revive: P2 donated a life (%.0f spare left)", s_p2Lives);
+                } else {
+                    Log("revive: P2 has no spare extends -> free revive");
+                }
+                ReviveP1();
             }
-            ReviveP2();
             s_reviveFrames = 0;
         }
     } else {
@@ -611,7 +698,7 @@ static void LifeShare(void *p2, uint16_t p1in, uint16_t p2in,
         dx > -REVIVE_RADIUS && dx < REVIVE_RADIUS &&
         dy > -REVIVE_RADIUS && dy < REVIVE_RADIUS) {
         if (s_shareFrames % REVIVE_TICK == 0)
-            GrazeFeedback((float *)((char *)p2 + OFF_POS_X));
+            GrazeFeedback((void *)ADDR_PLAYER_BASE, (float *)((char *)p2 + OFF_POS_X));
         s_shareFrames++;
         if (s_shareFrames >= SHARE_FRAMES && (p1FocusRelease || p2FocusRelease)) {
             float pos[3];
@@ -660,7 +747,10 @@ static void PollHotkeys(void)
     if (f6  && !s_prevF6)  { s_p2SepRes = !s_p2SepRes; Log("P2 separate-resources %s", s_p2SepRes ? "ON" : "OFF"); }
     if (f5  && !s_prevF5)  { s_bossHpScale = !s_bossHpScale; Log("boss/enemy HP scaling %s", s_bossHpScale ? "ON" : "OFF"); }
     if (f4  && !s_prevF4)  { s_p2TeamBorder = !s_p2TeamBorder; Log("P2 team-border %s", s_p2TeamBorder ? "ON" : "OFF"); }
-    if (f11 && !s_prevF11) { Log("F11 edge detected"); ReviveP2(); }
+    if (f11 && !s_prevF11) {
+        Log("F11 edge detected");
+        if (s_p2Ghost) ReviveP2(); else if (s_p1Ghost) ReviveP1();
+    }
     s_prevF9  = f9;
     s_prevF10 = f10;
     s_prevF8  = f8;
@@ -695,10 +785,11 @@ static int P2CollisionSkipped(void *p2)
 
 static int __fastcall HookedCollideBullet(void *self, void *edx, float *pos, float *size)
 {
-    int r = s_origCollideBullet(self, edx, pos, size);   /* P1 (unchanged) */
+    int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    int r = (isP1 && s_p1Ghost) ? 0                       /* ghost P1: untouchable */
+          : s_origCollideBullet(self, edx, pos, size);    /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost &&
-        !P2CollisionSkipped(p2))
+    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2))
         s_origCollideBullet(p2, edx, pos, size);          /* P2 — param-relative */
     return r;
 }
@@ -706,10 +797,11 @@ static int __fastcall HookedCollideBullet(void *self, void *edx, float *pos, flo
 static int __fastcall HookedCollideLaser(void *self, void *edx,
                                          void *a, void *b, void *c, void *d, int e)
 {
-    int r = s_origCollideLaser(self, edx, a, b, c, d, e); /* P1 (unchanged) */
+    int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    int r = (isP1 && s_p1Ghost) ? 0
+          : s_origCollideLaser(self, edx, a, b, c, d, e); /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost &&
-        !P2CollisionSkipped(p2))
+    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2))
         s_origCollideLaser(p2, edx, a, b, c, d, e);        /* P2 */
     return r;
 }
@@ -721,9 +813,11 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
  * FUN_0043e3b0 returns 1=grazed, 2=cancelled-by-field, 0=nothing; we only upgrade 0->1. */
 static int __fastcall HookedGraze(void *self, void *edx, float *pos, float *size)
 {
-    int r = s_origGraze(self, edx, pos, size);            /* P1 (unchanged) */
+    int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    int r = (isP1 && s_p1Ghost) ? 0                       /* ghost P1: no grazing */
+          : s_origGraze(self, edx, pos, size);            /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost && !P2CollisionSkipped(p2)) {
+    if (p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
         int r2 = s_origGraze(p2, edx, pos, size);          /* P2 — param-relative */
         if (r == 0 && r2 == 1) r = 1;   /* P2 grazed -> mark bullet grazed so its hit test runs */
     }
@@ -771,9 +865,11 @@ static int __fastcall HookedCollectOverlap(void *self, void *edx, float *pos, fl
 {
     RestoreHeldRes();                                  /* undo the previous item's P2 swap */
 
-    int r = s_origCollectOverlap(self, edx, pos, size);   /* P1 (unchanged) */
+    int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    int r = (isP1 && s_p1Ghost) ? 0                       /* ghost P1: can't collect */
+          : s_origCollectOverlap(self, edx, pos, size);   /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if ((uint32_t)self == ADDR_PLAYER_BASE && !r && p2 && !s_p2Ghost) {
+    if (isP1 && !r && p2 && !s_p2Ghost) {
         r = s_origCollectOverlap(p2, edx, pos, size);      /* P2 — param-relative */
         if (r && s_p2SepRes) {
             /* P2 collected: hold P2's resources in for this item's upcoming credit */
@@ -892,10 +988,58 @@ static void __fastcall HookedBorderBreak(void *self, void *edx, int flag)
 /* ---- detours ---- */
 static int __fastcall HookedUpdate(void *self)
 {
+    int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    int p1Fake = 0;
+    uint16_t p1GhostSavedIn = 0;
+
+    /* PHANTOM SPARE (P1): while co-op is active, ZUN's death commit must never
+     * see 0 lives — the lives==0 path is game-over + full-power items + the
+     * continue-style reset. With a phantom spare swapped in, a last-life death
+     * runs the NORMAL death (partial power drop, vanilla respawn); afterwards
+     * we detect the consumed phantom and overlay ghost mode ourselves. */
+    if (isP1 && s_p2 && !s_runOver) {
+        if (!s_p1Ghost) {
+            uint32_t res = *ADDR_RES_PTR;
+            if (res && *(float *)(res + RES_LIVES) < 1.0f) {
+                *(float *)(res + RES_LIVES) = 1.0f;
+                ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);
+                p1Fake = 1;
+            }
+        } else {
+            p1GhostSavedIn = *ADDR_INPUT_GAMEPLAY;   /* ghost P1: no input at all */
+            *ADDR_INPUT_GAMEPLAY = 0;
+        }
+    }
+
     int r = s_origUpdate(self);             /* P1 (or whatever ctx the task holds) */
 
     /* act only off the real P1 object, never re-entrantly off P2 */
-    if ((uint32_t)self == ADDR_PLAYER_BASE) {
+    if (isP1) {
+        if (s_p1Ghost) {
+            *ADDR_INPUT_GAMEPLAY = p1GhostSavedIn;
+            MoveGhost((void *)ADDR_PLAYER_BASE);
+        }
+        if (p1Fake) {
+            uint32_t res = *ADDR_RES_PTR;
+            float lv = res ? *(float *)(res + RES_LIVES) : 1.0f;
+            if (lv < 1.0f) {
+                EnterGhostP1();             /* phantom consumed -> last-life death */
+            } else if (res) {
+                *(float *)(res + RES_LIVES) = lv - 1.0f;    /* take the phantom back */
+                ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);
+            }
+        }
+        /* track P1's last ALIVE pos + bomb stock (1up drop spot / revive bombs) */
+        if (!s_p1Ghost) {
+            unsigned char st = *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE);
+            if (st == 0 || st == 4) {
+                uint32_t res = *ADDR_RES_PTR;
+                memcpy(s_p1AlivePos, (char *)ADDR_PLAYER_BASE + OFF_POS_X,
+                       sizeof(s_p1AlivePos));
+                if (res) s_p1AliveBombs = *(float *)(res + RES_BOMBS);
+            }
+        }
+
         PollHotkeys();
 
         /* auto-spawn after a few seconds of active gameplay (no keyboard needed) */
@@ -936,14 +1080,19 @@ static int __fastcall HookedUpdate(void *self)
              * -> fills the replay/cap array with 0xffffffff -> crash). */
             float *rb = NULL, *rp = NULL, *rl = NULL; float saveB = 0.f, saveP = 0.f, saveL = 0.f;
             uint32_t ckBefore = 0;
+            int p2Fake = 0;
             uint32_t res = *ADDR_RES_PTR;
-            unsigned char goBefore = *ADDR_GAMEOVER;       /* attribute game-over to P2 */
+            unsigned char goBefore = *ADDR_GAMEOVER;
             if (s_p2SepRes && res) {
                 rl = (float *)(res + RES_LIVES);
                 rb = (float *)(res + RES_BOMBS); rp = (float *)(res + RES_POWER);
                 saveL = *rl; saveB = *rb; saveP = *rp;
                 ckBefore = *(volatile uint32_t *)(res + RES_CHECKSUM);
-                *rl = s_p2Lives; *rb = s_p2Bombs; *rp = s_p2Power;
+                /* PHANTOM SPARE (P2): same trick as P1's — swap in 1 when P2 has
+                 * no spares so a last-life death runs ZUN's NORMAL death path. */
+                p2Fake = (!s_p2Ghost && !s_runOver && s_p2Lives < 1.0f);
+                *rl = p2Fake ? 1.0f : s_p2Lives;
+                *rb = s_p2Bombs; *rp = s_p2Power;
             }
 
             /* Drive P2's ringless shadow border to track P1's (enter/sync/retire) BEFORE
@@ -954,6 +1103,12 @@ static int __fastcall HookedUpdate(void *self)
 
             if (s_p2SepRes && rb) {
                 s_p2Lives = *rl; s_p2Bombs = *rb; s_p2Power = *rp;  /* capture P2's */
+                /* resolve the phantom: consumed -> last-life death -> ghost;
+                 * untouched -> take it back (real spares stay 0) */
+                if (p2Fake) {
+                    if (s_p2Lives < 1.0f) { s_p2Lives = 0.f; EnterGhostP2(); }
+                    else                    s_p2Lives -= 1.0f;
+                }
                 *rl = saveL; *rb = saveB; *rp = saveP;              /* restore P1's */
                 if (*(volatile uint32_t *)(res + RES_CHECKSUM) != ckBefore)
                     ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);         /* re-heal checksum */
@@ -965,18 +1120,12 @@ static int __fastcall HookedUpdate(void *self)
                 }
             }
 
-            /* P2 ran out of lives during its update -> ZUN set the team game-over
-             * flag. Cancel it (P1 plays on), drop P2 into ghost mode, and drop
-             * the guaranteed last-life 1up at the death spot. */
-            if (!s_p2Ghost && !goBefore && *ADDR_GAMEOVER) {
-                *ADDR_GAMEOVER = goBefore;          /* undo P2-caused game-over */
-                s_p2Ghost = 1;
-                s_reviveFrames = 0;
-                Log("P2 death intercept: alivePos=(%.0f,%.0f) itemMgr=%p",
-                    s_p2AlivePos[0], s_p2AlivePos[1], (void *)s_itemMgr);
-                DropOneUp();
-                Log("P2 out of lives -> GHOST mode (auto-wander; graze %d frames to revive)",
-                    REVIVE_FRAMES);
+            /* With the phantom spare, ZUN's lives==0 game-over can no longer fire
+             * during P2's update — cancel anything unexpected (but never OUR
+             * deliberate both-ghosts game over). */
+            if (!goBefore && *ADDR_GAMEOVER && !s_runOver) {
+                *ADDR_GAMEOVER = 0;
+                Log("unexpected game-over flag during P2 update -> cancelled");
             }
 
             *ADDR_INPUT_GAMEPLAY = saved;   /* restore P1's input immediately */
@@ -988,24 +1137,29 @@ static int __fastcall HookedUpdate(void *self)
                     Log("P2 state %d -> %d", s_p2PrevState, st);
                     s_p2PrevState = st;
                 }
-                /* track the last ALIVE position — the 1up death drop uses it
-                 * (the FSM resets pos to center before we see the death) */
-                if (!s_p2Ghost && (st == 0 || st == 4))
+                /* track the last ALIVE position + bomb stock (1up drop / revive) */
+                if (!s_p2Ghost && (st == 0 || st == 4)) {
                     memcpy(s_p2AlivePos, (char *)p2 + OFF_POS_X, sizeof(s_p2AlivePos));
+                    s_p2AliveBombs = s_p2Bombs;
+                }
             }
 
             /* ghost drive + graze resurrection / live life-sharing: the shared
              * struct holds P1's values here (restored above), so a life
-             * donation can write it directly. Both mechanics confirm on a
+             * donation can write it directly. All mechanics confirm on a
              * focus-release edge (P1 = the restored gameplay word; P2 = the
-             * p2in word fed this frame, zeroed while ghost so only P1 confirms). */
-            {
+             * p2in word fed this frame, zeroed while ghost). At most one player
+             * can be a ghost — a second down while one is a ghost is game over. */
+            if (!s_runOver) {
                 uint16_t p1in = *ADDR_INPUT_GAMEPLAY;
                 int p1Rel = s_p1PrevFocus && !(p1in & IN_FOCUS);
                 int p2Rel = s_p2PrevFocus && !(p2in & IN_FOCUS);
                 if (s_p2Ghost) {
                     MoveGhost(p2);
-                    ReviveByGraze(p2, p1Rel);
+                    ReviveByGraze(p2, (void *)ADDR_PLAYER_BASE, 1, p1Rel);
+                } else if (s_p1Ghost) {
+                    /* MoveGhost(P1) already ran right after P1's update */
+                    ReviveByGraze((void *)ADDR_PLAYER_BASE, p2, 0, p2Rel);
                 } else {
                     LifeShare(p2, p1in, p2in, p1Rel, p2Rel);
                 }

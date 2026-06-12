@@ -832,6 +832,15 @@ afterwards and overlay ghost mode ourselves.
   first 10 damage-fn returns while any bomb is active. Bisect run requested:
   P1 bomb vs P2 bomb, with F5 (damage divisor) ON and OFF, and P2 bomb with
   F7 (shot transfer) OFF — read the log after.
+- **BISECT VERDICT (same day): P2's bomb NEVER dealt damage.** P1's bomb:
+  `r=8, outflag=1, self=004bdad8` ×10 per bomb. P2's bomb: ZERO damage calls,
+  invariant under F5/F7 — our hooks innocent. The per-enemy sweep invokes
+  `FUN_0043d9e0` with **ECX = static P1 always**; the fn itself is
+  param-relative (reads the given player's bombing flag + bomb projectiles).
+  **Fix: `HookedDamage` re-invokes with ECX = P2 while P2 is bombing and adds
+  the result** (out_flag propagated; no shot double-count — P2's regular shots
+  live in P1's array via the transfer). Awaiting test: P2 bomb damage + whether
+  the homing also resumes (suspected downstream of sweep contact).
 
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)

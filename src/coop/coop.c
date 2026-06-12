@@ -1000,14 +1000,29 @@ static int __fastcall HookedDamage(void *self, void *edx,
                                    float *pos, float *size, int *out_flag)
 {
     int r = s_origDamage(self, edx, pos, size, out_flag);
-    /* DIAG: sample the first damage returns while any bomb is active — shows
-     * whether bomb damage flows through this fn and with which out_flag */
-    if ((s_p1WasBombing || s_p2WasBombing) && r > 0 && s_bombDmgLogged < 10) {
-        s_bombDmgLogged++;
-        Log("dmg(bomb active): r=%d outflag=%d self=%08x p1b=%d p2b=%d",
-            r, out_flag ? *out_flag : -1, (uint32_t)self,
-            s_p1WasBombing, s_p2WasBombing);
+    void *p2 = (void *)s_p2;
+
+    /* P2 BOMB DAMAGE: the per-enemy sweep is hardwired to ECX = the static P1
+     * (bisect-proven: r=8/outflag=1 self=004bdad8 during P1's bomb; ZERO
+     * damage calls during P2's bomb, invariant under F5/F7) — so P2's bomb
+     * projectiles were never tested against anything. The fn is param-relative:
+     * re-invoke with ECX = P2 while P2 is bombing and merge. No double-count
+     * for regular shots — P2's live in P1's array via the shot transfer; P2's
+     * own struct holds only the bomb-side state. */
+    if (p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost &&
+        *(int *)((char *)p2 + OFF_BOMBING) != 0) {
+        int f2 = 0;
+        int r2 = s_origDamage(p2, edx, pos, size, &f2);
+        if (r2 > 0) {
+            r += r2;
+            if (s_bombDmgLogged < 10) {
+                s_bombDmgLogged++;
+                Log("dmg(P2 bomb): r2=%d f2=%d", r2, f2);
+            }
+        }
+        if (f2 && out_flag && !*out_flag) *out_flag = f2;
     }
+
     if (s_bossHpScale && s_p2 && r > 0) {
         r /= 2;                              /* player count (3P: divide by 3) */
         if (r == 0) r = 1;

@@ -107,6 +107,37 @@ catches this precisely.
 
 ---
 
+## 2b. Resources, anti-tamper & a hidden determinism interaction (verified)
+
+The resource struct (`*(int*)0x00626278`, reached as `*(scoreSingleton 0x626270 + 8)`)
+field offsets `coop.c` uses are **confirmed against the accessors**:
+
+| Field | Offset | Evidence |
+|---|---|---|
+| Lives (float) | `+0x5c` | `FUN_0042d5cd` line 17723: `*(float*)(*(p+8)+0x5c) += delta` |
+| Bombs (float) | `+0x68` | `FUN_0042d612` line 17745: `*(float*)(*(p+8)+0x68) += delta` |
+| Checksum      | `+0xb0` | `FUN_004012b0` line 2874: `*(*(p+8)+0xb0) = FUN_0042d7be()` |
+
+**Anti-tamper** (matches `coop.c`'s comments): each accessor first calls
+`FUN_00404fe0`; if it reports tampering it fills `DAT_00575950` with `0xffffffff`
+(0xb4 dwords) → crash. `FUN_004012b0` is the **heal**: it recomputes the checksum
+(`+0xb0`), two random canaries (`+0x3c`, `+0x98`), a copy (`+0xac`), and a derived
+guard float at `player+0x9614`. So `coop.c` calling `FUN_004012b0` after restoring
+P1's values correctly re-establishes the whole invariant. **Note `FUN_004012b0` is
+the checksum recompute, NOT the visible HUD draw** — the lives/bomb *sprite* draw is
+a separate, not-yet-located function (needed for a real P2 HUD).
+
+> ⚠️ **Determinism interaction for the netcode integration:** `FUN_004012b0`
+> **consumes 2 shared-RNG calls** (`Rng_Next32` at lines 2868/2870 for the canaries).
+> `coop.c` invokes the heal whenever P2's update changed the checksum (i.e. on frames
+> P2 gains/loses a life or bomb). That advances the shared RNG counter
+> (`0x0049fe24`). In 2-player netplay this is harmless **only because both machines
+> run P2's identical simulation and so consume the same calls in lockstep** — but it
+> means the co-op RNG stream diverges from a vanilla/single-player one. Anything that
+> makes P2's resource events differ between machines (e.g. a future *per-player* lives
+> model that isn't byte-identical) will desync here. Validate with the `0x0049fe24`
+> counter oracle after wiring the netcode in.
+
 ## 3. Quick map of related functions (leads, not fully reversed)
 | Addr | Role | Evidence |
 |---|---|---|

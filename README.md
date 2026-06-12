@@ -12,27 +12,27 @@ by an RNG-seed comparison every frame.
 
 ## Start here
 - **`docs/th07_netplay_handoff.md`** — the canonical design doc / session handoff. Read
-  §0–§1 (addresses), then §5b (latest progress) and §5 (next steps).
+  §0–§1 (addresses), then the latest dated §5x progress section and its next steps.
 - **`docs/th07_fork_a_integration.md`** — verified hook seams for wiring the netcode
-  into the game (the input-inject + seed-sync detours).
-- **`docs/th07_boss_hp_scaling.md`** — Tier-1 boss/enemy HP scaling (easiest gameplay
-  change).
-- **`docs/th07_cherry_determinism.md`** — the cherry↔item-drop RNG coupling and how to
-  do per-player cherry without breaking lockstep.
+  into the game (input-inject + seed-sync detours, menu lockstep, the coop.c wiring plan).
+- **`docs/th07_boss_hp_scaling.md`** — Tier-1 boss/enemy HP scaling (implemented; plus
+  an alternative damage-side lever).
+- **`docs/th07_cherry_determinism.md`** — the three-value cherry model, the cherry↔
+  item-drop RNG coupling, and the shared-border design (game-tested).
 - **`docs/th07_item_collect_credit.md`** — verified item-collection credit map
   (power/bombs/points/1up) + the per-player resource attribution design.
-- **`docs/th07_player_struct.md`** — verified PCB Player-object offset map (for the
-  Fork-B second-player graft).
+- **`docs/th07_player_struct.md`** — verified PCB Player-object offset map + the death
+  FSM / resurrection seam (for the Fork-B second-player graft).
 
 ## Layout
 | Path | What |
 |---|---|
-| `PCBdecomp.c` | Ghidra decompilation of th07.exe (~83k lines, ~94% of functions). The RE ground truth. **Partial** — some top-level loop fns (frame governor, GameUpdate) are absent; see the Fork-A doc. |
-| `src/netplay/` | Engine-agnostic netcode core (`netcode.*`, `Connection.*`, lifted from th06_multi_net) + the th07 integration DLL (`coop_net.cpp`). |
-| `src/coop/coop.c` | Fork B — the second-player (P2) entity graft (clone, killable, separate bombs/power, ghost mode). |
+| `PCBdecomp.c` | Ghidra decompilation of th07.exe (~83k lines, ~94% of functions). The RE ground truth. **Partial** — some top-level loop fns (frame governor) are absent; see the Fork-A doc. |
+| `src/netplay/` | Engine-agnostic netcode core (`netcode.*`, `Connection.*`, `merge.*` lifted from th06_multi_net), the C-linkage shim for coop.c (`netcode_c_api.*`), and the th07 integration DLL (`coop_net.cpp`). |
+| `src/coop/coop.c` | Fork B — the second-player (P2) entity graft (clone, killable, grazes, separate bombs/power, shared border, ghost mode + F11 revive). |
 | `src/harness/harness.c` | Determinism harness (record/replay the RNG seed+counter to prove the sim is deterministic). |
 | `src/injector/injector.c` | Launches th07.exe suspended + LoadLibrary-injects a DLL. |
-| `tests/` | `netloop_test` (in-process transport+merge) and `netsim` + `run_netsim.sh` (two-process lockstep integration test). |
+| `tests/` | `merge_test` (native, no wine — exhaustive merge-agreement check, runs in CI), `netloop_test` (in-process transport+merge), and `netsim` + `run_netsim.sh` (two-process lockstep integration test). |
 | `third_party/minhook/` | MinHook (function detours). |
 | `reference/th06_multi_net/` | The reference mod's source (the "phrasebook"). |
 
@@ -43,35 +43,45 @@ by an RNG-seed comparison every frame.
 
 **On Linux** (full build + automated tests, no game needed):
 ```sh
-sudo apt-get install -y gcc-mingw-w64-i686 g++-mingw-w64-i686
-# to also RUN the tests:
+sudo apt-get install -y mingw-w64
+# optional, to also RUN the Windows-side tests:
 sudo dpkg --add-architecture i386 && sudo apt-get update
 sudo apt-get install -y --no-install-recommends wine wine32:i386
 
-./build.sh --test      # builds everything, runs the netcode self-tests under wine
+./build.sh --test      # builds everything, runs the native merge test
+                       # (+ the wine netcode tests when wine is present)
 ```
 `build.sh` produces `th07_harness.dll`, `th07_coop.dll`, `th07_coop_net.dll`,
-`injector.exe`, and the two test exes in `build/`. The netcode lockstep core is
-verified end-to-end by `tests/run_netsim.sh` (a real host+guest over UDP loopback).
+`injector.exe`, and the test exes in `build/`, and asserts every PE is 32-bit.
+The netcode lockstep core is verified end-to-end by `tests/run_netsim.sh`
+(a real host+guest over UDP loopback).
+
+**CI:** `.github/workflows/build.yml` runs `./build.sh --clean --test` (Linux build of
+all artifacts + the native merge test) on every push/PR.
 
 ## Run (in-game)
-Copy `build/<dll> + injector.exe + the .ini` together, then:
 ```
 injector.exe "D:\Touhou 7 - Perfect Cherry Blossom\th07.exe"
 ```
-The injector loads whichever DLL is configured. (Harness uses `harness.ini`; the netcode
-integration DLL uses `coop_net.ini`.) See the docs for what each does and what is /
-isn't game-tested yet.
+(or use `build/run_coop.bat`). The injector loads whichever DLL is configured —
+harness uses `harness.ini`, the netcode integration DLL uses `coop_net.ini`. For the
+co-op DLL: get into a stage, P2 auto-spawns after ~3 s; see the header comment in
+`src/coop/coop.c` for the live hotkeys (IJKL/Space/U/O = P2, F4–F11 = toggles).
 
-## Status (2026-06-11)
-- ✅ Netcode core: built + unit-tested + **lockstep verified end-to-end** (`netsim`).
+## Status (2026-06-12)
+- ✅ Netcode core: built + unit-tested + **lockstep verified end-to-end** (`netsim`),
+  with a CI-run native merge test and a C-callable shim (`netcode_c_api`) ready for
+  the coop.c integration.
 - ✅ Determinism harness + injector: built, smoke-tested in-game.
-- ✅ Fork B (P2 entity): substantial — spawns, killable, collects items into its OWN
-  power/bombs/lives (game-tested: P2 levels its own shot type off its own power),
-  ghost mode, F11 revive-from-ghost (stand-in for proximity/graze resurrection).
-- 🟡 Tier-1 boss/enemy HP scaling: implemented in `coop.c` (scales with player count,
-  F5 toggle), **compile-verified, not yet game-tested** (`docs/th07_boss_hp_scaling.md`).
-- 🟡 Fork A (netcode↔game wiring): integration DLL written + compile-verified, **not yet
-  game-tested**. Seams are pinned (`docs/th07_fork_a_integration.md`).
-- ⬜ Menu lockstep (A1), real seed handshake (needs ConnectionUI port), per-player
-  cherry/lives, auto-resurrection trigger, 3-player. See the handoff §5 next-steps.
+- ✅ Fork B (P2 entity): substantial — spawns, killable by bullets/lasers/contact,
+  **grazes** (the graze flag gates bullet hit tests — found 2026-06-12), collects
+  items into its OWN power/bombs/lives, shared team border (P2 rides P1's border as
+  a ringless shadow), ghost mode, F11 revive. All game-tested.
+- 🟡 Tier-1 boss/enemy HP scaling: implemented in `coop.c` (ECL set-life detour,
+  scales with player count), **compile-verified, not yet game-tested**
+  (`docs/th07_boss_hp_scaling.md`; an alternative damage-side lever is documented there).
+- 🟡 Fork A (netcode↔game wiring): integration DLL written + compile-verified, **not
+  yet game-tested** (deferred until the game side is finished). Seams pinned in
+  `docs/th07_fork_a_integration.md`, including the A1 menu-lockstep hook.
+- ⬜ Auto-resurrection trigger, P2 cherry HUD, netcode→coop.c wiring, real seed
+  handshake (ConnectionUI port), 3-player. See the handoff §5 next-steps.

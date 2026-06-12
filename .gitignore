@@ -10,5 +10,8 @@ build/desync_guest.csv
 # netsim driver is a build product, not a shipped artifact
 build/netsim.exe
 
+# host-native test binary produced by build.sh (not a Windows deliverable)
+build/merge_test_native
+
 # Copyrighted game binary — used locally for RE/disasm, NEVER commit it
 th07.exe

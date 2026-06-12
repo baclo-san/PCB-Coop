@@ -1,0 +1,2 @@
+# Shell scripts run on Linux/CI — CRLF breaks bash. Keep them LF everywhere.
+*.sh text eol=lf

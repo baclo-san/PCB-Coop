@@ -11,28 +11,7 @@
 // Per-frame flow lives in Netcode_GetInput_Net(); see netcode.cpp / Controller.cpp.
 #pragma once
 #include "Connection.hpp"
-
-// ---- button bit layout (matches th06 TouhouButton; th07 gameplay reads low 9) ----
-enum NetButton
-{
-    NB_SHOOT  = 1 << 0,
-    NB_BOMB   = 1 << 1,
-    NB_FOCUS  = 1 << 2,
-    NB_MENU   = 1 << 3,
-    NB_UP     = 1 << 4,
-    NB_DOWN   = 1 << 5,
-    NB_LEFT   = 1 << 6,
-    NB_RIGHT  = 1 << 7,
-    NB_SKIP   = 1 << 8,
-
-    NB_SHOOT2 = 1 << 9,
-    NB_BOMB2  = 1 << 10,
-    NB_FOCUS2 = 1 << 11,
-    NB_UP2    = 1 << 12,
-    NB_DOWN2  = 1 << 13,
-    NB_LEFT2  = 1 << 14,
-    NB_RIGHT2 = 1 << 15,
-};
+#include "merge.hpp"   // NetButton bit layout + the pure MergeKeys() (platform-independent)
 
 // host-provided callbacks
 typedef unsigned short (*ReadLocalInputFn)(void);

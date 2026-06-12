@@ -100,7 +100,9 @@ if ($LASTEXITCODE) { throw "link failed: injector.exe" }
 $netSrcs = @(
     (Join-Path $root "tests\netloop_test.cpp"),
     (Join-Path $root "src\netplay\netcode.cpp"),
-    (Join-Path $root "src\netplay\Connection.cpp")
+    (Join-Path $root "src\netplay\Connection.cpp"),
+    (Join-Path $root "src\netplay\merge.cpp"),
+    (Join-Path $root "src\netplay\netcode_c_api.cpp")
 )
 $netTest = Join-Path $build "netloop_test.exe"
 Write-Host "  CXX netloop_test.exe"

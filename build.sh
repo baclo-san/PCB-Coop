@@ -79,6 +79,7 @@ echo "  CXX netloop_test.exe"
     "$ROOT/src/netplay/netcode.cpp" \
     "$ROOT/src/netplay/Connection.cpp" \
     "$ROOT/src/netplay/merge.cpp" \
+    "$ROOT/src/netplay/netcode_c_api.cpp" \
     -o "$BUILD/netloop_test.exe" -static -lws2_32
 
 # ---- 3c. native merge test (platform-independent — runs HERE, no wine) ----

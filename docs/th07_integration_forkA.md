@@ -114,11 +114,15 @@ as a **first end-to-end milestone** before investing in 3b.
 Goal: replace `coop.c`'s `ReadP2InputLocal()` (keyboard) with the netcode's merged
 P2 bits, so the existing, already-working P2 entity is driven over UDP.
 
-**Build:** `coop.c` is C, the netcode is C++. Merge into one DLL by compiling
-`coop.c` as-is and linking the netcode TUs (`netcode.cpp`, `Connection.cpp`,
-`merge.cpp`) + `-lws2_32`, exposing a tiny `extern "C"` shim header
-(`netcode_c_api.h`) over the `Netcode_*` calls. (Both `build.sh` and `build.ps1`
-already compile these TUs for the test — add them to the `th07_coop.dll` link line.)
+**Build:** `coop.c` is C, the netcode is C++. The C-callable seam already exists:
+**`src/netplay/netcode_c_api.h` / `.cpp`** wrap the `Netcode_*` API with plain C
+linkage + C-friendly types (`Nc_StartHost`, `Nc_GetInputNet(frame, is_in_UI,
+&ctrl)`, etc.; verified to compile from a C TU and is built by CI). To make the
+integrated DLL, compile `coop.c` and link the netcode TUs (`netcode.cpp`,
+`Connection.cpp`, `merge.cpp`, `netcode_c_api.cpp`) + `-lws2_32` into
+`th07_coop.dll` — i.e. add those four to the coop link line in `build.sh`/`build.ps1`
+(they're already compiled for the netcode test). `coop.c` then `#include
+"netcode_c_api.h"` and calls `Nc_*`.
 
 **One hook owns the frame counter and both input globals:**
 

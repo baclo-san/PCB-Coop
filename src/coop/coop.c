@@ -442,8 +442,20 @@ static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch             
  * player's own update re-arms each frame. P2's copy was therefore never
  * filled -> its bomb orbs never homed. coop.c copies P1's target into P2 at
  * draw time (the bomb fns run from the player draw). Note both players home
- * at P1's chosen enemy (the chooser ranks by distance to P1) — close enough. */
-#define OFF_HOMING_TGT 0x2428          /* float x, float y                       */
+ * at P1's chosen enemy (the chooser ranks by distance to P1) — close enough.
+ *
+ * The block is bigger than just the homing target. The enemy update keeps a
+ * whole absolutely-addressed target group at static P1 +0x2428..+0x2443:
+ *   +0x2428 float[3]  homing target x,y,z   (0x4bff00/04/08)
+ *   +0x2434 float[3]  SakuyaA AIM target    (0x4bff0c/10/14) — only filled
+ *           when global char id DAT_0062f645 == 2 (Sakuya), enemy in the
+ *           upward ~60° cone from P1 (PCBdecomp.c:12913-12943); consumed
+ *           param-relatively by the aimed-shot spawn cb FUN_0043c0d0 (25176)
+ *   +0x2440 int       target-valid flag     (0x4bff18)
+ * Mirror the whole 0x1c-byte block or SakuyaA's focused shot fires straight
+ * for P2 (round-11 bug). */
+#define OFF_HOMING_TGT 0x2428          /* base of the target block               */
+#define HOMING_TGT_LEN 0x1c            /* homing xyz + aim xyz + valid flag      */
 
 static void Log(const char *fmt, ...)
 {
@@ -1392,10 +1404,11 @@ static int __fastcall HookedDraw(void *self)
             if (s_p2FocusFx)
                 memcpy((char *)s_p2FocusFx + OFF_FX_POS,
                        (char *)p2 + OFF_POS_X, 12);
-            /* feed P2 this frame's homing target (see OFF_HOMING_TGT note) —
-             * the bomb fns run from the draw we're about to call */
+            /* feed P2 this frame's homing + SakuyaA aim targets (see the
+             * OFF_HOMING_TGT note) — the consumers run param-relative but the
+             * enemy update only ever fills static P1's block */
             memcpy((char *)p2 + OFF_HOMING_TGT,
-                   (char *)ADDR_PLAYER_BASE + OFF_HOMING_TGT, 8);
+                   (char *)ADDR_PLAYER_BASE + OFF_HOMING_TGT, HOMING_TGT_LEN);
             s_origDraw(p2);
             DrawCoopHud(p2);
         }

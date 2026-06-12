@@ -881,6 +881,28 @@ afterwards and overlay ghost mode ourselves.
 - Awaiting test: revive → invuln ends ~4 s; MarisaB P2 lasers fire/damage;
   ReimuA P2 normal+bomb still fine (the array switch touches all shot types).
 
+### 5f — round-11: SakuyaA aimed focus shot for P2
+
+- Round-10 verdicts: **all pass** (revive invuln ends, MarisaB lasers work,
+  ReimuA unaffected). One new find: **SakuyaA's focused AIMED shot fired
+  straight for P2** (the focused spellcard aimed fine).
+- Same disease as the homing bug: the enemy update maintains a whole
+  absolutely-addressed target block at static P1 `+0x2428..+0x2443` —
+  homing xyz (`0x4bff00/04/08`), the **SakuyaA aim target** xyz
+  (`0x4bff0c/10/14`, only filled when global char id `DAT_0062f645 == 2`
+  and the enemy sits in the upward ~60° cone from P1's position,
+  PCBdecomp.c:12913-12943), and a valid flag (`0x4bff18`). The aimed-shot
+  spawn callback `FUN_0043c0d0` (25168) consumes `param_1+0x2434`
+  param-relatively, so P2's copy was the −999 sentinel → straight shot.
+  (The spellcard aims via a different path — it never broke.)
+- Fix: the existing draw-time homing memcpy now mirrors the **full 0x1c-byte
+  block** (`HOMING_TGT_LEN`) into P2 instead of 8 bytes.
+- Charselect note for later: the aim-target *acquisition* is gated on the
+  GLOBAL char id == Sakuya. If P2 is Sakuya but P1 isn't, the block never
+  fills — the acquisition loop will need a P2-aware shim then.
+- Awaiting test: SakuyaA P2 focused shot aims; then green light for
+  P2 charselect.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

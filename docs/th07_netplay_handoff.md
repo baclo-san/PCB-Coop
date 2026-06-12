@@ -701,6 +701,39 @@ afterwards and overlay ghost mode ourselves.
 - Untested edge flagged: the auto cherry border firing while P1 is a ghost
   (gauge can fill from P2's play; `FUN_0042f5a2` will border a ghost P1).
   Watch for weirdness in test; fix if it manifests.
+  → **Round-5 verdict: everything above works; border-on-ghost confirmed
+  harmless (ghost can't affect its flow).**
+
+### 5f — round-5 fixes: session reset + P2 focus ring (new effect-system RE)
+
+- **Stale session across games (user):** after a both-down game over, the next
+  run started with P1 still flagged as a ghost. Fix: a >2s gap in P1 update
+  ticks while `s_runOver` (updates stop between games) = new-game signal →
+  full co-op session reset (ghost flags, tint, despawn the stale P2 clone,
+  re-arm auto-spawn). NOTE: a manual quit-to-menu mid-run (no game over) still
+  leaves a stale P2 across games — untested/unfixed path, flagged.
+- **P2 focus ring — implemented, with new effect-system RE (decomp-verified):**
+  - The focus visual = **effect type `0x18`**, spawned by the player's
+    option-mode machine via **`FUN_0041c610`** = `__thiscall(effect_mgr, type,
+    float *pos, slotArg, a5, color)` into **fixed player-effect slot
+    400+slotArg** (focus = slotArg 2 → slot 402; the border ring = 4 → 404;
+    slots 405–407 free). Handle stored at `player+0x9d8`; killed on focus
+    release via `effect+0x1c6 = 1` (PCBdecomp.c:26412/26420).
+  - The spawner **copies** the position (no pointer); following the player is
+    done by the per-type update callback (`effect+0x2c8`, from the type table
+    `DAT_0049efc4 + type*0xc`): for the focus ring it is **`FUN_0041abe0`**
+    (line 10257), which snaps the effect to the **STATIC P1 position**
+    (`DAT_004be408` = `0x4bdad8+0x930`) — absolute, so no clone can ever own
+    one. This is why P2 never showed focus graphics.
+  - **Effect manager is static at `0x012fe250`** (the 400-slot general effect
+    array sits at +0x1c, stride 0x2d8; player-effect slots 400–407 follow).
+  - coop.c fix: defang P2's vanilla slot-402 spawn each frame (kill the stray
+    ring unless P1 is legitimately focused, zero `p2+0x9d8`), spawn our own
+    type-0x18 ring in **slot 406** on P2's focus press, kill on release, and
+    re-pin its position to P2 after updates AND at draw time (last write
+    before the draw wins over the updater's P1-snap).
+- Cherry-border ring for P2 stays a known cosmetic gap (single ring slot);
+  user: unnecessary.
 
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)

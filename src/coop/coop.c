@@ -310,6 +310,41 @@ static float s_p2AlivePos[3] = {192.f, 384.f, 0.f};
 static float s_p1AlivePos[3] = {192.f, 384.f, 0.f};
 static float s_p1AliveBombs = 0.f, s_p2AliveBombs = 0.f;
 
+/* ---- P2 focus ring ----
+ * The focus visual is effect type 0x18, spawned by the player's option-mode
+ * machine via FUN_0041c610(mgr, 0x18, &pos, slotArg=2, 1, white) into the FIXED
+ * player-effect slot 402 (slot = 400+slotArg; PCBdecomp.c:26412), handle kept at
+ * player+0x9d8, killed on focus release by writing 1 into effect+0x1c6 (26420).
+ * Its per-frame updater FUN_0041abe0 (10257) snaps the effect to the STATIC P1
+ * position (DAT_004be408) — so P2's vanilla spawn both fights P1's ring (same
+ * slot) AND can never follow P2. We defang P2's vanilla spawn each frame and run
+ * our own type-0x18 ring in FREE player-effect slot 406, re-pinning its position
+ * to P2 after updates and again at draw time (the updater keeps snapping it back
+ * to P1; last write before the draw wins). */
+#define ADDR_EFFECT_MGR   ((void *)0x012fe250) /* static; slots at +0x1c, stride 0x2d8 */
+#define FX_TYPE_FOCUS     0x18
+#define FX_SLOT_P2_FOCUS  6        /* player-effect slot 406 (402=focus, 404=border) */
+#define OFF_FX_KILL       0x1c6    /* u16: 1 = fade out & die                      */
+#define OFF_FX_TYPE       0x2cd    /* u8: effect type byte                         */
+#define OFF_FX_POS        0x24c    /* float[3] world position                      */
+#define OFF_PLAYER_FX     0x9d8    /* player: handle of its own focus effect       */
+/* __thiscall(mgr, type, pos, slotArg, a5, color) modelled as __fastcall */
+typedef void *(__fastcall *EffectSpawnFn_t)(void *mgr, void *edx, int type,
+                                            float *pos, int slotArg, int a5,
+                                            uint32_t color);
+#define ADDR_EFFECT_SPAWN ((EffectSpawnFn_t)0x0041c610)
+static void *s_p2FocusFx = NULL;
+
+static void KillP2FocusFx(void)
+{
+    if (!s_p2FocusFx) return;
+    /* guard: only if the slot still holds a focus-type effect (stage transitions
+     * recycle the effect array under us) */
+    if (*(unsigned char *)((char *)s_p2FocusFx + OFF_FX_TYPE) == FX_TYPE_FOCUS)
+        *(uint16_t *)((char *)s_p2FocusFx + OFF_FX_KILL) = 1;
+    s_p2FocusFx = NULL;
+}
+
 /* Graze credit leaf FUN_0043eb90: __thiscall(player, float *grazed_pos) — bumps
  * the graze counters, spawns the graze spark at the midpoint, queues the graze
  * SFX, +200 score. Called every few frames during the revive/share channel so
@@ -465,6 +500,7 @@ static void DespawnP2(void)
     void *p2 = (void *)s_p2;
     if (!p2) return;
     s_p2 = NULL;                            /* stop piggyback FIRST */
+    KillP2FocusFx();
     VirtualFree(p2, 0, MEM_RELEASE);
     Log("despawn: P2 freed");
 }
@@ -986,11 +1022,36 @@ static void __fastcall HookedBorderBreak(void *self, void *edx, int flag)
 }
 
 /* ---- detours ---- */
+static DWORD s_lastP1TickMs = 0;
+
 static int __fastcall HookedUpdate(void *self)
 {
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
     int p1Fake = 0;
     uint16_t p1GhostSavedIn = 0;
+
+    /* SESSION RESET: after our both-down game over, player updates stop (game
+     * over -> results -> menu) and resume only when a NEW game starts — but all
+     * the co-op session state (ghost flags, the stale P2 clone) survives in the
+     * DLL and bled into the next run (observed: new game started with P1 "in
+     * ghost mode"). A >2s gap in P1 update ticks while s_runOver is the new-game
+     * signal: full reset + re-arm the auto-spawn. */
+    if (isP1) {
+        DWORD now = GetTickCount();
+        if (s_runOver && s_lastP1TickMs && (now - s_lastP1TickMs) > 2000) {
+            Log("new game after game over -> co-op session reset");
+            s_runOver = 0;
+            s_p1Ghost = 0;
+            s_p2Ghost = 0;
+            s_reviveFrames = 0;
+            s_shareFrames = 0;
+            *(uint32_t *)((char *)ADDR_PLAYER_BASE + OFF_TINT) = 0xffffffffu;
+            DespawnP2();            /* the old clone references the previous game */
+            s_autoSpawned = 0;      /* re-arm auto-spawn for the new run */
+            s_readyFrames = 0;
+        }
+        s_lastP1TickMs = now;
+    }
 
     /* PHANTOM SPARE (P1): while co-op is active, ZUN's death commit must never
      * see 0 lives — the lives==0 path is game-over + full-power items + the
@@ -1144,6 +1205,32 @@ static int __fastcall HookedUpdate(void *self)
                 }
             }
 
+            /* P2 focus ring (see the block comment at the defines) */
+            {
+                int p2Foc = (p2in & IN_FOCUS) != 0 && !s_p2Ghost;
+                /* defang P2's vanilla spawn: it grabbed slot 402 (P1's ring).
+                 * Kill the stray ring unless P1 is legitimately focused, and
+                 * zero the handle so P2's release can't kill P1's ring later.
+                 * (p2+0x9d8 may also hold a stale/cloned handle — same cure.) */
+                uint32_t zfx = *(uint32_t *)((char *)p2 + OFF_PLAYER_FX);
+                if (zfx) {
+                    if (!*(unsigned char *)((char *)ADDR_PLAYER_BASE + 0x240b) &&
+                        *(unsigned char *)(zfx + OFF_FX_TYPE) == FX_TYPE_FOCUS)
+                        *(uint16_t *)(zfx + OFF_FX_KILL) = 1;
+                    *(uint32_t *)((char *)p2 + OFF_PLAYER_FX) = 0;
+                }
+                if (p2Foc && !s_p2FocusFx)
+                    s_p2FocusFx = ADDR_EFFECT_SPAWN(ADDR_EFFECT_MGR, NULL,
+                                                    FX_TYPE_FOCUS,
+                                                    (float *)((char *)p2 + OFF_POS_X),
+                                                    FX_SLOT_P2_FOCUS, 1, 0xffffffffu);
+                else if (!p2Foc)
+                    KillP2FocusFx();
+                if (s_p2FocusFx)        /* counter the updater's P1-snap */
+                    memcpy((char *)s_p2FocusFx + OFF_FX_POS,
+                           (char *)p2 + OFF_POS_X, 12);
+            }
+
             /* ghost drive + graze resurrection / live life-sharing: the shared
              * struct holds P1's values here (restored above), so a life
              * donation can write it directly. All mechanics confirm on a
@@ -1179,8 +1266,15 @@ static int __fastcall HookedDraw(void *self)
 
     if ((uint32_t)self == ADDR_PLAYER_BASE) {
         void *p2 = (void *)s_p2;
-        if (p2)
+        if (p2) {
+            /* re-pin the P2 focus ring before anything draws it — the effect
+             * updater snaps it to P1 each tick and the update order between the
+             * player and effect tasks is unknown; the draw chain runs last */
+            if (s_p2FocusFx)
+                memcpy((char *)s_p2FocusFx + OFF_FX_POS,
+                       (char *)p2 + OFF_POS_X, 12);
             s_origDraw(p2);
+        }
     }
     return r;
 }

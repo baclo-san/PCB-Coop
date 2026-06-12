@@ -138,7 +138,42 @@ a separate, not-yet-located function (needed for a real P2 HUD).
 > model that isn't byte-identical) will desync here. Validate with the `0x0049fe24`
 > counter oracle after wiring the netcode in.
 
-## 2c. Player death FSM & the resurrection seam (Tier 3 — revive-a-partner)
+## 2c. Border / cherry display & the per-player-cherry seam (user wants this)
+
+The user wants **separate cherry counters per player**; the likely-safe design is
+"separate display counter, **shared** border activation" (per-player borders that each
+cancel bullets would trivialize the game). The score sub-struct lives at
+`gameManager+8` (`= *(scoreSingleton 0x626270 + 8)` = the `0x626278` struct); the
+display fields (handoff §4) are **confirmed**:
+
+| Field | Meaning | Decomp |
+|---|---|---|
+| `+0x209f0` | **border state**: 1=FullPower, 2=SupernaturalBorder, 3=CherryPointMax, 4=BorderBonus; 0=inactive | set 15444, read 15633/16760 |
+| `+0x209ec` | border bonus value | 15449 |
+| `+0x209fc` | **border banner anim counter** 0→0xb3 (border ends when `>0xb3`) | 16761/16769/16770 |
+| `+0x209e0` | banner float Y | 15439 |
+| `+0x20a28` | cherry display (×10); `= cherryMax − liveCherry` at tally | 15567, 16392 |
+| `+0x20a24` | point items (×50000) | 15559, 16391 |
+| `+0x20a2c` | graze (×500) | 15563, 16393 |
+| `+0x209b8` | total score | 15620, 16812 |
+
+Key functions:
+- **`FUN_00427c81(this, bonus, state)` @ `0x00427c81`** — **border activation** (sets
+  `+0x209f0=state`, `+0x209ec=bonus`, resets the banner). The "shared border
+  activation" seam: let either player's fill trigger it, once.
+- `FUN_0042adab(this)` @ `0x0042adab` — border-banner **tick** (advances `+0x209fc`,
+  ends the border at `>0xb3`).
+- `FUN_00429c42(this)` @ `0x00429c42` — **end-of-stage tally** (writes the display
+  cherry/point/graze from the shared totals).
+
+**Per-player cherry plan:** keep the determinism-critical pool (`DAT_0062f888/88c` +
+`(0x626278)+0x88`, which feeds the item-drop roll — see §2) **shared**, so the
+RNG-coupled drop stays byte-identical on both machines. Track each player's *display*
+cherry contribution in DLL-owned state (incremented when that player collects), and
+drive border activation off the shared pool (or "either player full"). This avoids
+adding determinism-feeding state. Confirm with the `0x0049fe24` counter oracle.
+
+## 2d. Player death FSM & the resurrection seam (Tier 3 — revive-a-partner)
 
 The player update `FUN_00441fb0` @ `0x00441fb0` (the fn `coop.c` piggybacks for P2)
 dispatches on the **state byte `+0x2408`** (= coop.c `OFF_STATE`):

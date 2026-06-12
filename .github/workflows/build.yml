@@ -1,0 +1,40 @@
+name: build
+
+# Builds all PCB co-op artifacts with the 32-bit mingw cross toolchain and runs
+# the platform-independent merge unit test. The DLLs/injector target Windows and
+# can't be exercised here (no th07.exe), but this proves the whole tree compiles
+# as 32-bit PEs and that the lockstep merge invariant still holds.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install 32-bit mingw toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: Build everything + run native merge test
+        run: ./build.sh --clean --test
+
+      - name: Verify all Windows artifacts are 32-bit PEs
+        run: |
+          set -e
+          for f in th07_harness.dll th07_coop.dll injector.exe netloop_test.exe; do
+            machine=$(python3 - "build/$f" <<'PY'
+import struct, sys
+b = open(sys.argv[1], "rb").read()
+pe = struct.unpack_from("<i", b, 0x3C)[0]
+print(hex(struct.unpack_from("<H", b, pe + 4)[0]))
+PY
+)
+            echo "$f -> $machine"
+            [ "$machine" = "0x14c" ] || { echo "ERROR: $f is not 32-bit (machine $machine)"; exit 1; }
+          done

@@ -767,6 +767,31 @@ afterwards and overlay ghost mode ourselves.
   3. Then back to the netplay track (handoff §5e plan steps 4–5: netcode→
      coop.c wiring via `Nc_*`, menu lockstep, seed handshake, live test).
 
+### 5f — round-7: stage-transition crash root-caused; stage-init hook; P2 HUD
+
+- **The gap detector NEVER fired** (log-proven): PCB keeps the player task
+  ticking straight through stage transitions — the revive channel even charged
+  during the results tally (that's why the user's ghost "revived at the
+  transition": idle P1 + bouncing ghost + focus release = legitimate but
+  surprising donation; P1 paid a life). The stale stage-1 P2 clone then crossed
+  into stage 2 with freed asset pointers → locked in place, crash on shoot.
+- **Fix: hook `FUN_00442c60` (stage-init task)** — re-registered and run once
+  per stage load; the positive stage-start signal (and the future netplay
+  seed-sync detour, same seam). On stage init with co-op state: despawn the
+  stale clone, clear ghosts/tint, re-arm auto-spawn; resources carry
+  (`s_p2Carry`) unless `s_runOver` (post-game-over run reseeds from P1). The
+  GetTickCount gap detector is REMOVED (its >2s-pause false positive with it).
+- **P2 HUD (user priority) — implemented via ZUN's text queue:**
+  `FUN_00402060(ascii_mgr@0x0134ce18, float pos[3], fmt, ...)` = vsprintf +
+  queue on the ascii manager; its own draw task renders per frame (16px line
+  height; ZUN's HUD "%d/%d" point counter uses it at (496,176) —
+  PCBdecomp.c:17163; renderer = `FUN_004020b0`). coop.c queues once per frame
+  from the draw hook, sidebar at x=448: `P2 L<lives> B<bombs> P<power>` (or
+  `P2 GHOST`), `P1 GHOST` when applicable, and live `REVIVE n/90` /
+  `SHARE n/90` channel progress.
+- Awaiting test: stage 1→2 with P2 alive AND with P2 ghost (rebuild both ways),
+  HUD legibility/position, focus-ring blip gone.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

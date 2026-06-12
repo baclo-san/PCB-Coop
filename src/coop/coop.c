@@ -362,6 +362,29 @@ static void KillP2FocusFx(void)
     s_p2FocusFx = NULL;
 }
 
+/* ---- stage-start signal + on-screen text ----
+ * FUN_00442c60 = the record-start init task (saves the RNG seed into the replay
+ * obj, zeroes the call counter — fork-a doc §3). It is re-registered by
+ * FUN_00443aa0 at EVERY stage load and runs once per stage — the positive
+ * stage-start signal. (The previous >2s update-gap detector NEVER fired: PCB
+ * keeps the player task ticking straight through stage transitions — proven by
+ * a revive channel charging during the results tally. The stale P2 clone then
+ * crossed into stage 2 holding freed stage-1 pointers -> the observed crash.)
+ * This is also the future seed-sync detour point for netplay. */
+#define ADDR_STAGE_INIT ((LPVOID)0x00442c60)
+typedef int (__fastcall *StageInitFn_t)(void *self);
+static StageInitFn_t s_origStageInit = NULL;
+
+/* ZUN's on-screen text: FUN_00402060(ascii_mgr, float pos[3], fmt, ...) —
+ * vsprintf into a local buffer, then queue on the ascii manager (static at
+ * 0x0134ce18); the manager's own draw task renders the queue each frame
+ * (16px line height, sidebar coords — the HUD "%d/%d" point display uses
+ * (496,176), PCBdecomp.c:17163). Queueing is render-state-independent; call
+ * once per frame. Plain __cdecl varargs. */
+typedef void (__cdecl *AsciiPrintFn_t)(void *mgr, float *pos, const char *fmt, ...);
+#define ADDR_ASCII_PRINT ((AsciiPrintFn_t)0x00402060)
+#define ADDR_ASCII_MGR   ((void *)0x0134ce18)
+
 /* Graze credit leaf FUN_0043eb90: __thiscall(player, float *grazed_pos) — bumps
  * the graze counters, spawns the graze spark at the midpoint, queues the graze
  * SFX, +200 score. Called every few frames during the revive/share channel so
@@ -1044,48 +1067,42 @@ static void __fastcall HookedBorderBreak(void *self, void *edx, int flag)
 }
 
 /* ---- detours ---- */
-static DWORD s_lastP1TickMs = 0;
+/* STAGE START: every stage load re-registers and runs this init task once.
+ * The P2 clone's internal pointers reference the PREVIOUS stage's assets,
+ * which the load just recycled (proven crash: stale P2 locked in place, then
+ * crashed on shoot in stage 2) — so rebuild the whole co-op session here:
+ * despawn the stale clone, re-arm auto-spawn (P2 returns ~3s in, cloned from
+ * the FRESH P1). Resources carry across stages; after a game over the next
+ * run reseeds from P1. A ghost is revived by the transition (still 0 spares). */
+static int __fastcall HookedStageInit(void *self)
+{
+    int r = s_origStageInit(self);
+    if (s_p2 || s_p1Ghost || s_runOver) {
+        if (s_runOver) {
+            Log("stage init after game over -> full co-op reset");
+            s_p2Carry = 0;              /* fresh run: reseed P2 from P1 */
+        } else {
+            Log("stage init -> P2 rebuild (resources carried)");
+            s_p2Carry = (s_p2 != NULL);
+        }
+        s_runOver = 0;
+        s_p1Ghost = 0;
+        s_p2Ghost = 0;
+        s_reviveFrames = 0;
+        s_shareFrames = 0;
+        *(uint32_t *)((char *)ADDR_PLAYER_BASE + OFF_TINT) = 0xffffffffu;
+        DespawnP2();                /* the old clone references the previous stage */
+        s_autoSpawned = 0;          /* re-arm auto-spawn */
+        s_readyFrames = 0;
+    }
+    return r;
+}
 
 static int __fastcall HookedUpdate(void *self)
 {
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
     int p1Fake = 0;
     uint16_t p1GhostSavedIn = 0;
-
-    /* SESSION RESET / P2 REBUILD: player updates stop for seconds between
-     * games (game over -> results -> menu -> new game) AND across stage
-     * transitions (results -> loading) — and the P2 clone's internal pointers
-     * reference the PREVIOUS stage's assets, which the load recycles (the
-     * observed stage-2 crash). Any >2s gap in P1 ticks while co-op state
-     * exists ⇒ despawn the stale clone and re-arm auto-spawn so P2 is rebuilt
-     * from the fresh P1. Resources carry over unless the run ended (after a
-     * game over the next run reseeds from P1). A ghost is revived by the
-     * transition (alive again, still 0 spares). Worst-case false positive is
-     * a >2s PAUSE: P2 blips out and auto-respawns ~3s later with carried
-     * resources — tolerable until a real stage-start hook replaces this. */
-    if (isP1) {
-        DWORD now = GetTickCount();
-        if (s_lastP1TickMs && (now - s_lastP1TickMs) > 2000 &&
-            (s_p2 || s_p1Ghost || s_runOver)) {
-            if (s_runOver) {
-                Log("new game after game over -> full co-op reset");
-                s_p2Carry = 0;          /* fresh run: reseed P2 from P1 */
-            } else {
-                Log("stage transition / long gap -> P2 rebuild (resources carried)");
-                s_p2Carry = (s_p2 != NULL);
-            }
-            s_runOver = 0;
-            s_p1Ghost = 0;
-            s_p2Ghost = 0;
-            s_reviveFrames = 0;
-            s_shareFrames = 0;
-            *(uint32_t *)((char *)ADDR_PLAYER_BASE + OFF_TINT) = 0xffffffffu;
-            DespawnP2();            /* the old clone references the previous stage */
-            s_autoSpawned = 0;      /* re-arm auto-spawn */
-            s_readyFrames = 0;
-        }
-        s_lastP1TickMs = now;
-    }
 
     /* PHANTOM SPARE (P1): while co-op is active, ZUN's death commit must never
      * see 0 lives — the lives==0 path is game-over + full-power items + the
@@ -1282,6 +1299,38 @@ static int __fastcall HookedUpdate(void *self)
     return r;
 }
 
+/* P2 HUD: queue text on ZUN's ascii manager once per frame (rendered by its
+ * own draw task in the sidebar, where the rest of the HUD lives). Shows P2's
+ * separate resources, ghost status, and the revive/share channel progress. */
+static void DrawCoopHud(void *p2)
+{
+    float pos[3];
+    pos[0] = 448.f; pos[2] = 0.f;
+
+    pos[1] = 296.f;
+    if (s_p2Ghost)
+        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P2 GHOST");
+    else
+        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P2 L%d B%d P%d",
+                         (int)s_p2Lives, (int)s_p2Bombs, (int)s_p2Power);
+    if (s_p1Ghost) {
+        pos[1] = 312.f;
+        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P1 GHOST");
+    }
+    if (s_reviveFrames > 0) {
+        pos[1] = 328.f;
+        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "REVIVE %d/%d",
+                         s_reviveFrames > REVIVE_FRAMES ? REVIVE_FRAMES : s_reviveFrames,
+                         REVIVE_FRAMES);
+    } else if (s_shareFrames > 0) {
+        pos[1] = 328.f;
+        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "SHARE %d/%d",
+                         s_shareFrames > SHARE_FRAMES ? SHARE_FRAMES : s_shareFrames,
+                         SHARE_FRAMES);
+    }
+    (void)p2;
+}
+
 static int __fastcall HookedDraw(void *self)
 {
     int r = s_origDraw(self);               /* P1 draw */
@@ -1296,6 +1345,7 @@ static int __fastcall HookedDraw(void *self)
                 memcpy((char *)s_p2FocusFx + OFF_FX_POS,
                        (char *)p2 + OFF_POS_X, 12);
             s_origDraw(p2);
+            DrawCoopHud(p2);
         }
     }
     return r;
@@ -1311,6 +1361,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_COLLIDE_GRAZE,  (LPVOID)&HookedGraze,         (LPVOID*)&s_origGraze)         != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DAMAGE,         (LPVOID)&HookedDamage,        (LPVOID*)&s_origDamage)        != MH_OK) return 0;
     if (MH_CreateHook(ADDR_EFFECT_SPAWN,   (LPVOID)&HookedEffectSpawn,   (LPVOID*)&s_origEffectSpawn)   != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_STAGE_INIT,     (LPVOID)&HookedStageInit,     (LPVOID*)&s_origStageInit)     != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
@@ -1321,6 +1372,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_COLLIDE_GRAZE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DAMAGE)         != MH_OK) return 0;
     if (MH_EnableHook(ADDR_EFFECT_SPAWN)   != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_STAGE_INIT)     != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLECT_OVERLAP)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_ITEM_LOOP)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;

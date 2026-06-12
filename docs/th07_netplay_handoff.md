@@ -1,5 +1,23 @@
 # TH07 (PCB) Co-op Netplay — Handoff for Next Session
 
+> **⚠️ 2026-06-12 UPDATE — read the newer companion docs first; parts of THIS file
+> are now superseded.** This doc predates the P2-entity work. Current state:
+> - **Fork B (the second-player entity) is largely DONE** in `src/coop/coop.c`:
+>   P2 is a piggyback clone with collision/death, separate bombs+power, ghost mode,
+>   and shot transfer — but driven by **local keyboard**, not the network.
+> - The netcode core (`src/netplay/`) builds + passes tests but is **not yet wired**
+>   to the game DLL.
+> - New docs:
+>   - **`th07_integration_forkA.md`** — true project state, the 4 seams re-verified
+>     against `PCBdecomp.c` with line numbers, Fork A (seed-sync + menu lockstep)
+>     concrete hooks, and the netcode↔coop integration plan. **Start here.**
+>   - **`th07_gameplay_seams.md`** — boss-HP scaling lever (`FUN_0043d9e0`) and the
+>     cherry/item-drop determinism coupling.
+> - Build now also works on Linux/web: `./build.sh` (distro mingw-w64); CI in
+>   `.github/workflows/build.yml` runs it + a native merge unit test on every push.
+> - `PCBdecomp.c` in the repo root is the Ghidra dump; note `FUN_0042fd60` is
+>   already renamed **`GameUpdate`** in it.
+
 ## 0. Read this first
 
 **Goal:** Add co-op (2-player, possibly 3-player) netplay to Touhou 7 *Perfect Cherry Blossom* (`th07.exe`),

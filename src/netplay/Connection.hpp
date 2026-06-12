@@ -8,7 +8,7 @@
 #define MULTI_NET_VER_S "3.9.5"
 
 #include <winsock2.h>
-#include <Ws2tcpip.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 
 #include <string>

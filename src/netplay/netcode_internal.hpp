@@ -1,10 +1,8 @@
 // netcode_internal.hpp — internals exposed for unit tests only.
 #pragma once
 
-// The pure merge function: given each side's raw word, produce the single
-// 16-bit word both machines must agree on. is_host selects which side owns the
-// P1 low bits; is_in_UI returns self|rcv (menu) instead of the P1/P2 split.
-unsigned short MergeKeys(bool is_host, bool is_in_UI,
-                         unsigned short self_key, unsigned short rcv_key);
+// The pure merge function (MergeKeys) now lives in merge.hpp / merge.cpp so it can
+// also be tested natively without the Winsock transport (tests/merge_test.cpp).
+#include "merge.hpp"
 
 void Netcode_TestSetHost(bool h);

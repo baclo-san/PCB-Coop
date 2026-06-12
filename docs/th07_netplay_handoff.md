@@ -809,6 +809,30 @@ afterwards and overlay ghost mode ourselves.
   re-news the task object; a decrease triggers the one-shot session rebuild
   (same carry semantics). Pause-safe (counter only pauses, never decreases).
 
+### 5f — round-9: spawn-together, bomb-lethality diagnostics; HUD verdicts
+
+- Round-8 verdicts: rebuild loop gone, HUD functional + position OK, focus
+  blip gone, `REVIVE n/90` works. **Shelved (user-accepted):** HUD in P1's
+  native style (gauges + life/bomb icon rows) — needs the HUD sprite-draw RE;
+  text version stands for now.
+- **Both players now spawn together at stage start** (user request): auto-spawn
+  fires 30 frames after P1 reaches state 0 post-fly-in; at spawn P1 steps
+  -24px, P2 +24px — symmetric around the spawn point. (P2 does not share the
+  fly-in animation — cloning during state 1 risks the fly-in target snapping
+  both to the same spot; not attempted.)
+- **OPEN BUG — P2 bomb not lethal** (user: focused ReimuA bomb's homing
+  bullets "didn't home on anyone, as if enemies weren't present"; normal shot
+  fine). Decomp facts gathered (NOT yet conclusive): the per-enemy update
+  gates bomb interaction on **P1's bombing flag read ABSOLUTELY**
+  (`DAT_004d44f8` = `0x4bdad8+0x16a20`, PCBdecomp.c:12690) and the
+  damage-apply block has a second `FUN_0043d9e0` sweep against a second enemy
+  box whose result swaps in a hidden-ECX getter value (12824-12826) — the
+  suspected bomb-damage path. Whether P2's bomb EVER dealt damage is unclear.
+  **Diagnostics shipped:** bombing-transition logs for both players + the
+  first 10 damage-fn returns while any bomb is active. Bisect run requested:
+  P1 bomb vs P2 bomb, with F5 (damage divisor) ON and OFF, and P2 bomb with
+  F7 (shot transfer) OFF — read the log after.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

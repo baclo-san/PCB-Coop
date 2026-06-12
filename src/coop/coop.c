@@ -427,7 +427,14 @@ static char  s_dir[MAX_PATH];
 
 static int   s_readyFrames = 0;        /* consecutive P1-update frames seen        */
 static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch               */
-#define AUTO_SPAWN_AFTER 180           /* ~3s of active gameplay, then spawn P2    */
+#define AUTO_SPAWN_AFTER 30            /* frames of P1 in state 0 after the stage
+                                          fly-in, then spawn P2 (user: both players
+                                          up together at stage start) */
+
+/* DIAG (P2 bomb lethality questioned): log bombing transitions for both
+ * players and the first damage-fn returns while any bomb is active. */
+static int s_p1WasBombing = 0, s_p2WasBombing = 0;
+static int s_bombDmgLogged = 0;
 
 static void Log(const char *fmt, ...)
 {
@@ -504,7 +511,9 @@ static void SpawnP2(void)
         ADDR_PLAYER_BASE, p2, PLAYER_SIZE);
     memcpy(p2, (const void *)ADDR_PLAYER_BASE, PLAYER_SIZE);
 
-    /* nudge P2 X so it's a visibly distinct sprite */
+    /* symmetric spawn: P1 steps left, P2 takes the right (user: both players
+     * side by side around the spawn point at stage start) */
+    *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X) -= P2_SPAWN_OFFSET_X;
     *(float *)((char *)p2 + OFF_POS_X) += P2_SPAWN_OFFSET_X;
 
     /* the clone copied P1's focus-ring handle — P2 must not own P1's ring */
@@ -991,6 +1000,14 @@ static int __fastcall HookedDamage(void *self, void *edx,
                                    float *pos, float *size, int *out_flag)
 {
     int r = s_origDamage(self, edx, pos, size, out_flag);
+    /* DIAG: sample the first damage returns while any bomb is active — shows
+     * whether bomb damage flows through this fn and with which out_flag */
+    if ((s_p1WasBombing || s_p2WasBombing) && r > 0 && s_bombDmgLogged < 10) {
+        s_bombDmgLogged++;
+        Log("dmg(bomb active): r=%d outflag=%d self=%08x p1b=%d p2b=%d",
+            r, out_flag ? *out_flag : -1, (uint32_t)self,
+            s_p1WasBombing, s_p2WasBombing);
+    }
     if (s_bossHpScale && s_p2 && r > 0) {
         r /= 2;                              /* player count (3P: divide by 3) */
         if (r == 0) r = 1;
@@ -1144,6 +1161,15 @@ static int __fastcall HookedUpdate(void *self)
                 ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);
             }
         }
+        /* DIAG: P1 bombing transitions */
+        {
+            int b = *(int *)((char *)ADDR_PLAYER_BASE + OFF_BOMBING) != 0;
+            if (b != s_p1WasBombing) {
+                s_p1WasBombing = b;
+                if (b) s_bombDmgLogged = 0;
+                Log("P1 bomb %s", b ? "START" : "end");
+            }
+        }
         /* track P1's last ALIVE pos + bomb stock (1up drop spot / revive bombs) */
         if (!s_p1Ghost) {
             unsigned char st = *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE);
@@ -1157,9 +1183,10 @@ static int __fastcall HookedUpdate(void *self)
 
         PollHotkeys();
 
-        /* auto-spawn after a few seconds of active gameplay (no keyboard needed) */
+        /* auto-spawn shortly after P1 finishes the stage fly-in (state 0) */
         if (!s_autoSpawned && !s_p2) {
-            if (P1Ready()) {
+            if (P1Ready() &&
+                *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE) == 0) {
                 if (++s_readyFrames == AUTO_SPAWN_AFTER) {
                     Log("auto-spawn: %d ready frames reached", AUTO_SPAWN_AFTER);
                     SpawnP2();
@@ -1258,6 +1285,17 @@ static int __fastcall HookedUpdate(void *self)
                 if (!s_p2Ghost && (st == 0 || st == 4)) {
                     memcpy(s_p2AlivePos, (char *)p2 + OFF_POS_X, sizeof(s_p2AlivePos));
                     s_p2AliveBombs = s_p2Bombs;
+                }
+            }
+
+            /* DIAG: P2 bombing transitions */
+            {
+                int b = *(int *)((char *)p2 + OFF_BOMBING) != 0;
+                if (b != s_p2WasBombing) {
+                    s_p2WasBombing = b;
+                    if (b) s_bombDmgLogged = 0;
+                    Log("P2 bomb %s (p1.bombing=%d)", b ? "START" : "end",
+                        *(int *)((char *)ADDR_PLAYER_BASE + OFF_BOMBING));
                 }
             }
 

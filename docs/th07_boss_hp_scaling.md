@@ -15,6 +15,13 @@
 > - Side note: the eclhp log burst (~40 lines in one frame at wave spawns, each
 >   fflush'd) likely caused the brief freeze the user saw — the diagnostic is
 >   removed with the switch.
+>
+> **GAME TEST round 3 (2026-06-12): PASSES for the boss** — Cirno nearly timed
+> out with P2 dormant (~2× TTK, as intended). **Known accepted trade-off:**
+> popcorn fairies now take TWO homing amulets instead of one (the integer
+> halving — a fairy that died to one amulet's damage now needs two). User:
+> shelf it for now. If it ever matters: gate the divisor on the target (only
+> the boss-object path / life-bar flag `+0xbf4`), or round-up the division.
 
 **Goal (handoff §4 "Difficulty tiers"):** with two players the team does ~2× DPS,
 so bosses die twice as fast. Scaling boss HP by the player count restores the

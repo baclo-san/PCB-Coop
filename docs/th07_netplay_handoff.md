@@ -650,6 +650,29 @@ this transcript. First action next session: verify write access, then `git push`
   feel/speed/band, graze-revive channel, 1up at death spot, and ideally a repro
   attempt of the high-death crash.
 
+### 5f — test round 3 results + the EoSD life-sharing mechanic
+
+**Round 3 (user): boss-HP TTK ✅ (Cirno nearly timed out), high-death crash did
+NOT reproduce ✅, ghost movement ✅.** Known accepted trade-off: popcorn now
+takes two homing amulets (integer damage halving) — shelved (boss-HP doc).
+
+Refinements + the forgotten EoSD mechanic, all implemented (build clean,
+awaiting test round 4):
+- **Graze feedback is now visual-only:** the graze-credit call during the
+  channel is wrapped in a stat snapshot/restore (graze counters `res+0x14/+0x18`,
+  score `res+0x04`, bonus accumulator `0x012fe0d0`) — spark + SFX remain, the
+  HUD graze counter no longer rises.
+- **Revive trigger reworked (user):** graze radius 24px; the 90-frame channel
+  charges regardless of focus state; the revive fires only on a **focus
+  RELEASE edge** after the channel is full.
+- **NEW — life sharing between two LIVE players (EoSD mechanic):** both within
+  24px for 90 consecutive frames with NEITHER shooting (same graze feedback),
+  then the donor confirms with one focus release → donor loses a life, a 1up
+  pops ~48px above the donor (plus the item's built-in upward pop) for the
+  partner to catch. Pickup deliberately universal — a donor re-eating their own
+  1up refunds the donation (net zero). P1 donates from the shared struct
+  (direct write + checksum heal); P2 donates from `s_p2Lives`.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

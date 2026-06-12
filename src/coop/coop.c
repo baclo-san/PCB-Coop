@@ -81,15 +81,24 @@
  *   lives it becomes a GHOST — invulnerable, no input, semi-transparent (half-
  *   alpha tint), drifting slowly (~1/3 focus speed, position driven directly)
  *   inside a band in the lower playfield, bouncing between the side walls. The
- *   survivor revives it by GRAZING the ghost — P1's hitbox inside the ghost
- *   sprite — for 90 consecutive frames; while channeling, the real graze-credit
- *   leaf (FUN_0043eb90) fires every 6 frames for authentic graze SFX/spark
- *   feedback. The revive DONATES one of the survivor's lives (written into the
- *   shared struct + checksum re-heal) — or is FREE when the survivor has no
- *   spare extends. Additionally, dying on the LAST life drops a guaranteed 1-UP
- *   item at the death spot (tracked last-alive position; ZUN's item spawner
- *   FUN_004326f0, type 5), so the survivor can bank a life and then revive.
- *   F11 stays as the debug instant-revive.
+ *   survivor revives it by GRAZING the ghost (within 24px, focus state free)
+ *   for 90 consecutive frames, then CONFIRMING with one focus release. While
+ *   channeling, the real graze-credit leaf (FUN_0043eb90) fires every 6 frames
+ *   for authentic graze SFX/spark feedback — with its stat effects (graze
+ *   counters/score/bonus accumulator) snapshot-restored so nothing rises. The
+ *   revive DONATES one of the survivor's lives (written into the shared struct
+ *   + checksum re-heal) — or is FREE when the survivor has no spare extends.
+ *   Additionally, dying on the LAST life drops a guaranteed 1-UP item at the
+ *   death spot (tracked last-alive position; ZUN's item spawner FUN_004326f0,
+ *   type 5), so the survivor can bank a life and then revive. F11 stays as the
+ *   debug instant-revive.
+ *
+ * LIFE SHARING (EoSD-mod mechanic, same session): two LIVE players graze each
+ *   other (same 24px / 90 frames channel, same feedback) with NEITHER shooting;
+ *   the donor then confirms with one focus release -> loses a life, and a 1up
+ *   pops out ~48px ABOVE the donor (plus the item's built-in upward pop) so the
+ *   partner can catch it. Pickup is deliberately universal: if the donor
+ *   re-eats their own 1up, the extend refunds the donation — net zero.
  *
  * Controls (in-stage):
  *   F9  = spawn P2 (clone of P1, offset +24px X). Only when a char is loaded.
@@ -279,6 +288,7 @@ static int   s_p2PrevLives = -1, s_p2PrevBombs = -1, s_p2PrevPower = -1;
 static int   s_p2Ghost = 0;
 static int   s_ghostDirX = 1, s_ghostDirY = 1;  /* auto-wander bounce direction */
 static int   s_reviveFrames = 0;       /* consecutive frames P1 grazed the ghost */
+static int   s_p1PrevFocus = 0, s_p2PrevFocus = 0; /* focus-release edge tracking */
 static float s_p2AlivePos[3] = {192.f, 384.f, 0.f}; /* P2's last alive position —
                                         the death FSM resets pos to center before
                                         we see the last-life death, so the 1up
@@ -286,10 +296,16 @@ static float s_p2AlivePos[3] = {192.f, 384.f, 0.f}; /* P2's last alive position 
 
 /* Graze credit leaf FUN_0043eb90: __thiscall(player, float *grazed_pos) — bumps
  * the graze counters, spawns the graze spark at the midpoint, queues the graze
- * SFX, +200 score. Called every few frames during the revive channel so
- * "grazing the ghost" sounds and looks like real grazing. */
+ * SFX, +200 score. Called every few frames during the revive/share channel so
+ * grazing a partner sounds and looks like real grazing — but the STAT effects
+ * (graze counters, score, graze bonus accumulator) are snapshot/restored around
+ * the call (user: feedback only, the counter must not rise). */
 typedef void (__fastcall *GrazeCreditFn_t)(void *self, void *edx, float *pos);
 #define ADDR_GRAZE_CREDIT ((GrazeCreditFn_t)0x0043eb90)
+#define RES_SCORE        0x04      /* int: score (graze credit adds 200)        */
+#define RES_GRAZE_CUR    0x14      /* int: graze counter (HUD, cap 9999)        */
+#define RES_GRAZE_TOTAL  0x18      /* int: total graze (cap 999999)             */
+#define ADDR_GRAZE_BONUS_ACC ((volatile int *)0x012fe0d0) /* graze score-bonus accumulator */
 
 /* ZUN's item spawner: __thiscall(item_mgr, float pos[3], int type, int mode) —
  * walks the 1100-slot ring, activates a free slot, sets pos/type/mode
@@ -480,6 +496,13 @@ static void MoveGhost(void *p2)
     *(uint32_t *)((char *)p2 + OFF_TINT) = GHOST_TINT;
 }
 
+static void Spawn1Up(float *pos3)
+{
+    void *mgr = (void *)s_itemMgr;
+    if (!mgr) { Log("1up spawn SKIPPED: item manager not seen yet"); return; }
+    ADDR_ITEM_SPAWN(mgr, NULL, pos3, ITEM_TYPE_1UP, 0);
+}
+
 /* Guaranteed 1up at the DEATH SPOT when P2 dies on its last life, so the
  * survivor can bank a life and then graze-revive. Only P1 can collect it
  * (the collect-overlap hook skips a ghost P2). Uses the tracked last-alive
@@ -488,26 +511,46 @@ static void MoveGhost(void *p2)
  * lap, instantly consumed). */
 static void DropOneUp(void)
 {
-    void *mgr = (void *)s_itemMgr;
-    if (!mgr) { Log("1up drop SKIPPED: item manager not seen yet"); return; }
-    ADDR_ITEM_SPAWN(mgr, NULL, s_p2AlivePos, ITEM_TYPE_1UP, 0);
+    Spawn1Up(s_p2AlivePos);
     Log("P2 last-life death -> dropped 1up at (%.1f,%.1f)",
         s_p2AlivePos[0], s_p2AlivePos[1]);
 }
 
-/* The survivor grazes the ghost for REVIVE_FRAMES consecutive frames ->
- * donates one life (free when they have no spare extends) and the ghost
- * resurrects next to them. Radius = "P1's hitbox inside the ghost sprite"
- * (user). While channeling, the real graze-credit leaf fires every few
- * frames — authentic graze SFX + spark + counter tick as live feedback.
- * Runs while the shared struct holds P1's values (after the P2 field-swap
- * restore), so the donation is a direct write + checksum re-heal — the same
- * proven pattern as the resource swap. */
-#define REVIVE_RADIUS  16.0f
+/* Authentic graze feedback with NO stat effects: run the real graze-credit
+ * leaf (spark + SFX), then put back the graze counters, the +200 score, and
+ * the graze score-bonus accumulator it bumped. ZUN's own code writes these
+ * fields directly (no accessor/checksum), so direct restore is equally safe. */
+static void GrazeFeedback(float *pos)
+{
+    uint32_t res = *ADDR_RES_PTR;
+    int g14 = 0, g18 = 0, sc = 0, acc = *ADDR_GRAZE_BONUS_ACC;
+    if (res) {
+        g14 = *(int *)(res + RES_GRAZE_CUR);
+        g18 = *(int *)(res + RES_GRAZE_TOTAL);
+        sc  = *(int *)(res + RES_SCORE);
+    }
+    ADDR_GRAZE_CREDIT((void *)ADDR_PLAYER_BASE, NULL, pos);
+    if (res) {
+        *(int *)(res + RES_GRAZE_CUR)   = g14;
+        *(int *)(res + RES_GRAZE_TOTAL) = g18;
+        *(int *)(res + RES_SCORE)       = sc;
+    }
+    *ADDR_GRAZE_BONUS_ACC = acc;
+}
+
+/* The survivor grazes the ghost for REVIVE_FRAMES consecutive frames (focus
+ * state does NOT matter while channeling), then CONFIRMS with a focus RELEASE
+ * (down->up edge) -> donates one life (free when they have no spare extends)
+ * and the ghost resurrects next to them. Radius = hitbox-inside-sprite-ish
+ * (user-tuned). While channeling, GrazeFeedback fires every few frames —
+ * authentic graze SFX + spark, no stat changes. Runs while the shared struct
+ * holds P1's values (after the P2 field-swap restore), so the donation is a
+ * direct write + checksum re-heal — the same proven pattern as the swap. */
+#define REVIVE_RADIUS  24.0f
 #define REVIVE_FRAMES  90
 #define REVIVE_TICK     6          /* graze-feedback cadence while channeling */
 
-static void ReviveByGraze(void *p2)
+static void ReviveByGraze(void *p2, int p1FocusRelease)
 {
     unsigned char p1st = *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE);
     float dx = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X)
@@ -520,9 +563,9 @@ static void ReviveByGraze(void *p2)
         dx > -REVIVE_RADIUS && dx < REVIVE_RADIUS &&
         dy > -REVIVE_RADIUS && dy < REVIVE_RADIUS) {
         if (s_reviveFrames % REVIVE_TICK == 0)      /* live feedback: real graze */
-            ADDR_GRAZE_CREDIT((void *)ADDR_PLAYER_BASE, NULL,
-                              (float *)((char *)p2 + OFF_POS_X));
-        if (++s_reviveFrames >= REVIVE_FRAMES) {
+            GrazeFeedback((float *)((char *)p2 + OFF_POS_X));
+        s_reviveFrames++;
+        if (s_reviveFrames >= REVIVE_FRAMES && p1FocusRelease) {
             uint32_t res = *ADDR_RES_PTR;
             if (res && *(float *)(res + RES_LIVES) >= 1.0f) {
                 *(float *)(res + RES_LIVES) -= 1.0f;        /* donate one */
@@ -537,6 +580,66 @@ static void ReviveByGraze(void *p2)
         }
     } else {
         s_reviveFrames = 0;
+    }
+}
+
+/* ---- life sharing between two LIVE players (EoSD-mod mechanic) ----
+ * Both players graze each other (within REVIVE_RADIUS) for SHARE_FRAMES
+ * consecutive frames with NEITHER shooting; then the DONOR confirms with one
+ * focus release -> the donor loses a life and a 1up item pops out slightly
+ * ABOVE the donor (spawn offset + the item's built-in upward pop), so the
+ * partner can catch it instead of the donor instantly re-eating it. Pickup
+ * stays universal on purpose: if the donor does re-eat it, the extend credit
+ * refunds the donated life — net zero, nothing lost. */
+#define SHARE_FRAMES   90
+#define SHARE_POP_UP   48.0f       /* spawn this far above the donor          */
+static int s_shareFrames = 0;
+
+static void LifeShare(void *p2, uint16_t p1in, uint16_t p2in,
+                      int p1FocusRelease, int p2FocusRelease)
+{
+    unsigned char p1st = *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE);
+    unsigned char p2st = *(unsigned char *)((char *)p2 + OFF_STATE);
+    float dx = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X)
+             - *(float *)((char *)p2 + OFF_POS_X);
+    float dy = *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_Y)
+             - *(float *)((char *)p2 + OFF_POS_Y);
+
+    if ((p1st == 0 || p1st == 3 || p1st == 4) &&
+        (p2st == 0 || p2st == 3 || p2st == 4) &&
+        !(p1in & IN_SHOOT) && !(p2in & IN_SHOOT) &&
+        dx > -REVIVE_RADIUS && dx < REVIVE_RADIUS &&
+        dy > -REVIVE_RADIUS && dy < REVIVE_RADIUS) {
+        if (s_shareFrames % REVIVE_TICK == 0)
+            GrazeFeedback((float *)((char *)p2 + OFF_POS_X));
+        s_shareFrames++;
+        if (s_shareFrames >= SHARE_FRAMES && (p1FocusRelease || p2FocusRelease)) {
+            float pos[3];
+            if (p1FocusRelease) {               /* P1 donates */
+                uint32_t res = *ADDR_RES_PTR;
+                if (!res || *(float *)(res + RES_LIVES) < 1.0f) {
+                    Log("life share: P1 has no spare life to donate"); return;
+                }
+                *(float *)(res + RES_LIVES) -= 1.0f;
+                ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);
+                memcpy(pos, (char *)ADDR_PLAYER_BASE + OFF_POS_X, sizeof(pos));
+                pos[1] -= SHARE_POP_UP;
+                Spawn1Up(pos);
+                Log("life share: P1 donated a life -> 1up at (%.0f,%.0f)", pos[0], pos[1]);
+            } else {                            /* P2 donates */
+                if (s_p2Lives < 1.0f) {
+                    Log("life share: P2 has no spare life to donate"); return;
+                }
+                s_p2Lives -= 1.0f;
+                memcpy(pos, (char *)p2 + OFF_POS_X, sizeof(pos));
+                pos[1] -= SHARE_POP_UP;
+                Spawn1Up(pos);
+                Log("life share: P2 donated a life -> 1up at (%.0f,%.0f)", pos[0], pos[1]);
+            }
+            s_shareFrames = 0;
+        }
+    } else {
+        s_shareFrames = 0;
     }
 }
 
@@ -891,11 +994,23 @@ static int __fastcall HookedUpdate(void *self)
                     memcpy(s_p2AlivePos, (char *)p2 + OFF_POS_X, sizeof(s_p2AlivePos));
             }
 
-            /* ghost drive + graze resurrection: the shared struct holds P1's
-             * values here (restored above), so the life donation can write it */
-            if (s_p2Ghost) {
-                MoveGhost(p2);
-                ReviveByGraze(p2);
+            /* ghost drive + graze resurrection / live life-sharing: the shared
+             * struct holds P1's values here (restored above), so a life
+             * donation can write it directly. Both mechanics confirm on a
+             * focus-release edge (P1 = the restored gameplay word; P2 = the
+             * p2in word fed this frame, zeroed while ghost so only P1 confirms). */
+            {
+                uint16_t p1in = *ADDR_INPUT_GAMEPLAY;
+                int p1Rel = s_p1PrevFocus && !(p1in & IN_FOCUS);
+                int p2Rel = s_p2PrevFocus && !(p2in & IN_FOCUS);
+                if (s_p2Ghost) {
+                    MoveGhost(p2);
+                    ReviveByGraze(p2, p1Rel);
+                } else {
+                    LifeShare(p2, p1in, p2in, p1Rel, p2Rel);
+                }
+                s_p1PrevFocus = (p1in & IN_FOCUS) != 0;
+                s_p2PrevFocus = (p2in & IN_FOCUS) != 0;
             }
 
             if (s_shotXfer && !s_p2Ghost) TransferP2Shots(p2);  /* P2 shots -> P1 array */

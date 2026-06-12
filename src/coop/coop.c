@@ -40,6 +40,9 @@
  *   F8  = toggle P2 killability (default ON).
  *   F7  = toggle P2 shot damage (default ON).
  *   F6  = toggle P2 separate resources (default ON).
+ *   F5  = cycle boss/enemy HP scale x1/x2/x3 (default x1 = OFF). Divides player-
+ *         shot damage to offset co-op's doubled DPS; detours FUN_0043d9e0. See
+ *         docs/th07_gameplay_seams.md §1. Scales ALL enemies, not just bosses.
  *
  * !!! ALL ADDRESSES are build-specific to th07.exe ver 1.00b
  * !!! SHA256 35467EAF8DC7FC85F024F16FB2037255F151CEFDA33CF4867BC9122AAA2E80CA
@@ -79,6 +82,15 @@
 #define ADDR_COLLIDE_BULLET ((LPVOID)0x0043e260) /* bullets + enemy-body contact */
 #define ADDR_COLLIDE_LASER  ((LPVOID)0x0043e6b0) /* lasers                       */
 
+/* Player-shot DAMAGE function. __thiscall(ECX=player, target_pos, target_size,
+ * out_flag); RETURNS the total damage this frame's active shots deal to the target
+ * box, and has side effects (consumes hit shots, spawns hit sparks). The enemy/boss
+ * damage-apply loop (decomp line 12822) subtracts the return from the target's HP.
+ * Scaling ONLY the return value gives a clean "boss HP x N" knob for double-DPS
+ * balance, while the shot-consumption + spark side effects still happen once.
+ * See docs/th07_gameplay_seams.md §1. */
+#define ADDR_DAMAGE ((LPVOID)0x0043d9e0)
+
 /* __thiscall modelled as __fastcall: ECX=this, EDX=unused, rest on stack.
  * Stack-arg count + order match, so callee stack cleanup (ret N) matches too. */
 typedef int (__fastcall *CollideBulletFn_t)(void *self, void *edx,
@@ -86,6 +98,9 @@ typedef int (__fastcall *CollideBulletFn_t)(void *self, void *edx,
 typedef int (__fastcall *CollideLaserFn_t )(void *self, void *edx,
                                             void *a, void *b, void *c,
                                             void *d, int e);
+/* damage fn: __thiscall(ECX=player, pos, size, out_flag) -> int damage */
+typedef int (__fastcall *DamageFn_t)(void *self, void *edx,
+                                     float *pos, float *size, int *out_flag);
 
 /* ---- separate resources (lives/bombs/power) ----
  * They live in the struct at *(player+8) == DAT_00626278, stored as floats, and
@@ -139,6 +154,15 @@ static PlayerFn_t s_origUpdate = NULL;
 static PlayerFn_t s_origDraw   = NULL;
 static CollideBulletFn_t s_origCollideBullet = NULL;
 static CollideLaserFn_t  s_origCollideLaser  = NULL;
+static DamageFn_t        s_origDamage         = NULL;
+
+/* Boss/enemy HP scaling: effective-HP multiplier for double-DPS balance. 1 = OFF
+ * (vanilla damage, behaviour identical to the pre-scaling DLL). F5 cycles 1->2->3->1.
+ * Damage returned by the shot-damage fn is divided by this, floored at 1 so a hit is
+ * never silently dropped. DEFAULT OFF until balance is tested with two live players. */
+static int s_bossHpScale = 1;
+static int s_prevF5 = 0;
+static int s_dmgHookLogged = 0;
 
 static volatile void *s_p2   = NULL;   /* P2 object base, NULL until spawned     */
 static int   s_p2Killable = 1;         /* on by default; F8 toggles              */
@@ -284,16 +308,20 @@ static void PollHotkeys(void)
     int f8  = (GetAsyncKeyState(VK_F8)  & 0x8000) != 0;
     int f7  = (GetAsyncKeyState(VK_F7)  & 0x8000) != 0;
     int f6  = (GetAsyncKeyState(VK_F6)  & 0x8000) != 0;
+    int f5  = (GetAsyncKeyState(VK_F5)  & 0x8000) != 0;
     if (f9  && !s_prevF9)  { Log("F9 edge detected");  SpawnP2(); }
     if (f10 && !s_prevF10) { Log("F10 edge detected"); DespawnP2(); }
     if (f8  && !s_prevF8)  { s_p2Killable = !s_p2Killable; Log("P2 killable %s", s_p2Killable ? "ON" : "OFF"); }
     if (f7  && !s_prevF7)  { s_shotXfer = !s_shotXfer; Log("shot xfer %s", s_shotXfer ? "ON" : "OFF"); }
     if (f6  && !s_prevF6)  { s_p2SepRes = !s_p2SepRes; Log("P2 separate-resources %s", s_p2SepRes ? "ON" : "OFF"); }
+    if (f5  && !s_prevF5)  { s_bossHpScale = s_bossHpScale % 3 + 1; s_dmgHookLogged = 0;
+                             Log("boss-HP scale x%d (%s)", s_bossHpScale, s_bossHpScale == 1 ? "OFF" : "ON"); }
     s_prevF9  = f9;
     s_prevF10 = f10;
     s_prevF8  = f8;
     s_prevF7  = f7;
     s_prevF6  = f6;
+    s_prevF5  = f5;
 }
 
 /* ---- collision detours: make P2 killable ----
@@ -319,6 +347,23 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
     void *p2 = (void *)s_p2;
     if (s_p2Killable && p2 && (uint32_t)self == ADDR_PLAYER_BASE)
         s_origCollideLaser(p2, edx, a, b, c, d, e);        /* P2 */
+    return r;
+}
+
+/* ---- boss/enemy HP scaling ----
+ * Run the original (side effects: shot consumption + hit sparks happen once,
+ * unchanged), then divide ONLY the returned damage by the scale, flooring a
+ * positive result at 1 so weak shots still register. With one player this just
+ * makes the game harder; its real purpose is to offset the doubled DPS of co-op. */
+static int __fastcall HookedDamage(void *self, void *edx,
+                                   float *pos, float *size, int *out_flag)
+{
+    int r = s_origDamage(self, edx, pos, size, out_flag);
+    if (s_bossHpScale > 1 && r > 0) {
+        r /= s_bossHpScale;
+        if (r == 0) r = 1;
+        if (!s_dmgHookLogged) { Log("boss-HP scaling active (x%d)", s_bossHpScale); s_dmgHookLogged = 1; }
+    }
     return r;
 }
 
@@ -432,10 +477,12 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_PLAYER_DRAW,   (LPVOID)&HookedDraw,   (LPVOID*)&s_origDraw)   != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLIDE_BULLET, (LPVOID)&HookedCollideBullet, (LPVOID*)&s_origCollideBullet) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLIDE_LASER,  (LPVOID)&HookedCollideLaser,  (LPVOID*)&s_origCollideLaser)  != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_DAMAGE,         (LPVOID)&HookedDamage,        (LPVOID*)&s_origDamage)        != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_LASER)  != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_DAMAGE)         != MH_OK) return 0;
     return 1;
 }
 
@@ -449,13 +496,13 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         { char *s = strrchr(s_dir, '\\'); if (s) s[1] = '\0'; }
         { char p[MAX_PATH]; snprintf(p, sizeof(p), "%scoop_log.txt", s_dir); s_log = fopen(p, "w"); }
         Log("th07_coop attached. AUTO-spawn P2 ~3s. P2: IJKL move, Space shot, U focus, O bomb. "
-            "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn.");
+            "F5=boss-HP scale (x1/x2/x3), F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn.");
         if (!InstallHooks())
             MessageBoxA(NULL, "th07_coop: hook install failed (wrong build/addresses?)",
                         "th07_coop", MB_ICONERROR);
         else
             Log("hooks installed (update @0x441fb0, draw @0x4420b0, "
-                "collide-bullet @0x43e260, collide-laser @0x43e6b0)");
+                "collide-bullet @0x43e260, collide-laser @0x43e6b0, damage @0x43d9e0)");
         break;
     case DLL_PROCESS_DETACH:
         if (s_log) { Log("detach"); fclose(s_log); }

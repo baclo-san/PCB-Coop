@@ -229,11 +229,18 @@ cherry display `+0x20a28` 15567/16392; points `+0x20a24` 15559; graze `+0x20a2c`
 
 ## 6. Decision + implementation plan (2026-06-11)
 
-**User decision (2026-06-11): "separate counts per player, SHARED border."** Each
-player gets their own cherry count for score/display; the border (bullet-cancel)
-activates off the TEAM total; the shared item-drop roll is fed by the team value.
-(The other options — P1-drives-all, fully-per-player-borders, keep-shared — were
-declined.)
+> **⚠️ DECISION REVISED (user, 2026-06-12): per-player cherry DISPLAY is DROPPED.**
+> With the shared team border settled (§0), a single shared cherry counter is the
+> design — two counters would be confusing. Everything below about per-player
+> display attribution is RETIRED (kept for the record); the cherry-gain trace
+> (§7) is no longer needed for any planned feature. **The P2 HUD (lives/bombs/
+> power) is still wanted** — that's an item-credit/HUD task, not a cherry task.
+
+**User decision (2026-06-11, superseded above): "separate counts per player,
+SHARED border."** Each player gets their own cherry count for score/display; the
+border (bullet-cancel) activates off the TEAM total; the shared item-drop roll is
+fed by the team value. (The other options — P1-drives-all,
+fully-per-player-borders, keep-shared — were declined.)
 
 ### The determinism re-framing that makes this SAFE by construction
 Delay-based lockstep means **both machines run the entire game sim on the same
@@ -311,7 +318,12 @@ trace first.
 
 ---
 
-## 7. Cherry-GAIN investigation (2026-06-11, IN PROGRESS)
+## 7. Cherry-GAIN investigation (2026-06-11 — RETIRED 2026-06-12)
+
+> **No longer needed:** this trace only served the per-player cherry *display*,
+> which the user dropped (§6 banner). Kept because the findings (graze ≠ cherry,
+> the accumulator structure, the pinned shot-hit path) are real RE that may help
+> later. Do not resume unless a feature needs it.
 
 User's initial (wiki-level) claims: cherry rises from (a) shots landing on enemies
 (less when focused; also feeds Cherry+), (b) certain item pickups (cherry items /

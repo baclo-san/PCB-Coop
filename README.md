@@ -76,12 +76,18 @@ co-op DLL: get into a stage, P2 auto-spawns after ~3 s; see the header comment i
 - ✅ Fork B (P2 entity): substantial — spawns, killable by bullets/lasers/contact,
   **grazes** (the graze flag gates bullet hit tests — found 2026-06-12), collects
   items into its OWN power/bombs/lives, shared team border (P2 rides P1's border as
-  a ringless shadow), ghost mode, F11 revive. All game-tested.
-- 🟡 Tier-1 boss/enemy HP scaling: implemented in `coop.c` (ECL set-life detour,
-  scales with player count), **compile-verified, not yet game-tested**
+  a ringless shadow), ghost mode. All game-tested.
+- 🟡 EoSD-style resurrection: implemented (ghost auto-wanders the bottom band;
+  survivor graze-revives it in 90 frames at the cost of a donated life — free if
+  broke; guaranteed 1up drop on last-life death), **not yet game-tested**. F11 =
+  debug instant-revive.
+- 🔴 Tier-1 boss/enemy HP scaling: implemented (ECL set-life detour) but the
+  2026-06-12 midboss test showed **no effect on Cirno** (fairies do scale); a
+  per-cap-write diagnostic is in — next run pinpoints it
   (`docs/th07_boss_hp_scaling.md`; an alternative damage-side lever is documented there).
 - 🟡 Fork A (netcode↔game wiring): integration DLL written + compile-verified, **not
   yet game-tested** (deferred until the game side is finished). Seams pinned in
   `docs/th07_fork_a_integration.md`, including the A1 menu-lockstep hook.
-- ⬜ Auto-resurrection trigger, P2 cherry HUD, netcode→coop.c wiring, real seed
-  handshake (ConnectionUI port), 3-player. See the handoff §5 next-steps.
+- ⬜ P2 HUD (lives/bombs/power — cherry stays a single shared counter, per user),
+  netcode→coop.c wiring, real seed handshake (ConnectionUI port), 3-player. See
+  the handoff §5 next-steps.

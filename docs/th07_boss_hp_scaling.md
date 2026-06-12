@@ -3,10 +3,19 @@
 > **STATUS (2026-06-11): IMPLEMENTED (Option A) in `src/coop/coop.c`** — the
 > `HookedEclInterp` detour on `FUN_00424290` scales `+0xd30` by the active
 > player count (`1 + P2-present`), auto-armed while P2 is live, F5 to toggle.
-> Compile-verified; **not yet game-tested** (verify a boss takes ~2× hits with
-> P2 spawned, and that the life bar drains at the correct rate). The static
-> binary patch (Option B) was not pursued — the runtime detour supports 3P and
-> needs no instruction-offset surgery.
+> The static binary patch (Option B) was not pursued — the runtime detour
+> supports 3P and needs no instruction-offset surgery.
+>
+> **GAME TEST (2026-06-12): INCONCLUSIVE-NEGATIVE for the midboss.** User
+> tested stage-1 midboss Cirno (20 power, P2 spawned but dormant): kill time
+> ~unchanged vs solo — definitely not ×2. The run's log shows the hook DID
+> scale *something* (`boss/enemy HP scaled x2 (60 -> 120)` — a 60-HP popcorn
+> fairy), but the log was one-shot so Cirno's set-life verdict is invisible.
+> **Diagnostic shipped:** `HookedEclInterp` now logs EVERY cap write (one line
+> per enemy phase init): `eclhp: <obj> cap A -> B SCALED xN` or
+> `... skip (players=, acc=)`. Next: one Cirno run, read the eclhp lines —
+> either her set-life never passes this interpreter path, or the guard
+> (`acc == 0` / `after != before`) rejects it; the log will say which.
 
 **Goal (handoff §4 "Difficulty tiers"):** with two players the team does ~2× DPS,
 so bosses die twice as fast. Scaling boss HP by the player count restores the

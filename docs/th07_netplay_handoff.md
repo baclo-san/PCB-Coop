@@ -595,6 +595,32 @@ this transcript. First action next session: verify write access, then `git push`
    `Ctrl_Set_InitSetting`, ConnectionUI port, and finally the deferred
    two-instance live determinism test (§5c step 1).
 
+## 5f. Session progress — 2026-06-12 (boss-HP test, resurrection, cherry decision)
+
+- **Boss-HP scaling game test: NOT working for the midboss** (user: stage-1 Cirno,
+  20 power, P2 dormant — kill time ~unchanged, definitely not ×2). The run's log
+  proves the hook scaled a 60-HP fairy, but the one-shot log hid everything after.
+  **Per-cap-write `eclhp:` diagnostic shipped** (boss-HP doc §status) — the next
+  Cirno run will show whether her set-life ever passes `FUN_00424290` and, if so,
+  which guard rejects it. Do NOT theorize past that log.
+- **EoSD-style resurrection IMPLEMENTED (awaiting game test), user-specified:**
+  ghost P2 now **auto-wanders** (bounces in the bottom ~1/5 band between the side
+  walls, synthesized input through ZUN's movement), the survivor **graze-revives**
+  it (within 32 units for 90 consecutive frames) at the cost of **one donated
+  life — free if the survivor has no spare extends**, and **dying on the last life
+  drops a guaranteed 1up** at the death spot via ZUN's item spawner
+  (`FUN_004326f0` = `__thiscall(item_mgr, float pos[3], int type, int mode)`,
+  type 5 = 1up, mode 0; item manager captured in the item-loop hook — NEW
+  function pin, PCBdecomp.c:20244). F11 stays as debug instant-revive. P1-side
+  ghost (P2 revives P1) is NOT in scope yet — P1's game-over is still vanilla.
+- **DECISION (user): per-player cherry display DROPPED** — single shared cherry
+  counter + the shared border stands; two counters would be confusing. The
+  cherry-gain trace (§5e plan item 3) is RETIRED (cherry doc §6/§7 updated).
+  **The P2 HUD (lives/bombs/power) is still wanted.**
+- Revised plan: 1) user test run (eclhp log + resurrection feel), 2) fix boss-HP
+  per the log, 3) P2 HUD, 4) netcode→coop.c wiring (fork-a §8), 5) menu lockstep
+  A1 validation, seed handshake, ConnectionUI, live two-instance test last.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

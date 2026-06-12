@@ -621,6 +621,35 @@ this transcript. First action next session: verify write access, then `git push`
   per the log, 3) P2 HUD, 4) netcode→coop.c wiring (fork-a §8), 5) menu lockstep
   A1 validation, seed handshake, ConnectionUI, live two-instance test last.
 
+### 5f-addendum — first resurrection test + the eclhp verdict (same day)
+
+**Test round 2 results (user) + fixes shipped:**
+- **eclhp verdict: every cap write in the entire run was `0 -> 120` (popcorn).**
+  Cirno's HP never passes `FUN_00424290`'s set-life — boss/midboss HP is set by
+  some other path (un-RE'd). **Boss-HP scaling switched to the damage-side
+  lever**: `HookedDamage` on `FUN_0043d9e0` divides only the returned damage by
+  the player count (floor 1) — covers every enemy regardless of HP init. The
+  ECL-cap detour + eclhp diagnostic were removed (the ~40-line log burst per
+  wave spawn was also the likely cause of the user's post-Cirno freeze).
+- **Crash (run 1, unreproduced):** P2's last-life death high up the screen
+  crashed the game once; run 2 (death low) was clean. Unexplained — the death
+  intercept now logs alivePos+itemMgr for forensics. Watch for a repro.
+- **1up drop position was wrong:** it spawned at (192,384) — the FSM resets P2's
+  pos to the respawn center before the intercept sees the death, and P1 standing
+  there ate the 1up instantly ("just the sound of it being consumed"). Now drops
+  at the tracked last-alive position.
+- **Ghost feel (user):** band ≈ right but ~50px too low (raised: y 302–382),
+  speed way too fast (input-bit steering = unfocused speed; now the position is
+  driven DIRECTLY at 0.8 px/frame ≈ 1/3 focus, all input masked), revive
+  impossible to channel (radius was 32 on a fast ghost). Now: radius 16 ("P1's
+  hitbox inside the ghost sprite"), ghost semi-transparent (half-alpha tint
+  `+0x1b8`, re-applied each frame), and the real graze-credit leaf
+  `FUN_0043eb90` (`__thiscall(player, float* grazed_pos)`) fires every 6 frames
+  of the channel for authentic graze SFX/spark/counter feedback.
+- Awaiting test round 3: Cirno TTK with P2 (expect ~2× slower), ghost
+  feel/speed/band, graze-revive channel, 1up at death spot, and ideally a repro
+  attempt of the high-death crash.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

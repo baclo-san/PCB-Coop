@@ -1,21 +1,20 @@
 # Tier 1 — Boss / enemy HP scaling (verified against PCBdecomp.c)
 
-> **STATUS (2026-06-11): IMPLEMENTED (Option A) in `src/coop/coop.c`** — the
-> `HookedEclInterp` detour on `FUN_00424290` scales `+0xd30` by the active
-> player count (`1 + P2-present`), auto-armed while P2 is live, F5 to toggle.
-> The static binary patch (Option B) was not pursued — the runtime detour
-> supports 3P and needs no instruction-offset surgery.
->
-> **GAME TEST (2026-06-12): INCONCLUSIVE-NEGATIVE for the midboss.** User
-> tested stage-1 midboss Cirno (20 power, P2 spawned but dormant): kill time
-> ~unchanged vs solo — definitely not ×2. The run's log shows the hook DID
-> scale *something* (`boss/enemy HP scaled x2 (60 -> 120)` — a 60-HP popcorn
-> fairy), but the log was one-shot so Cirno's set-life verdict is invisible.
-> **Diagnostic shipped:** `HookedEclInterp` now logs EVERY cap write (one line
-> per enemy phase init): `eclhp: <obj> cap A -> B SCALED xN` or
-> `... skip (players=, acc=)`. Next: one Cirno run, read the eclhp lines —
-> either her set-life never passes this interpreter path, or the guard
-> (`acc == 0` / `after != before`) rejects it; the log will say which.
+> **STATUS (2026-06-12): re-implemented on the DAMAGE side (§5), the ECL-cap
+> detour (§2–§3) is RETIRED.** The game test + the per-cap-write `eclhp`
+> diagnostic settled it:
+> - Cirno (stage-1 midboss) kill time was unchanged with the ECL-cap detour
+>   armed, and **every single eclhp line in the diagnostic run was
+>   `cap 0 -> 120` (popcorn)** — the midboss's HP **never passes the
+>   `FUN_00424290` set-life path** this doc's §2 pinned. Where boss/midboss HP
+>   is actually set remains un-RE'd (a different opcode/handler); not pursued.
+> - `coop.c` now detours **`FUN_0043d9e0`** (§5): the original runs (shot
+>   consumption + sparks happen once), then only the returned damage is divided
+>   by the player count, floored at 1. This catches every enemy uniformly no
+>   matter how its HP was initialized. Auto-armed while P2 is live; F5 toggles.
+> - Side note: the eclhp log burst (~40 lines in one frame at wave spawns, each
+>   fflush'd) likely caused the brief freeze the user saw — the diagnostic is
+>   removed with the switch.
 
 **Goal (handoff §4 "Difficulty tiers"):** with two players the team does ~2× DPS,
 so bosses die twice as fast. Scaling boss HP by the player count restores the
@@ -142,11 +141,11 @@ notes). Hooking it would corrupt half the game. Scale `+0xd30`, not the accumula
 
 ---
 
-## 5. Alternative lever — scale the damage RETURN at `FUN_0043d9e0` (fallback)
+## 5. The damage-RETURN lever at `FUN_0043d9e0` — NOW THE SHIPPED IMPLEMENTATION
 
-(From the 2026-06-12 overnight session, decomp-verified. NOT implemented in the
-shipped coop.c — Option A above is. Keep as the fallback if the ECL-cap detour
-misbehaves in the game test.)
+(From the 2026-06-12 overnight session, decomp-verified; promoted from fallback
+to the implementation after the game test killed the ECL-cap approach — see the
+status banner. `coop.c`'s `HookedDamage` is this recipe.)
 
 ### `FUN_0043d9e0` @ `0x0043d9e0` — the player-shot damage function
 ```c
@@ -177,9 +176,11 @@ int __fastcall HookedDamage(void* self, void* edx, float* pos, float* size, int*
 - Scales ALL player-shot damage (every enemy, not just bosses) — same scope as
   Option A's all-enemies behavior, but as a damage divisor (rounding differs).
 
-### Trade-off vs Option A (the shipped ECL-cap detour)
-Option A scales the phase cap once per set-life opcode (exact ×N, no rounding loss,
-life bar drains visually correct). The damage-divisor changes every hit's value
-(integer division loses fractions; per-shot floor can overweight weak shots), but
-it needs no knowledge of the enemy struct. Prefer A; use this if A's game test
-surprises us.
+### Trade-off vs the retired ECL-cap detour (Option A, §2–§3)
+Option A scales the phase cap once per set-life opcode (exact ×N, no rounding
+loss, life bar drains visually correct) — but the game test proved it only ever
+reaches popcorn; boss/midboss HP is initialized somewhere `FUN_00424290`'s cap
+write never sees. The damage-divisor loses fractions to integer division and the
+floor can overweight 1-damage shots, but it provably covers everything. If exact
+boss pacing ever matters enough, the open RE task is "where is boss HP actually
+set" — until then this is the lever.

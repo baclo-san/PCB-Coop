@@ -50,13 +50,13 @@
  *   P2's bombs/power are logged to coop_log.txt on change until the P2 HUD exists.
  *
  * BOSS / ENEMY HP SCALING (Tier-1): two players ~= 2x DPS, so spell/life phases
- *   end twice as fast. We detour the per-enemy ECL interpreter (FUN_00424290)
- *   and multiply the per-phase max-life cap (+0xd30) by the active player count
- *   the frame the "set life" opcode (re)writes it. PCB's HP model is inverted:
- *   damage climbs in the accumulator (+0xd18) toward the cap, phase ends when
- *   acc >= cap; doubling the cap restores the solo fight length. Auto-arms when
- *   P2 is live (factor = 1 + P2-present); F5 toggles off. Scales all enemies
- *   (TTK-neutral for popcorn, correct for bosses). See docs/th07_boss_hp_scaling.md.
+ *   end twice as fast. We detour the player-shot DAMAGE function (FUN_0043d9e0)
+ *   and divide only its returned damage by the active player count (floor 1).
+ *   The original runs first, so shot consumption + hit sparks happen exactly
+ *   once. This catches EVERY enemy uniformly — the previous ECL set-life cap
+ *   scaling (FUN_00424290, +0xd30) only ever caught popcorn; the 2026-06-12
+ *   eclhp log proved the stage-1 midboss's HP never passes that path. Auto-arms
+ *   when P2 is live; F5 toggles off. See docs/th07_boss_hp_scaling.md.
  *
  * SHARED TEAM BORDER (user-corrected design): the cherry border is the AUTOMATIC
  *   supernatural border that fires when the shared Cherry+ gauge reaches 50000 — it
@@ -78,16 +78,18 @@
  *   See docs/th07_cherry_determinism.md §0.
  *
  * RESURRECTION (EoSD-mod style, user-specified 2026-06-12): when P2 runs out of
- *   lives it becomes a GHOST — invulnerable, no shot/bomb, and AUTO-WANDERING
- *   (bounces inside the bottom ~1/5 band of the playfield between the side
- *   walls, via synthesized input bits through ZUN's own movement code). The
- *   survivor revives it by GRAZING the ghost (staying within graze range) for
- *   90 consecutive frames: that DONATES one of the survivor's lives (written
- *   into the shared struct + checksum re-heal) — or is FREE when the survivor
- *   has no spare extends. Additionally, dying on the LAST life drops a
- *   guaranteed 1-UP item at the death spot (ZUN's item spawner FUN_004326f0,
- *   type 5), so the survivor can bank a life and then revive. F11 stays as the
- *   debug instant-revive.
+ *   lives it becomes a GHOST — invulnerable, no input, semi-transparent (half-
+ *   alpha tint), drifting slowly (~1/3 focus speed, position driven directly)
+ *   inside a band in the lower playfield, bouncing between the side walls. The
+ *   survivor revives it by GRAZING the ghost — P1's hitbox inside the ghost
+ *   sprite — for 90 consecutive frames; while channeling, the real graze-credit
+ *   leaf (FUN_0043eb90) fires every 6 frames for authentic graze SFX/spark
+ *   feedback. The revive DONATES one of the survivor's lives (written into the
+ *   shared struct + checksum re-heal) — or is FREE when the survivor has no
+ *   spare extends. Additionally, dying on the LAST life drops a guaranteed 1-UP
+ *   item at the death spot (tracked last-alive position; ZUN's item spawner
+ *   FUN_004326f0, type 5), so the survivor can bank a life and then revive.
+ *   F11 stays as the debug instant-revive.
  *
  * Controls (in-stage):
  *   F9  = spawn P2 (clone of P1, offset +24px X). Only when a char is loaded.
@@ -127,6 +129,7 @@
 
 #define OFF_POS_X     0x930        /* float player X                            */
 #define OFF_POS_Y     0x934        /* float player Y                            */
+#define OFF_TINT      0x1b8        /* u32 sprite tint 0xAARRGGBB (update rewrites it) */
 #define OFF_CHARDATA  0xb7e70      /* char speed-table ptr; !=0 ⇒ char loaded   */
 #define OFF_STATE     0x2408       /* player state byte: 0 play,1 enter,2 dying, */
                                    /*   3 respawn-invuln, 4 border               */
@@ -166,14 +169,18 @@
 #define OFF_BORDER_REQ  0x240d    /* border request/active flag (1 = pressing bomb pops)*/
 #define OFF_BORDER_SPR  0xb7e6c   /* border-ring sprite object ptr                     */
 
-/* Tier-1 boss/enemy HP scaling. The per-phase max-life cap is (re)written once
- * per phase by the "set life" opcode inside the per-enemy ECL command
- * interpreter; we detour it and multiply the cap by the player count on the
- * frame it changes. Cap is stored via a float write but read as int everywhere
- * that matters (death check, bar math) — treat it as int. */
-#define ADDR_ECL_INTERP ((LPVOID)0x00424290) /* __fastcall(enemy) ECL cmd interp */
-#define OFF_HP_MAX  0xd30   /* int: max life of the current phase (scale target) */
-#define OFF_HP_ACC  0xd18   /* int: accumulated damage; ==0 right after set-life */
+/* Tier-1 boss/enemy HP scaling — DAMAGE-side lever. The first attempt scaled
+ * the per-phase max-life cap (+0xd30) at the ECL set-life opcode (FUN_00424290),
+ * but the 2026-06-12 eclhp diagnostic proved only popcorn (cap 60) ever passes
+ * that path — the stage-1 midboss's HP is set elsewhere and was never scaled.
+ * So we scale at the other end: FUN_0043d9e0 sweeps the player's shot array
+ * against a target box and RETURNS the total damage this frame (the per-enemy
+ * damage-apply loop FUN_00420620:12822 subtracts the return from HP). Dividing
+ * only the return catches EVERY enemy uniformly — no matter how its HP was set —
+ * while shot consumption + hit sparks still happen exactly once. Both players'
+ * shots flow through P1's array (shot transfer), so the divisor halves the
+ * TEAM's doubled DPS back to vanilla pacing. See docs/th07_boss_hp_scaling.md §5. */
+#define ADDR_DAMAGE ((LPVOID)0x0043d9e0) /* __thiscall(player, pos, size, outf) */
 
 /* __thiscall modelled as __fastcall: ECX=this, EDX=unused, rest on stack.
  * Stack-arg count + order match, so callee stack cleanup (ret N) matches too. */
@@ -236,7 +243,10 @@ typedef void (__fastcall *HudRefreshFn_t)(uint32_t singleton);
 #define P2_SPAWN_OFFSET_X  24.0f
 
 typedef int (__fastcall *PlayerFn_t)(void *self);
-typedef int (__fastcall *EclInterpFn_t)(void *self);
+/* FUN_0043d9e0: __thiscall(player, float *pos, float *size, int *out_flag),
+ * returns total shot damage vs the target box. Modeled as __fastcall. */
+typedef int (__fastcall *DamageFn_t)(void *self, void *edx,
+                                     float *pos, float *size, int *out_flag);
 
 static PlayerFn_t s_origUpdate = NULL;
 static PlayerFn_t s_origDraw   = NULL;
@@ -244,7 +254,7 @@ static CollideBulletFn_t s_origCollideBullet = NULL;
 static CollideBulletFn_t s_origGraze         = NULL;   /* FUN_0043e3b0, same signature */
 static CollideLaserFn_t  s_origCollideLaser  = NULL;
 static CollectOverlapFn_t s_origCollectOverlap = NULL;
-static EclInterpFn_t     s_origEclInterp     = NULL;
+static DamageFn_t        s_origDamage        = NULL;
 static ItemLoopFn_t      s_origItemLoop       = NULL;
 
 static volatile void *s_p2   = NULL;   /* P2 object base, NULL until spawned     */
@@ -269,6 +279,17 @@ static int   s_p2PrevLives = -1, s_p2PrevBombs = -1, s_p2PrevPower = -1;
 static int   s_p2Ghost = 0;
 static int   s_ghostDirX = 1, s_ghostDirY = 1;  /* auto-wander bounce direction */
 static int   s_reviveFrames = 0;       /* consecutive frames P1 grazed the ghost */
+static float s_p2AlivePos[3] = {192.f, 384.f, 0.f}; /* P2's last alive position —
+                                        the death FSM resets pos to center before
+                                        we see the last-life death, so the 1up
+                                        must drop at the position we tracked */
+
+/* Graze credit leaf FUN_0043eb90: __thiscall(player, float *grazed_pos) — bumps
+ * the graze counters, spawns the graze spark at the midpoint, queues the graze
+ * SFX, +200 score. Called every few frames during the revive channel so
+ * "grazing the ghost" sounds and looks like real grazing. */
+typedef void (__fastcall *GrazeCreditFn_t)(void *self, void *edx, float *pos);
+#define ADDR_GRAZE_CREDIT ((GrazeCreditFn_t)0x0043eb90)
 
 /* ZUN's item spawner: __thiscall(item_mgr, float pos[3], int type, int mode) —
  * walks the 1100-slot ring, activates a free slot, sets pos/type/mode
@@ -391,6 +412,7 @@ static void SpawnP2(void)
         }
         s_p2Ghost = 0;
         s_reviveFrames = 0;
+        memcpy(s_p2AlivePos, (char *)p2 + OFF_POS_X, sizeof(s_p2AlivePos));
         s_p2PrevLives = s_p2PrevBombs = s_p2PrevPower = -1;
         Log("spawn: P2 lives=%.0f bombs=%.0f power=%.0f (res=0x%08x separate=%d)",
             s_p2Lives, s_p2Bombs, s_p2Power, res, s_p2SepRes);
@@ -432,46 +454,58 @@ static void ReviveP2(void)
 
 /* ---- EoSD-style resurrection (user-specified 2026-06-12) ---- */
 
-/* Ghost auto-movement: bounce inside the bottom ~1/5 band of the playfield
- * (between the side walls, off the band top and the bottom wall). Driven via
- * synthesized input bits through ZUN's own movement code, so it respects the
- * engine's position clamps and the character's speed. Thresholds only steer;
- * the engine clamp is the real wall. Playfield ~384x448 world units. */
+/* Ghost auto-movement: drift slowly inside a band in the lower playfield,
+ * bouncing between the side walls and the band top/bottom. The first version
+ * steered via input bits, which moves at the character's (unfocused) speed —
+ * way too fast to graze (user test). So the ghost's position is driven
+ * DIRECTLY (the hitbox and sprite both track +0x930, verified) at GHOST_SPEED,
+ * with all input bits masked. Playfield ~384x448 world units; band raised
+ * 50px from the first test per user feedback. */
 #define GHOST_X_MIN   48.0f
 #define GHOST_X_MAX  336.0f
-#define GHOST_Y_TOP  352.0f            /* top of the bottom-1/5 band (448*4/5) */
-#define GHOST_Y_BOT  432.0f
+#define GHOST_Y_TOP  302.0f
+#define GHOST_Y_BOT  382.0f
+#define GHOST_SPEED    0.8f            /* ~1/3 focus speed; tune after testing */
+#define GHOST_TINT 0x80ffffffu         /* half-alpha white — semi-transparent  */
 
-static uint16_t GhostAutoInput(void *p2)
+static void MoveGhost(void *p2)
 {
-    float x = *(float *)((char *)p2 + OFF_POS_X);
-    float y = *(float *)((char *)p2 + OFF_POS_Y);
-    if (x <= GHOST_X_MIN) s_ghostDirX = 1;  else if (x >= GHOST_X_MAX) s_ghostDirX = -1;
-    if (y <= GHOST_Y_TOP) s_ghostDirY = 1;  else if (y >= GHOST_Y_BOT) s_ghostDirY = -1;
-    return (uint16_t)((s_ghostDirX > 0 ? IN_RIGHT : IN_LEFT) |
-                      (s_ghostDirY > 0 ? IN_DOWN  : IN_UP));
+    float *px = (float *)((char *)p2 + OFF_POS_X);
+    float *py = (float *)((char *)p2 + OFF_POS_Y);
+    if (*px <= GHOST_X_MIN) s_ghostDirX = 1;  else if (*px >= GHOST_X_MAX) s_ghostDirX = -1;
+    if (*py <= GHOST_Y_TOP) s_ghostDirY = 1;  else if (*py >= GHOST_Y_BOT) s_ghostDirY = -1;
+    *px += GHOST_SPEED * (float)s_ghostDirX;
+    *py += GHOST_SPEED * (float)s_ghostDirY;
+    /* semi-transparent ghost; the update rewrites the tint, so re-apply each frame */
+    *(uint32_t *)((char *)p2 + OFF_TINT) = GHOST_TINT;
 }
 
-/* Guaranteed 1up at the death spot when P2 dies on its last life, so the
+/* Guaranteed 1up at the DEATH SPOT when P2 dies on its last life, so the
  * survivor can bank a life and then graze-revive. Only P1 can collect it
- * (the collect-overlap hook skips a ghost P2). */
-static void DropOneUp(void *plr)
+ * (the collect-overlap hook skips a ghost P2). Uses the tracked last-alive
+ * position — by the time we see the death, the FSM already reset P2's pos
+ * to the respawn center (first test dropped the 1up at (192,384) into P1's
+ * lap, instantly consumed). */
+static void DropOneUp(void)
 {
     void *mgr = (void *)s_itemMgr;
-    float pos[3];
     if (!mgr) { Log("1up drop SKIPPED: item manager not seen yet"); return; }
-    memcpy(pos, (char *)plr + OFF_POS_X, sizeof(pos));   /* x,y,z are contiguous */
-    ADDR_ITEM_SPAWN(mgr, NULL, pos, ITEM_TYPE_1UP, 0);
-    Log("P2 last-life death -> dropped 1up at (%.1f,%.1f)", pos[0], pos[1]);
+    ADDR_ITEM_SPAWN(mgr, NULL, s_p2AlivePos, ITEM_TYPE_1UP, 0);
+    Log("P2 last-life death -> dropped 1up at (%.1f,%.1f)",
+        s_p2AlivePos[0], s_p2AlivePos[1]);
 }
 
 /* The survivor grazes the ghost for REVIVE_FRAMES consecutive frames ->
  * donates one life (free when they have no spare extends) and the ghost
- * resurrects next to them. Runs while the shared struct holds P1's values
- * (after the P2 field-swap restore), so the donation is a direct write +
- * checksum re-heal — the same proven pattern as the resource swap. */
-#define REVIVE_RADIUS  32.0f
+ * resurrects next to them. Radius = "P1's hitbox inside the ghost sprite"
+ * (user). While channeling, the real graze-credit leaf fires every few
+ * frames — authentic graze SFX + spark + counter tick as live feedback.
+ * Runs while the shared struct holds P1's values (after the P2 field-swap
+ * restore), so the donation is a direct write + checksum re-heal — the same
+ * proven pattern as the resource swap. */
+#define REVIVE_RADIUS  16.0f
 #define REVIVE_FRAMES  90
+#define REVIVE_TICK     6          /* graze-feedback cadence while channeling */
 
 static void ReviveByGraze(void *p2)
 {
@@ -485,6 +519,9 @@ static void ReviveByGraze(void *p2)
     if ((p1st == 0 || p1st == 3 || p1st == 4) &&
         dx > -REVIVE_RADIUS && dx < REVIVE_RADIUS &&
         dy > -REVIVE_RADIUS && dy < REVIVE_RADIUS) {
+        if (s_reviveFrames % REVIVE_TICK == 0)      /* live feedback: real graze */
+            ADDR_GRAZE_CREDIT((void *)ADDR_PLAYER_BASE, NULL,
+                              (float *)((char *)p2 + OFF_POS_X));
         if (++s_reviveFrames >= REVIVE_FRAMES) {
             uint32_t res = *ADDR_RES_PTR;
             if (res && *(float *)(res + RES_LIVES) >= 1.0f) {
@@ -663,34 +700,19 @@ static void __fastcall HookedItemLoop(void *self)
     RestoreHeldRes();
 }
 
-/* ---- boss/enemy HP scaling detour ----
- * Multiply the per-phase max-life cap by the active player count on the frame
- * the "set life" ECL opcode (re)writes it. Guard: the cap actually changed AND
- * the damage accumulator was just reset to 0 — that pair is unique to the
- * set-life command, so a fresh phase is scaled exactly once and never
- * re-multiplied on subsequent frames (when the interpreter leaves the cap as-is,
- * after == before). Only arms while P2 is live, so solo play is untouched. */
-static int __fastcall HookedEclInterp(void *self)
+/* ---- boss/enemy HP scaling detour (damage-side) ----
+ * Run the original (side effects — shot consumption, hit sparks — happen once,
+ * unchanged), then divide ONLY the returned damage by the active player count,
+ * flooring a positive result at 1 so weak shots still register. Catches every
+ * enemy including the midboss/boss whose HP never passes the ECL set-life path
+ * (proven by the 2026-06-12 eclhp log). Arms only while P2 is live. */
+static int __fastcall HookedDamage(void *self, void *edx,
+                                   float *pos, float *size, int *out_flag)
 {
-    int before = *(int *)((char *)self + OFF_HP_MAX);
-    int r = s_origEclInterp(self);
-    if (s_bossHpScale) {
-        int players = s_p2 ? 2 : 1;               /* active player count */
-        int after   = *(int *)((char *)self + OFF_HP_MAX);
-        int acc     = *(int *)((char *)self + OFF_HP_ACC);
-        /* DIAG (boss-HP game test came back inconclusive): log EVERY cap write —
-         * one line per enemy phase init — with the guard verdict, so a single run
-         * shows whether a midboss/boss set-life passes through here at all. */
-        if (after != before) {
-            if (players > 1 && after > 0 && acc == 0) {
-                *(int *)((char *)self + OFF_HP_MAX) = after * players;
-                Log("eclhp: %08x cap %d -> %d SCALED x%d", (uint32_t)self,
-                    before, after * players, players);
-            } else {
-                Log("eclhp: %08x cap %d -> %d skip (players=%d acc=%d)",
-                    (uint32_t)self, before, after, players, acc);
-            }
-        }
+    int r = s_origDamage(self, edx, pos, size, out_flag);
+    if (s_bossHpScale && s_p2 && r > 0) {
+        r /= 2;                              /* player count (3P: divide by 3) */
+        if (r == 0) r = 1;
     }
     return r;
 }
@@ -794,7 +816,7 @@ static int __fastcall HookedUpdate(void *self)
             uint16_t p2in  = ReadP2InputLocal();
             uint16_t saved = *ADDR_INPUT_GAMEPLAY;
             if (p2in && !s_p2InputLogged) { Log("P2 input read OK: 0x%03x (key path works)", p2in); s_p2InputLogged = 1; }
-            if (s_p2Ghost) p2in = GhostAutoInput(p2);  /* ghost auto-wanders, no shot/bomb */
+            if (s_p2Ghost) p2in = 0;    /* ghost: no input at all — MoveGhost drives it */
 
             /* P2's bomb is its own spell card (spent from P2's separate bomb count
              * via the resource field-swap below) and is NOT masked. ZUN's bomb handler
@@ -847,7 +869,9 @@ static int __fastcall HookedUpdate(void *self)
                 *ADDR_GAMEOVER = goBefore;          /* undo P2-caused game-over */
                 s_p2Ghost = 1;
                 s_reviveFrames = 0;
-                DropOneUp(p2);
+                Log("P2 death intercept: alivePos=(%.0f,%.0f) itemMgr=%p",
+                    s_p2AlivePos[0], s_p2AlivePos[1], (void *)s_itemMgr);
+                DropOneUp();
                 Log("P2 out of lives -> GHOST mode (auto-wander; graze %d frames to revive)",
                     REVIVE_FRAMES);
             }
@@ -861,11 +885,18 @@ static int __fastcall HookedUpdate(void *self)
                     Log("P2 state %d -> %d", s_p2PrevState, st);
                     s_p2PrevState = st;
                 }
+                /* track the last ALIVE position — the 1up death drop uses it
+                 * (the FSM resets pos to center before we see the death) */
+                if (!s_p2Ghost && (st == 0 || st == 4))
+                    memcpy(s_p2AlivePos, (char *)p2 + OFF_POS_X, sizeof(s_p2AlivePos));
             }
 
-            /* graze resurrection: the shared struct holds P1's values here
-             * (restored above), so the life donation can write it directly */
-            if (s_p2Ghost) ReviveByGraze(p2);
+            /* ghost drive + graze resurrection: the shared struct holds P1's
+             * values here (restored above), so the life donation can write it */
+            if (s_p2Ghost) {
+                MoveGhost(p2);
+                ReviveByGraze(p2);
+            }
 
             if (s_shotXfer && !s_p2Ghost) TransferP2Shots(p2);  /* P2 shots -> P1 array */
         }
@@ -893,7 +924,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_COLLIDE_BULLET, (LPVOID)&HookedCollideBullet, (LPVOID*)&s_origCollideBullet) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLIDE_LASER,  (LPVOID)&HookedCollideLaser,  (LPVOID*)&s_origCollideLaser)  != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLIDE_GRAZE,  (LPVOID)&HookedGraze,         (LPVOID*)&s_origGraze)         != MH_OK) return 0;
-    if (MH_CreateHook(ADDR_ECL_INTERP,     (LPVOID)&HookedEclInterp,     (LPVOID*)&s_origEclInterp)     != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_DAMAGE,         (LPVOID)&HookedDamage,        (LPVOID*)&s_origDamage)        != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
@@ -902,7 +933,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_LASER)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_GRAZE)  != MH_OK) return 0;
-    if (MH_EnableHook(ADDR_ECL_INTERP)     != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_DAMAGE)         != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLECT_OVERLAP)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_ITEM_LOOP)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;
@@ -927,7 +958,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         else
             Log("hooks installed (update @0x441fb0, draw @0x4420b0, "
                 "collide-bullet @0x43e260, collide-laser @0x43e6b0, graze @0x43e3b0, "
-                "ecl-interp @0x424290, collect-overlap @0x43e4e0, item-loop @0x432990, "
+                "damage @0x43d9e0, collect-overlap @0x43e4e0, item-loop @0x432990, "
                 "border-break @0x441bd0)");
         break;
     case DLL_PROCESS_DETACH:

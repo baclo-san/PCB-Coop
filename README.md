@@ -77,14 +77,16 @@ co-op DLL: get into a stage, P2 auto-spawns after ~3 s; see the header comment i
   **grazes** (the graze flag gates bullet hit tests — found 2026-06-12), collects
   items into its OWN power/bombs/lives, shared team border (P2 rides P1's border as
   a ringless shadow), ghost mode. All game-tested.
-- 🟡 EoSD-style resurrection: implemented (ghost auto-wanders the bottom band;
-  survivor graze-revives it in 90 frames at the cost of a donated life — free if
-  broke; guaranteed 1up drop on last-life death), **not yet game-tested**. F11 =
-  debug instant-revive.
-- 🔴 Tier-1 boss/enemy HP scaling: implemented (ECL set-life detour) but the
-  2026-06-12 midboss test showed **no effect on Cirno** (fairies do scale); a
-  per-cap-write diagnostic is in — next run pinpoints it
-  (`docs/th07_boss_hp_scaling.md`; an alternative damage-side lever is documented there).
+- 🟡 EoSD-style resurrection: implemented + first round of play feedback applied
+  (slow semi-transparent ghost drifting in the lower band; survivor graze-revives
+  it in 90 frames — with real graze SFX/spark feedback — at the cost of a donated
+  life, free if broke; guaranteed 1up drop at the death spot on last-life death).
+  **Retest pending**; one unreproduced crash on a high-position last-life death
+  is being watched. F11 = debug instant-revive.
+- 🟡 Tier-1 boss/enemy HP scaling: now a **damage-side divisor** (`FUN_0043d9e0`
+  return ÷ player count) — the ECL set-life detour was retired after the eclhp
+  log proved boss/midboss HP never passes that path (`docs/th07_boss_hp_scaling.md`).
+  **Retest pending.**
 - 🟡 Fork A (netcode↔game wiring): integration DLL written + compile-verified, **not
   yet game-tested** (deferred until the game side is finished). Seams pinned in
   `docs/th07_fork_a_integration.md`, including the A1 menu-lockstep hook.

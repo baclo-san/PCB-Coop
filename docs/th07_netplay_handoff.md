@@ -544,12 +544,63 @@ this transcript. First action next session: verify write access, then `git push`
 - **Cleanup:** all temporary DIAG logging + the F2 (fat-hitbox) / F3 (force-hit) debug keys
   were removed after the fix landed.
 
+## 5e. 2026-06-12 — branches merged to main; doc set consolidated
+
+**Everything now lives on `main`.** Two parallel lines were merged:
+- `claude/optimistic-brown-xe5tz6` — the joint sessions through 2026-06-12 01:07
+  (everything in §5b–§5d). Fast-forwarded into main.
+- `claude/adoring-lovelace-8azf2h` — the 2026-06-12 overnight unattended routine.
+  It had branched from the stale `main`, so most of its work re-derived §5b–§5d
+  results (good convergence: it independently resolved the A1 seam to the same
+  `FUN_00437c70`, and made the identical `ws2tcpip.h` fix). Taken from it:
+  - **`merge.{hpp,cpp}`** — MergeKeys extracted winsock-free + **native
+    `tests/merge_test.cpp`** (no wine needed) — and **CI**
+    (`.github/workflows/build.yml`: Linux build of everything + the native test
+    on every push/PR).
+  - **`netcode_c_api.{h,cpp}`** — C-linkage shim so `coop.c` can call the
+    netcode directly (the single-DLL integration; plan in fork-a doc §8).
+  - **New RE folded into the companion docs** (see those): death FSM /
+    resurrection seam (`FUN_00440cf0`), score-side border/banner fns, the
+    alternative damage-side boss-HP lever (`FUN_0043d9e0`), the
+    `FUN_004012b0`-consumes-2-RNG-calls determinism note, the second menu poll
+    site `FUN_0045bf15`, and the correction that **`GameUpdate` IS in the dump**
+    (renamed — §5b's "absent" note was wrong; the frame governor is still
+    genuinely absent).
+  - NOT taken: its coop.c F5 damage-divide hook (conflicted with our newer,
+    integrated ECL-cap scaling — kept as the documented fallback) and its
+    stale-status handoff banner / docs (`th07_integration_forkA.md`,
+    `th07_gameplay_seams.md` deleted after folding).
+- Hygiene: `build/coop_log.txt` untracked (a stale committed log misled §5b);
+  `.gitattributes` pins `*.sh` to LF; the push-recovery bundle removed.
+- Verified after the merge: `build.ps1` builds clean on Windows and
+  `netloop_test.exe` passes 16/16 (exercises the merge.cpp/netcode_c_api refactor).
+
+### Plan (2026-06-12) — game-side first (netplay live test stays parked)
+1. **Game-test Tier-1 boss-HP scaling** (only §5c item never play-tested):
+   with P2 spawned, a boss phase should take ~2× damage and the bar drain at
+   half rate. Fallback lever documented in boss-HP doc §5 if it misbehaves.
+2. **Auto-resurrection** (replace the F11 stand-in): death FSM is fully pinned
+   (player-struct doc). Design decisions for the user: revive input + window
+   (deathbomb-window catch vs revive-from-ghost), cost (reviver's life), 90-frame
+   hold? Then implement in coop.c + play-test.
+3. **Cherry-gain trace** (gates per-player cherry display, 3b): the shot-hit
+   path is now pinned (`FUN_0043d9e0` calc / `FUN_00420620:12822` apply) — trace
+   where the cherry accumulator rises, then the per-player display attribution +
+   P2 cherry HUD (score-side fns pinned in cherry doc §5).
+4. **Wire the netcode into coop.c** (fork-a doc §8, no game needed): replace
+   `ReadP2InputLocal()` with the merged word's high bits via `Nc_*`; one
+   DLL-owned frame counter in a `FUN_00437c70` detour; seed sync in
+   `FUN_00442c60`. Validate by compile + netsim; live test stays batched last.
+5. Then: menu-lockstep A1 in-game validation, seed handshake via
+   `Ctrl_Set_InitSetting`, ConnectionUI port, and finally the deferred
+   two-instance live determinism test (§5c step 1).
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)
 - th06 decomp base: GensokyoClub/happyhavoc
-- Persistent memory index: `C:\Users\rndmdck\.claude\projects\C--Users-rndmdck\memory\MEMORY.md`
-  → see `th07-netplay.md` (this handoff is the expanded form of that memory).
+- Persistent memory index: `C:\Users\rndmdck\.claude\projects\d--PCB-Co-op-PCB-Coop\memory\MEMORY.md`
+  → see `pcb-coop-overview.md` (this handoff is the expanded form of that memory).
 
 ## 7. Glossary of Ghidra fn renames (proposed; not yet applied in the db)
 Rng_Core=FUN_00431870, Rng_Next32=FUN_004318d0, Rng_NextFloat=FUN_00431900,

@@ -997,15 +997,29 @@ afterwards and overlay ghost mode ourselves.
   - Cross-char globals from round-12 (ReimuA damage nerf @12844, SakuyaA aim
     @12913) key off the GLOBAL char id; `SwapSelGlobals` covers the ones
     inside the player path, but the enemy-update ones see P1.
-- **First-test watch list (the uncertain bit):** if P2 renders with P1's
-  TEXTURE sheet but correct sprite geometry, the 0x40-byte entry's texture
-  ref is per-slot not global → would also need the slot texture-array slice
-  swapped. Expected to work (the +0x3c global sequence suggests a global tex
-  index), but this is the most likely surprise. Watch the coop_log line
-  `P2 char anm: ... N ids captured (0x.. .. 0x..)` — N≈0x80, top id < 0x4a0.
-- Awaiting test: F2 cycles P2 to Marisa/Sakuya while P1 is Reimu → P2's body
-  + shots + bomb are the new char; no crash on spawn / move / shoot / bomb /
-  stage transition / revive.
+- **TEST round 13a (Reimu P1):** first F2 (→ MarisaA) WORKED — body, shots,
+  bomb all Marisa, no crash, no cosmetic faults (textures resolve correctly,
+  so the swap design is sound). Second F2 (→ SakuyaA) crashed: P1's sprite
+  vanished, crash on shoot / next F2.
+- **BUG + FIX (the free clobber):** the FIRST transition never frees (nothing
+  loaded yet) — that's why it worked. The SECOND calls `FreeP2CharAnm`, whose
+  engine slot-free `FUN_0044e4e0` ZEROES the global script + sprite tables for
+  that slot's ids. But P2 loaded at base 0x400, so those are the SAME ids P1
+  uses, and the table then holds P1's entries → the free wiped P1's body/shot
+  scripts (P1 vanished; a NULL bind crashed on shoot). Fix: `FreeP2CharAnm`
+  now snapshots P1's `[0x400,0x4a0)` window, lets the engine free (it also
+  releases P2's buffer + textures), then restores P1's window. (The implicit
+  free on reload is harmless — we always free the old slot first and load into
+  a fresh empty one.)
+- **Bomb declaration portrait is P1's (SEPARATE, cosmetic, deferred):** the
+  bomb cb calls `FUN_0042868d(0x4a1, <spell name>)` — portrait id **0x4a1 is
+  in the FACE range (0x4a0+)**, NOT the player anm, and only P1's character's
+  face anm is loaded in-stage (`face_rm/mr/sk00.anm` at stage start by global
+  char id). So P2's bomb shows P1's face. Outside our 0x400-range swap; fixing
+  needs P2's declaration-portrait anm loaded too. Not a crash.
+- Awaiting re-test: F2 cycle Reimu→Marisa→Sakuya→… repeatedly while P1 is
+  Reimu → P1 stays visible, P2's body+shots+bomb are the new char, no crash on
+  spawn / move / shoot / bomb / repeated F2 / stage transition / revive.
 
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)

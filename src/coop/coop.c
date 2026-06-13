@@ -703,9 +703,31 @@ static int LoadP2CharAnm(int charId)
 static void FreeP2CharAnm(void)
 {
     uint32_t mgr = *ADDR_ANM_MGR_PP;
+    /* MUST be called with the tables in P1's (rest) state — callers ensure it. */
     if (s_p2AnmSlot >= 0 && mgr) {
+        /* The engine slot-free FUN_0044e4e0 ZEROES the global script + sprite
+         * tables for this slot's ids. But P2 loaded at base 0x400, so its ids
+         * are the SAME ones P1 uses, and the table right now holds P1's live
+         * entries — a naive free wipes P1's body/shot scripts (P1 vanishes,
+         * NULL bind crashes). So snapshot P1's window, let the engine free
+         * (which also releases P2's buffer + textures), then restore P1's. */
+        char *scr = (char *)(mgr + ANM_SCRIPT_TBL);
+        char *spr = (char *)(mgr + ANM_SPRITE_TBL);
+        uint32_t p1Script[ANM_MAX_IDS];
+        static unsigned char p1Sprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE];
+        int i;
+        for (i = 0; i < ANM_MAX_IDS; i++) {
+            p1Script[i] = *(uint32_t *)(scr + (ANM_ID_LO + i) * 4);
+            memcpy(p1Sprite[i], spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
+                   ANM_SPRITE_STRIDE);
+        }
         ADDR_ANM_FREE_FN((void *)mgr, s_p2AnmSlot);
-        Log("P2 char anm: freed slot %d", s_p2AnmSlot);
+        for (i = 0; i < ANM_MAX_IDS; i++) {
+            *(uint32_t *)(scr + (ANM_ID_LO + i) * 4) = p1Script[i];
+            memcpy(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
+                   ANM_SPRITE_STRIDE);
+        }
+        Log("P2 char anm: freed slot %d (P1 window restored)", s_p2AnmSlot);
     }
     s_p2AnmChar = -1;
     s_p2AnmSlot = -1;

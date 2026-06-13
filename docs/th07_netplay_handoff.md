@@ -1093,6 +1093,70 @@ afterwards and overlay ghost mode ourselves.
   (body/shots/bomb), portrait shows P1's face, SakuyaA cross-char aim absent,
   cycle-back F2 can crash. Good enough to build menu-select on.
 
+### 5g — EoSD-style menu character select (PLAN — RE done, not yet coded)
+
+Goal: P1 picks char+type on the normal screen; instead of starting, the game
+holds on character select and lets P2 pick its own char+type; then start.
+
+**The menu state machine (all verified in PCBdecomp.c):**
+- Dispatcher `FUN_004554d6(menu)` switches on the screen-state word at
+  `menu+0xd0f8` (0x36277):
+  - 4 / 8 / 0xc → `FUN_0045798b` (char-select INTRO/grid build)
+  - 5 / 9 / 0xd → `FUN_00457fe5` — **CHARACTER select**; on confirm sets
+    `DAT_0062f645` (char id) and `FUN_00455435(menu, 6/0xc/...)` → shot screen
+  - 6 / 10 / 0xe → `FUN_00459518` — **SHOT-TYPE select**; on confirm sets
+    `DAT_0062f646` (type) and **COMMITS** (37670-37688): `DAT_00575aa8 = 2`
+    (game mode), `DAT_0062f648 &= ~8`, `FUN_0043a05f()` (begins stage load),
+    drain `FUN_0044c9c0()`, `return 0`. (The 4/5/6 vs 8/9/0xa vs 0xc/0xd/0xe
+    triples are the normal / extra / practice variants.)
+  - `FUN_00455435(menu, state)` (0x455435): the screen-transition setter —
+    saves old state to menu+0x64, writes `menu+0xd0f8 = state`, resets the
+    per-screen counters. Use it (or write +0xd0f8 directly) to send the menu
+    back to char-select for P2's pass.
+- Input globals: `DAT_004b9e4c` = current input bits, `DAT_004b9e54` = previous
+  (the screens fire on a rising edge `cur & BIT != prev & BIT`). Confirm bit
+  `0x1001` (shot/Z), cancel bit `0xa` (bomb/X). `DAT_00575a89` = the char index
+  the shot screen is selecting for; `DAT_0062f647` = combined sel (char*2+type),
+  written from 645/646 at player init.
+
+**Implementation plan (two-pass, P2 picks second):**
+1. Hook `FUN_00459518` (shot-type select). Track a small coop-menu FSM:
+   `IDLE → P1_DONE → P2_CHAR → P2_SHOT → COMMIT`.
+2. When P1 hits the COMMIT path (detect: about to set `DAT_00575aa8=2` — easiest
+   to hook the commit by checking, after calling orig, whether it returned 0
+   / `DAT_00575aa8` became 2; OR pre-empt by watching the confirm edge in state
+   6 while our FSM is IDLE):
+   - SAVE P1's `645/646/647` → `s_p1MenuSel`.
+   - CANCEL the start: keep `DAT_00575aa8` at its menu value and send the menu
+     to the char-select state via `FUN_00455435(menu, charState)`; set FSM =
+     `P2_CHAR`. (Need the menu object ptr — it's the screen fns' param_1/ECX;
+     capture it in the hook.)
+3. While FSM is `P2_CHAR`/`P2_SHOT`, ROUTE P2's input into the menu: around the
+   orig screen call, swap `DAT_004b9e4c`/`DAT_004b9e54` to P2's key bits (reuse
+   `ReadP2InputLocal`, edge-tracked) so P2 drives the cursor. P1's input is
+   ignored during P2's pass (or P1 confirm = lock-in, like EoSD).
+4. On P2's shot-type COMMIT: SAVE P2's `645/646/647` → set `s_p2Sel`; **LOAD P2's
+   anms NOW** (player + face) — this is the clean menu-time load the round-13
+   regression calls for (no live entities, stage anm set stable); RESTORE P1's
+   `645/646/647` into the globals so the engine starts the stage as P1; set FSM
+   = COMMIT and let the real start proceed.
+5. In-stage: SpawnP2/ApplyP2Selection consume `s_p2Sel` and the pre-loaded anm
+   overlays; the per-frame code only SWAPS (never loads/frees) — so no
+   mid-stage churn, and the cycle-back crash is moot (no F2 cycling in real
+   play).
+
+**Open items for the (testable) next session:**
+- The menu object base address (capture via the screen-fn param, or find the
+  global it's dispatched from in `FUN_004554d6`'s caller).
+- Exactly which `FUN_00455435` target re-shows char select for the current game
+  mode (state 5 vs 9 vs 0xd) — read `menu+0xd0f8` at intercept to pick the
+  matching triple.
+- A visible "P2 SELECT" prompt (reuse the ascii text queue) during P2's pass.
+- Where the menu-time anm load should stash the overlays so they survive into
+  the stage (process-lifetime statics; the stage rebuild re-loads anyway).
+- Net play later drives P2's menu input from the remote word instead of
+  `ReadP2InputLocal` — same swap seam.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

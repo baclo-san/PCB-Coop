@@ -119,8 +119,11 @@
  *   F6  = toggle P2 separate resources (default ON).
  *   F5  = toggle boss/enemy HP scaling (default ON).
  *   F4  = toggle synced cherry team border (default ON).
- *   F3  = toggle P2's shot TYPE (A <-> B within P1's character) — P2 gets its
+ *   F3  = toggle P2's shot TYPE (A <-> B within its character) — P2 gets its
  *         own .sht pair + bomb callbacks (charselect stage 1; live re-apply OK).
+ *   F2  = cycle P2's CHARACTER (Reimu->Marisa->Sakuya, charselect stage 2):
+ *         loads that char's anm into a spare slot and swaps the 0x400-range
+ *         sprite/script tables to P2 around its update+draw (live re-apply OK).
  *   F11 = debug instant-revive of a ghost P2 (the graze resurrection above is
  *         the real mechanic; this stays as a test shortcut).
  *
@@ -283,7 +286,7 @@ static ItemLoopFn_t      s_origItemLoop       = NULL;
 static volatile void *s_p2   = NULL;   /* P2 object base, NULL until spawned     */
 static int   s_p2Killable = 1;         /* on by default; F8 toggles              */
 static unsigned char s_p2PrevState = 0;/* for death-transition logging           */
-static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0, s_prevF5 = 0, s_prevF4 = 0, s_prevF3 = 0;
+static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0, s_prevF5 = 0, s_prevF4 = 0, s_prevF3 = 0, s_prevF2 = 0;
 
 /* P2's own LIVES + BOMBS + POWER, field-swapped into the shared struct around P2's
  * update; ZUN's anti-tamper checksum is re-healed afterward (see the heal below).
@@ -500,6 +503,53 @@ static int   s_p2Sel = -1;             /* P2's sel 0-5; -1 = mirror P1. F3 toggl
 static void *s_shtCache[6][2];         /* loaded .sht pairs (game heap, kept for life) */
 static unsigned char s_selSaved[3];    /* global-swap save slots                  */
 static int   s_selSwapped = 0;
+static int   s_allowDiffChar = 0;      /* F2 enables cycling P2 to a DIFFERENT char */
+
+/* ---- DIFFERENT CHARACTER for P2 (charselect stage 2) ----
+ * The sprites/animation live in an ANM file (data/player0{0,1,2}.anm) the init
+ * loads into anm slot 10 at global id base 0x400. The anm manager keeps two
+ * parallel global tables (one mgr, base ptr at *0x4b9e44):
+ *   scripts:  mgr+0x28ef0 + id*4         (a script-bytecode pointer per id)
+ *   sprites:  mgr+0x60    + id*0x40      (a 0x40-byte sprite def per id)
+ *   slots:    mgr+0x2def0 + slot*0xc     (per-slot file ptr; 0 = slot free)
+ * with id space 0..0x9ff, the player char occupying ~0x400..0x481+.
+ *
+ * Shifting P2 to a free id base is NOT viable: the player movement update
+ * RE-BINDS the body sprite every tilt change to HARD-CODED ids 0x400..0x404
+ * (PCBdecomp.c:26323-26341,26759, reading mgr+0x29ef0..0x29f00 directly), and
+ * shots bind script ids straight from the .sht — all in the 0x400 range, in
+ * code shared with P1. So instead BOTH chars load at base 0x400 into separate
+ * slots, and we SWAP the 0x400-range table entries to P2's char around P2's
+ * update + draw (the only windows P2's char-specific binds/anim run in). A
+ * bind resolves to a stored pointer once (FUN_0044ea20 writes spriteobj+0x77),
+ * so a shot/body bound while the swap is active stays P2's. Outside the window
+ * the tables are P1's, so P1 + dialogue faces (ids 0x4a0+) are untouched.
+ * We capture P2's EXACT id set by snapshot-diffing the tables across the load,
+ * so the swap only touches ids P2 actually defines. */
+#define ADDR_ANM_MGR_PP   ((volatile uint32_t *)0x004b9e44) /* -> anm mgr base   */
+#define ANM_SCRIPT_TBL    0x28ef0      /* mgr+: script ptr per id                 */
+#define ANM_SPRITE_TBL    0x60         /* mgr+: sprite def per id, stride 0x40    */
+#define ANM_SPRITE_STRIDE 0x40
+#define ANM_SLOT_TBL      0x2def0      /* mgr+: per-slot file ptr (0=free), 0xc   */
+#define ANM_ID_LO         0x400        /* scan window for the player char's ids   */
+#define ANM_ID_HI         0x4a0        /* exclusive; below the in-stage face ids  */
+#define ANM_MAX_IDS       (ANM_ID_HI - ANM_ID_LO)
+/* FUN_0044df90 is a TRUE __thiscall: ECX=mgr, then (slot,file,base) on the
+ * stack, callee-cleaned — not the ECX/EDX __fastcall the other hooks model. */
+typedef int (__attribute__((thiscall)) *AnmLoadFn_t)(void *mgr, int slot,
+                                                      const char *file, int base);
+#define ADDR_ANM_LOAD_FN  ((AnmLoadFn_t)0x0044df90)
+typedef void (__attribute__((thiscall)) *AnmFreeFn_t)(void *mgr, int slot);
+#define ADDR_ANM_FREE_FN  ((AnmFreeFn_t)0x0044e4e0)
+
+static int      s_p2AnmChar = -1;      /* char id whose anm is loaded for P2; -1 none */
+static int      s_p2AnmSlot = -1;      /* anm slot holding P2's char anm              */
+static int      s_p2AnmActive = 0;     /* P2 currently uses a different-char anm       */
+static int      s_p2IdCount = 0;       /* how many ids P2's char defines in the window */
+static uint16_t s_p2Ids[ANM_MAX_IDS];                 /* the ids P2 defines            */
+static uint32_t s_p2Script[ANM_MAX_IDS];              /* P2's script ptr per id        */
+static unsigned char s_p2Sprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE]; /* P2's sprite def    */
+static int      s_anmSwapped = 0;
 
 static void Log(const char *fmt, ...)
 {
@@ -566,6 +616,130 @@ static void TransferP2Shots(void *p2)
     }
 }
 
+static void FreeP2CharAnm(void);
+
+/* Load P2's character anm into its own slot at base 0x400, then snapshot-diff
+ * the script + sprite tables to learn exactly which ids it defines, and restore
+ * P1's tables. Returns 1 on success. The anm buffer + slot stay allocated for
+ * the swap; freed in FreeP2CharAnm. */
+static int LoadP2CharAnm(int charId)
+{
+    static const char *const anmNames[3] =
+        { "data/player00.anm", "data/player01.anm", "data/player02.anm" };
+    uint32_t mgr = *ADDR_ANM_MGR_PP;
+    int slot, id, n = 0;
+    char *scr, *spr, *slt;
+
+    if (charId < 0 || charId > 2 || !mgr) return 0;
+    if (s_p2AnmChar == charId && s_p2IdCount > 0) return 1;   /* already loaded */
+
+    FreeP2CharAnm();
+
+    scr = (char *)(mgr + ANM_SCRIPT_TBL);
+    spr = (char *)(mgr + ANM_SPRITE_TBL);
+    slt = (char *)(mgr + ANM_SLOT_TBL);
+
+    /* pick a free anm slot high in the table (menu/result/title slots, free
+     * during a stage); never slot 10 (P1's live char) or the low engine slots */
+    slot = -1;
+    for (id = 0x31; id >= 0x14; id--) {
+        if (id == 10) continue;
+        if (*(uint32_t *)(slt + id * 0xc) == 0) { slot = id; break; }
+    }
+    if (slot < 0) { Log("P2 char anm: no free slot"); return 0; }
+
+    /* snapshot P1's tables across the window, then load P2's char OVER base
+     * 0x400 (overwrites only the ids P2's anm defines), diff, restore P1's. */
+    {
+        uint32_t p1Script[ANM_MAX_IDS];
+        unsigned char p1Sprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE];
+        int i, rc;
+        for (i = 0; i < ANM_MAX_IDS; i++) {
+            p1Script[i] = *(uint32_t *)(scr + (ANM_ID_LO + i) * 4);
+            memcpy(p1Sprite[i], spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
+                   ANM_SPRITE_STRIDE);
+        }
+        rc = ADDR_ANM_LOAD_FN((void *)mgr, slot, anmNames[charId], ANM_ID_LO);
+        if (rc != 0) {
+            Log("P2 char anm: load %s -> slot %d FAILED rc=%d",
+                anmNames[charId], slot, rc);
+            /* the loader cleared the slot first; restore our snapshot just in
+             * case a partial write happened, then bail */
+            for (i = 0; i < ANM_MAX_IDS; i++) {
+                *(uint32_t *)(scr + (ANM_ID_LO + i) * 4) = p1Script[i];
+                memcpy(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
+                       ANM_SPRITE_STRIDE);
+            }
+            return 0;
+        }
+        for (i = 0; i < ANM_MAX_IDS; i++) {
+            uint32_t curS = *(uint32_t *)(scr + (ANM_ID_LO + i) * 4);
+            int sprChanged = memcmp(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
+                                    p1Sprite[i], ANM_SPRITE_STRIDE) != 0;
+            if (curS != p1Script[i] || sprChanged) {
+                s_p2Ids[n] = (uint16_t)(ANM_ID_LO + i);
+                s_p2Script[n] = curS;
+                memcpy(s_p2Sprite[n],
+                       spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
+                       ANM_SPRITE_STRIDE);
+                n++;
+            }
+            /* restore P1's live tables */
+            *(uint32_t *)(scr + (ANM_ID_LO + i) * 4) = p1Script[i];
+            memcpy(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
+                   ANM_SPRITE_STRIDE);
+        }
+    }
+
+    s_p2AnmChar  = charId;
+    s_p2AnmSlot  = slot;
+    s_p2IdCount  = n;
+    Log("P2 char anm: %s -> slot %d, %d ids captured (0x%x..0x%x)",
+        anmNames[charId], slot, n,
+        n ? s_p2Ids[0] : 0, n ? s_p2Ids[n - 1] : 0);
+    return n > 0;
+}
+
+static void FreeP2CharAnm(void)
+{
+    uint32_t mgr = *ADDR_ANM_MGR_PP;
+    if (s_p2AnmSlot >= 0 && mgr) {
+        ADDR_ANM_FREE_FN((void *)mgr, s_p2AnmSlot);
+        Log("P2 char anm: freed slot %d", s_p2AnmSlot);
+    }
+    s_p2AnmChar = -1;
+    s_p2AnmSlot = -1;
+    s_p2IdCount = 0;
+    s_p2AnmActive = 0;
+    s_anmSwapped = 0;
+}
+
+/* Exchange the 0x400-range table entries between P1's (live) and P2's captured
+ * char for exactly the ids P2 defines. enter=1 installs P2, enter=0 restores
+ * P1. Re-entrancy-guarded; only acts while P2 has a different-char anm. */
+static void SwapAnm(int enter)
+{
+    uint32_t mgr = *ADDR_ANM_MGR_PP;
+    char *scr, *spr;
+    int i;
+    if (!s_p2AnmActive || !mgr || s_p2IdCount == 0) return;
+    if (enter == s_anmSwapped) return;
+    scr = (char *)(mgr + ANM_SCRIPT_TBL);
+    spr = (char *)(mgr + ANM_SPRITE_TBL);
+    for (i = 0; i < s_p2IdCount; i++) {
+        int id = s_p2Ids[i];
+        uint32_t *sScr = &s_p2Script[i];
+        uint32_t *tScr = (uint32_t *)(scr + id * 4);
+        unsigned char *tSpr = (unsigned char *)(spr + id * ANM_SPRITE_STRIDE);
+        uint32_t tmp; unsigned char tmpS[ANM_SPRITE_STRIDE];
+        tmp = *tScr; *tScr = *sScr; *sScr = tmp;            /* swap script ptr  */
+        memcpy(tmpS, tSpr, ANM_SPRITE_STRIDE);
+        memcpy(tSpr, s_p2Sprite[i], ANM_SPRITE_STRIDE);
+        memcpy(s_p2Sprite[i], tmpS, ANM_SPRITE_STRIDE);     /* swap sprite def  */
+    }
+    s_anmSwapped = enter;
+}
+
 /* Swap the three selection globals to P2's identity around a P2-context engine
  * call so char/type-gated branches (MarisaB fire-suppress during a border,
  * SakuyaB checks, ...) see P2, not P1. No-op when P2 mirrors P1. */
@@ -601,9 +775,26 @@ static void ApplyP2Selection(void *p2)
     int sel = (s_p2Sel < 0) ? p1sel : s_p2Sel;
     int k;
 
-    /* stage 1: clamp to P1's character, keep the chosen A/B type */
-    if (sel / 2 != p1sel / 2) sel = (p1sel & ~1) | (sel & 1);
+    /* stage 1 (default): clamp to P1's character, keep the chosen A/B type.
+     * stage 2 (F2): allow a different character — load its anm for the swap. */
+    if (!s_allowDiffChar && sel / 2 != p1sel / 2)
+        sel = (p1sel & ~1) | (sel & 1);
     s_p2Sel = sel;
+
+    /* different-character path: ensure P2's char anm is loaded + arm the swap;
+     * a same-char selection retires it (P2 shares P1's live tables). */
+    if (sel / 2 != p1sel / 2) {
+        if (LoadP2CharAnm(sel / 2)) {
+            s_p2AnmActive = 1;
+        } else {
+            Log("P2 loadout: char anm load failed -> falling back to P1's char");
+            sel = (p1sel & ~1) | (sel & 1);
+            s_p2Sel = sel;
+            FreeP2CharAnm();
+        }
+    } else {
+        FreeP2CharAnm();
+    }
 
     if (sel == p1sel) {
         /* mirror P1's loadout (also the path BACK after a toggle away) */
@@ -707,6 +898,8 @@ static void DespawnP2(void)
     void *p2 = (void *)s_p2;
     if (!p2) return;
     s_p2 = NULL;                            /* stop piggyback FIRST */
+    SwapAnm(0);                             /* ensure tables are P1's before free */
+    FreeP2CharAnm();
     KillP2FocusFx();
     VirtualFree(p2, 0, MEM_RELEASE);
     Log("despawn: P2 freed");
@@ -994,12 +1187,22 @@ static void PollHotkeys(void)
     int f4  = (GetAsyncKeyState(VK_F4)  & 0x8000) != 0;
     int f11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     int f3  = (GetAsyncKeyState(VK_F3)  & 0x8000) != 0;
+    int f2  = (GetAsyncKeyState(VK_F2)  & 0x8000) != 0;
     if (f9  && !s_prevF9)  { Log("F9 edge detected");  SpawnP2(); }
     if (f3  && !s_prevF3) {
         int cur = (s_p2Sel < 0) ? *ADDR_SEL_ID : s_p2Sel;
-        s_p2Sel = cur ^ 1;                  /* A <-> B within P1's character */
+        s_p2Sel = cur ^ 1;                  /* A <-> B within current character */
         Log("F3: P2 shot type -> %s", ADDR_SEL_NAMES[s_p2Sel]);
         if (s_p2) ApplyP2Selection((void *)s_p2);   /* live re-apply is safe */
+    }
+    if (f2  && !s_prevF2) {
+        int cur = (s_p2Sel < 0) ? *ADDR_SEL_ID : s_p2Sel;
+        int type = cur & 1;
+        int ch = (cur / 2 + 1) % 3;         /* cycle char Reimu->Marisa->Sakuya */
+        s_allowDiffChar = 1;
+        s_p2Sel = ch * 2 + type;
+        Log("F2: P2 character -> %s", ADDR_SEL_NAMES[s_p2Sel]);
+        if (s_p2) ApplyP2Selection((void *)s_p2);
     }
     if (f10 && !s_prevF10) { Log("F10 edge detected"); DespawnP2(); }
     if (f8  && !s_prevF8)  { s_p2Killable = !s_p2Killable; Log("P2 killable %s", s_p2Killable ? "ON" : "OFF"); }
@@ -1020,6 +1223,7 @@ static void PollHotkeys(void)
     s_prevF4  = f4;
     s_prevF11 = f11;
     s_prevF3  = f3;
+    s_prevF2  = f2;
 }
 
 /* ---- collision detours: make P2 killable ----
@@ -1413,7 +1617,9 @@ static int __fastcall HookedUpdate(void *self)
 
             s_inP2Update = 1;               /* effect-spawn detour: redirect slot */
             SwapSelGlobals(1);              /* char/type-gated branches see P2 */
+            SwapAnm(1);                     /* 0x400-range tables -> P2's char */
             s_origUpdate(p2);               /* trampoline → no detour re-entry */
+            SwapAnm(0);
             SwapSelGlobals(0);
             s_inP2Update = 0;
 
@@ -1512,10 +1718,13 @@ static void DrawCoopHud(void *p2)
     pos[1] = 296.f;
     if (s_p2Ghost)
         ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P2 GHOST");
-    else
-        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P2%c L%d B%d P%d",
-                         ((s_p2Sel >= 0 ? s_p2Sel : *ADDR_SEL_ID) & 1) ? 'B' : 'A',
+    else {
+        int psel = (s_p2Sel >= 0 ? s_p2Sel : *ADDR_SEL_ID);
+        char ch = "RMS"[(psel / 2) % 3];          /* Reimu/Marisa/Sakuya       */
+        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P2%c%c L%d B%d P%d",
+                         ch, (psel & 1) ? 'B' : 'A',
                          (int)s_p2Lives, (int)s_p2Bombs, (int)s_p2Power);
+    }
     if (s_p1Ghost) {
         pos[1] = 312.f;
         ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P1 GHOST");
@@ -1553,7 +1762,9 @@ static int __fastcall HookedDraw(void *self)
             memcpy((char *)p2 + OFF_HOMING_TGT,
                    (char *)ADDR_PLAYER_BASE + OFF_HOMING_TGT, HOMING_TGT_LEN);
             SwapSelGlobals(1);
+            SwapAnm(1);                     /* P2's char sprites for its draw */
             s_origDraw(p2);
+            SwapAnm(0);
             SwapSelGlobals(0);
             DrawCoopHud(p2);
         }

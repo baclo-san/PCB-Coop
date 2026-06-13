@@ -948,19 +948,64 @@ afterwards and overlay ghost mode ourselves.
     applies P1's identity to the COMBINED damage — rebalance bucket.
   - SakuyaA's aim-target acquisition gates on GLOBAL char==Sakuya (12913) —
     same-char teams fine; cross-char is a stage-2 problem.
-- **Stage 2 (different CHARACTER) notes:** the init loads
-  `data/player0N.anm` into the single ANM slot 10 with script-id base 0x400
-  (`FUN_0044df90(10, file, 0x400)` — the third arg IS the id base, and shot
-  anm ids resolve via mgr+0x28ef0+id*4). Plan: load P2's char anm into a
-  free slot with a shifted id base, then remap P2's sprite ids (the .sht
-  entry anm ids at entry+0x20 can be patched in OUR cached buffer; the
-  player/option/bomb hardcoded ids need a P2-context remap in the anm-fetch
-  path). Plus the per-char movement/hit constants come along in the .sht
-  already.
-- Awaiting test (Reimu suggested): F3 before/after spawn → P2 fires the
-  other type (ReimuB needles + Evil-Sealing Circle bomb while P1 stays A);
-  HUD letter flips; revive/border/lasers regression-free; (MarisaA+B: B's
-  lasers under the swap; SakuyaB knife spread + own bomb).
+- Round-12 verdict: **all shot types work, none break.** Green light for
+  different characters.
+
+### 5f — round-13: P2 different CHARACTER (charselect stage 2) — F2
+
+- **Why shifted-id-base (the old stage-2 plan) was WRONG:** the player
+  MOVEMENT update re-binds the body sprite to HARD-CODED ids 0x400..0x404
+  every tilt change (`PCBdecomp.c:26323-26341,26759`, reading
+  `mgr+0x29ef0..0x29f00` directly), and shots bind ids straight from the
+  .sht — all 0x400-range, in code SHARED with P1. A shifted base would need
+  patching code sites that also serve P1. Dead end.
+- **The anm system (RE'd):** one anm manager (base ptr at `*0x4b9e44`) holds
+  two parallel global tables — scripts at `mgr+0x28ef0+id*4` (a bytecode ptr)
+  and sprite defs at `mgr+0x60+id*0x40` (0x40-byte entry: tex ref + UV +
+  a global sequence at +0x3c) — plus a per-SLOT file ptr at
+  `mgr+0x2def0+slot*0xc` (0=free) and a per-id reverse-base at `mgr+0x2b6f0`.
+  `FUN_0044df90(ECX=mgr, slot, file, base)` (TRUE __thiscall: 3 stack args,
+  callee-cleaned) registers a char's scripts AND sprites at `base+local`;
+  `FUN_0044e4e0(mgr, slot)` frees a slot + clears its ids. A bind
+  (`FUN_0044ea20`) stores the RESOLVED script ptr into the sprite obj (+0x77)
+  — resolves once.
+- **Implementation (table-swap):** both chars load at base 0x400 into
+  SEPARATE slots; we swap the 0x400-range table entries to P2's char around
+  P2's update + draw (the only windows P2's binds/anim run). `LoadP2CharAnm`
+  picks a free high slot (scan 0x31→0x14, skip 10), snapshots the script +
+  sprite tables across `[0x400,0x4a0)` (below the in-stage dialogue-face ids
+  at 0x4a0+), loads P2's `data/player0{N}.anm` over base 0x400, **diffs** to
+  capture exactly the ids P2 defines (script ptr + 0x40-byte sprite each),
+  then restores P1's tables. `SwapAnm(enter)` exchanges those captured ids
+  in/out (self-inverse swap, re-entrancy-guarded). The reverse-base table
+  needs no swap (both chars = 0x400) and the per-slot texture array is
+  per-slot (P1's slot 10 untouched). `.sht`/bombs/stats were already
+  char-agnostic from round-12, so different-char = anm swap only.
+- **Lifecycle:** F2 cycles P2's char (Reimu→Marisa→Sakuya, keeps A/B);
+  `s_allowDiffChar` lifts the same-char clamp. `DespawnP2` + the stage-rebuild
+  `FreeP2CharAnm` (no-op if slot already cleared, so transitions are safe);
+  respawn reloads against the new stage's mgr. HUD shows `P2{R/M/S}{A/B}`.
+- **Known v1 gaps (cosmetic, not crashes):**
+  - Body shows P1's char until P2 first MOVES (tilt handler re-binds on a
+    tilt-state change; static P2 keeps the clone's bind one beat).
+  - OPTION sprites (player+0x24c/+0x498, bound once at init to ids
+    0x480/0x481, never re-bound) keep the CLONE's P1-char option sprite —
+    fires P2's shots but the little satellite art is P1's. Fix = rebind the
+    two option objs to P2's captured 0x480/0x481 scripts (deferred — the
+    real `FUN_0044ea20` ECX convention was ambiguous; replicating its
+    else-branch + FUN_004010f0/FUN_00450d60 side effects needs care).
+  - Cross-char globals from round-12 (ReimuA damage nerf @12844, SakuyaA aim
+    @12913) key off the GLOBAL char id; `SwapSelGlobals` covers the ones
+    inside the player path, but the enemy-update ones see P1.
+- **First-test watch list (the uncertain bit):** if P2 renders with P1's
+  TEXTURE sheet but correct sprite geometry, the 0x40-byte entry's texture
+  ref is per-slot not global → would also need the slot texture-array slice
+  swapped. Expected to work (the +0x3c global sequence suggests a global tex
+  index), but this is the most likely surprise. Watch the coop_log line
+  `P2 char anm: ... N ids captured (0x.. .. 0x..)` — N≈0x80, top id < 0x4a0.
+- Awaiting test: F2 cycles P2 to Marisa/Sakuya while P1 is Reimu → P2's body
+  + shots + bomb are the new char; no crash on spawn / move / shoot / bomb /
+  stage transition / revive.
 
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)

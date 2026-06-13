@@ -1060,6 +1060,39 @@ afterwards and overlay ghost mode ourselves.
 - Awaiting test: P2=Sakuya (P1=Reimu) bombs → Sakuya's portrait + spell name in
   the declaration; P1 bombs → still Reimu's; no crash; repeated bombs both ways.
 
+### 5f — round-13c: round-13b REVERTED (portrait attempt regressed)
+
+- **TEST round 13b: REGRESSION.** After F2 BOTH players rendered as stage-start
+  glyph sprites, the bomb portrait was still wrong, and bomb-bullet textures
+  vanished. I.e. the LIVE (un-swapped) 0x400 player table was corrupted — the
+  face-overlay load and/or the `AnmOverlay` refactor broke the player path that
+  worked in 13a. Couldn't be diagnosed without in-game iteration (user AFK).
+- **Action: `src/coop/coop.c` reverted to d0926b1** (the round-13a state — F2
+  different-character confirmed functional, the only knowns being the wrong bomb
+  portrait, SakuyaA cross-char aim, and the accepted cycle-back crash). This is
+  the confident shippable baseline. The face/portrait + refactor are dropped
+  from the build; the analysis below stays as the design record.
+- **Why the regression likely happened (hypotheses, for next time):**
+  - Most suspicious: loading `face_XX00.anm` at base 0x4a0 corrupted the global
+    sprite/texture state shared with 0x400. The face window [0x4a0,0x4b0) is
+    only 0x10 ids — if the face anm spans past 0x4b0 the load wrote ids we never
+    restored. But that alone wouldn't corrupt 0x400, so something broader (the
+    per-slot texture array / the global sprite-sequence counter mgr+0x28eec, or
+    a bad 2nd free-slot pick at stage 2) is implicated.
+  - The decl-draw hook on `FUN_0042b603` (a per-frame global draw fn) is the
+    other new surface; a swap held across the wrong frames could corrupt draws.
+- **DO THE PORTRAIT IN MENU-SELECT, NOT MID-STAGE.** The clean place to load
+  P2's face is BEFORE the stage starts (at character select), when no live
+  player/shot entities reference the tables and the stage anm set isn't mid-flux.
+  At menu time, load P2's char's player anm + face anm into dedicated slots ONCE,
+  capture the id sets, and the in-stage code only ever SWAPS (never loads/frees
+  mid-stage). That removes the mid-stage load/free churn that this round and the
+  cycle-back crash both stem from. The 13b design (overlay + decl-draw hook +
+  s_declP2 latch) is reusable — only the LOAD timing should move to menu-select.
+- Current shippable state = d0926b1 logic: F2 different character works
+  (body/shots/bomb), portrait shows P1's face, SakuyaA cross-char aim absent,
+  cycle-back F2 can crash. Good enough to build menu-select on.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

@@ -531,23 +531,9 @@ static int   s_allowDiffChar = 0;      /* F2 enables cycling P2 to a DIFFERENT c
 #define ANM_SPRITE_TBL    0x60         /* mgr+: sprite def per id, stride 0x40    */
 #define ANM_SPRITE_STRIDE 0x40
 #define ANM_SLOT_TBL      0x2def0      /* mgr+: per-slot file ptr (0=free), 0xc   */
-#define ANM_ID_LO         0x400        /* player-char window low                   */
-#define ANM_ID_HI         0x4a0        /* exclusive; below the face ids           */
+#define ANM_ID_LO         0x400        /* scan window for the player char's ids   */
+#define ANM_ID_HI         0x4a0        /* exclusive; below the in-stage face ids  */
 #define ANM_MAX_IDS       (ANM_ID_HI - ANM_ID_LO)
-/* The bomb spell-DECLARATION portrait is a SECOND char-specific anm: the face
- * `data/face_{rm,mr,sk}00.anm` loaded at base 0x4a0 by the global char id, so
- * P2 borrows P1's face. Same table-swap fix, in the face id window — but the
- * declaration is created in P2's bomb cb (during P2's update) AND drawn in a
- * GLOBAL UI pass (FUN_0042b603, when DAT_00575ab4 != 0), and FUN_0044e8e0
- * resolves the texture from the live table entry at DRAW time. So P2's face
- * must be swapped in at BOTH: P2's update (set-time UV cache) and the
- * declaration draw (texture) — the latter via a hook on FUN_0042b603, gated on
- * `s_declP2` (latched = the active declaration was created during P2's bomb). */
-#define ADDR_DECL_DRAW    ((LPVOID)0x0042b603)  /* spell-declaration draw         */
-#define ADDR_DECL_STATE   ((volatile int *)0x00575ab4) /* !=0 = declaration shown */
-#define FACE_ID_LO        0x4a0
-#define FACE_ID_HI        0x4b0        /* exclusive; covers 0x4a1/0x4a4/0x4a6/0x4ac */
-#define FACE_MAX_IDS      (FACE_ID_HI - FACE_ID_LO)
 /* FUN_0044df90 is a TRUE __thiscall: ECX=mgr, then (slot,file,base) on the
  * stack, callee-cleaned — not the ECX/EDX __fastcall the other hooks model. */
 typedef int (__attribute__((thiscall)) *AnmLoadFn_t)(void *mgr, int slot,
@@ -556,26 +542,14 @@ typedef int (__attribute__((thiscall)) *AnmLoadFn_t)(void *mgr, int slot,
 typedef void (__attribute__((thiscall)) *AnmFreeFn_t)(void *mgr, int slot);
 #define ADDR_ANM_FREE_FN  ((AnmFreeFn_t)0x0044e4e0)
 
-/* A swappable anm overlay: a char-specific anm loaded at `base`, with the ids
- * it defines in [idLo,idHi) captured (script ptr + 0x40 sprite def) so they can
- * be exchanged into/out of the live global tables on demand. */
-typedef struct {
-    int          slot;                 /* anm slot, -1 = none                     */
-    int          idLo, idHi;           /* the window scanned                      */
-    int          idCount;              /* ids actually defined                    */
-    int          swapped;              /* currently exchanged into the live table */
-    uint16_t     ids[ANM_MAX_IDS];
-    uint32_t     script[ANM_MAX_IDS];
-    unsigned char sprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE];
-} AnmOverlay;
-
-static AnmOverlay s_p2PlayerOv = { -1 };  /* data/player0N.anm @ 0x400           */
-static AnmOverlay s_p2FaceOv   = { -1 };  /* data/face_XX00.anm @ 0x4a0          */
-static int        s_p2AnmChar  = -1;      /* char id whose anms are loaded; -1    */
-static int        s_p2AnmActive = 0;      /* P2 uses a different-char loadout      */
-static int        s_declP2 = 0;           /* the active declaration is P2's bomb   */
-typedef void (__fastcall *DeclDrawFn_t)(void *self);   /* FUN_0042b603           */
-static DeclDrawFn_t s_origDeclDraw = NULL;
+static int      s_p2AnmChar = -1;      /* char id whose anm is loaded for P2; -1 none */
+static int      s_p2AnmSlot = -1;      /* anm slot holding P2's char anm              */
+static int      s_p2AnmActive = 0;     /* P2 currently uses a different-char anm       */
+static int      s_p2IdCount = 0;       /* how many ids P2's char defines in the window */
+static uint16_t s_p2Ids[ANM_MAX_IDS];                 /* the ids P2 defines            */
+static uint32_t s_p2Script[ANM_MAX_IDS];              /* P2's script ptr per id        */
+static unsigned char s_p2Sprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE]; /* P2's sprite def    */
+static int      s_anmSwapped = 0;
 
 static void Log(const char *fmt, ...)
 {
@@ -642,183 +616,150 @@ static void TransferP2Shots(void *p2)
     }
 }
 
-/* Load `file` at id base `base` into a fresh anm slot, then snapshot-diff the
- * global script + sprite tables across [idLo,idHi) to capture exactly the ids
- * the file defines (script ptr + 0x40 sprite each), and restore the live
- * tables. The anm buffer + slot stay allocated for the swap. Returns 1 on
- * success. MUST run with the tables in P1's (rest) state. */
-static int OverlayLoad(AnmOverlay *ov, const char *file, int base,
-                       int idLo, int idHi)
-{
-    uint32_t mgr = *ADDR_ANM_MGR_PP;
-    char *scr, *spr, *slt;
-    int slot, id, n = 0, span = idHi - idLo;
-    uint32_t liveScript[ANM_MAX_IDS];
-    static unsigned char liveSprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE];
-    int i, rc;
+static void FreeP2CharAnm(void);
 
-    if (!mgr || span <= 0 || span > ANM_MAX_IDS) return 0;
+/* Load P2's character anm into its own slot at base 0x400, then snapshot-diff
+ * the script + sprite tables to learn exactly which ids it defines, and restore
+ * P1's tables. Returns 1 on success. The anm buffer + slot stay allocated for
+ * the swap; freed in FreeP2CharAnm. */
+static int LoadP2CharAnm(int charId)
+{
+    static const char *const anmNames[3] =
+        { "data/player00.anm", "data/player01.anm", "data/player02.anm" };
+    uint32_t mgr = *ADDR_ANM_MGR_PP;
+    int slot, id, n = 0;
+    char *scr, *spr, *slt;
+
+    if (charId < 0 || charId > 2 || !mgr) return 0;
+    if (s_p2AnmChar == charId && s_p2IdCount > 0) return 1;   /* already loaded */
+
+    FreeP2CharAnm();
+
     scr = (char *)(mgr + ANM_SCRIPT_TBL);
     spr = (char *)(mgr + ANM_SPRITE_TBL);
     slt = (char *)(mgr + ANM_SLOT_TBL);
 
-    /* free a high slot (menu/result/title slots are free during a stage); never
-     * slot 10 (P1's live char anm) or the low engine slots */
+    /* pick a free anm slot high in the table (menu/result/title slots, free
+     * during a stage); never slot 10 (P1's live char) or the low engine slots */
     slot = -1;
     for (id = 0x31; id >= 0x14; id--) {
         if (id == 10) continue;
         if (*(uint32_t *)(slt + id * 0xc) == 0) { slot = id; break; }
     }
-    if (slot < 0) { Log("overlay %s: no free slot", file); return 0; }
+    if (slot < 0) { Log("P2 char anm: no free slot"); return 0; }
 
-    for (i = 0; i < span; i++) {
-        liveScript[i] = *(uint32_t *)(scr + (idLo + i) * 4);
-        memcpy(liveSprite[i], spr + (idLo + i) * ANM_SPRITE_STRIDE,
-               ANM_SPRITE_STRIDE);
-    }
-    rc = ADDR_ANM_LOAD_FN((void *)mgr, slot, file, base);
-    if (rc != 0) {
-        Log("overlay %s -> slot %d FAILED rc=%d", file, slot, rc);
-        for (i = 0; i < span; i++) {     /* undo any partial write */
-            *(uint32_t *)(scr + (idLo + i) * 4) = liveScript[i];
-            memcpy(spr + (idLo + i) * ANM_SPRITE_STRIDE, liveSprite[i],
+    /* snapshot P1's tables across the window, then load P2's char OVER base
+     * 0x400 (overwrites only the ids P2's anm defines), diff, restore P1's. */
+    {
+        uint32_t p1Script[ANM_MAX_IDS];
+        unsigned char p1Sprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE];
+        int i, rc;
+        for (i = 0; i < ANM_MAX_IDS; i++) {
+            p1Script[i] = *(uint32_t *)(scr + (ANM_ID_LO + i) * 4);
+            memcpy(p1Sprite[i], spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
                    ANM_SPRITE_STRIDE);
         }
-        return 0;
-    }
-    for (i = 0; i < span; i++) {
-        uint32_t curS = *(uint32_t *)(scr + (idLo + i) * 4);
-        int sprChanged = memcmp(spr + (idLo + i) * ANM_SPRITE_STRIDE,
-                                liveSprite[i], ANM_SPRITE_STRIDE) != 0;
-        if (curS != liveScript[i] || sprChanged) {
-            ov->ids[n]    = (uint16_t)(idLo + i);
-            ov->script[n] = curS;
-            memcpy(ov->sprite[n], spr + (idLo + i) * ANM_SPRITE_STRIDE,
-                   ANM_SPRITE_STRIDE);
-            n++;
+        rc = ADDR_ANM_LOAD_FN((void *)mgr, slot, anmNames[charId], ANM_ID_LO);
+        if (rc != 0) {
+            Log("P2 char anm: load %s -> slot %d FAILED rc=%d",
+                anmNames[charId], slot, rc);
+            /* the loader cleared the slot first; restore our snapshot just in
+             * case a partial write happened, then bail */
+            for (i = 0; i < ANM_MAX_IDS; i++) {
+                *(uint32_t *)(scr + (ANM_ID_LO + i) * 4) = p1Script[i];
+                memcpy(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
+                       ANM_SPRITE_STRIDE);
+            }
+            return 0;
         }
-        *(uint32_t *)(scr + (idLo + i) * 4) = liveScript[i];   /* restore P1's */
-        memcpy(spr + (idLo + i) * ANM_SPRITE_STRIDE, liveSprite[i],
-               ANM_SPRITE_STRIDE);
+        for (i = 0; i < ANM_MAX_IDS; i++) {
+            uint32_t curS = *(uint32_t *)(scr + (ANM_ID_LO + i) * 4);
+            int sprChanged = memcmp(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
+                                    p1Sprite[i], ANM_SPRITE_STRIDE) != 0;
+            if (curS != p1Script[i] || sprChanged) {
+                s_p2Ids[n] = (uint16_t)(ANM_ID_LO + i);
+                s_p2Script[n] = curS;
+                memcpy(s_p2Sprite[n],
+                       spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
+                       ANM_SPRITE_STRIDE);
+                n++;
+            }
+            /* restore P1's live tables */
+            *(uint32_t *)(scr + (ANM_ID_LO + i) * 4) = p1Script[i];
+            memcpy(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
+                   ANM_SPRITE_STRIDE);
+        }
     }
-    ov->slot = slot; ov->idLo = idLo; ov->idHi = idHi;
-    ov->idCount = n; ov->swapped = 0;
-    Log("overlay %s -> slot %d, %d ids (0x%x..0x%x)", file, slot, n,
-        n ? ov->ids[0] : 0, n ? ov->ids[n - 1] : 0);
+
+    s_p2AnmChar  = charId;
+    s_p2AnmSlot  = slot;
+    s_p2IdCount  = n;
+    Log("P2 char anm: %s -> slot %d, %d ids captured (0x%x..0x%x)",
+        anmNames[charId], slot, n,
+        n ? s_p2Ids[0] : 0, n ? s_p2Ids[n - 1] : 0);
     return n > 0;
-}
-
-/* Free an overlay's slot. The engine slot-free FUN_0044e4e0 ZEROES the global
- * tables for this slot's ids — but the overlay loaded at a base shared with the
- * live (P1) anm, and the table holds P1's entries here, so a naive free wipes
- * P1's (P1 vanishes, NULL bind crashes). Snapshot the window, free (also
- * releases the buffer + textures), restore. MUST run with tables in rest state. */
-static void OverlayFree(AnmOverlay *ov)
-{
-    uint32_t mgr = *ADDR_ANM_MGR_PP;
-    if (ov->slot >= 0 && mgr) {
-        char *scr = (char *)(mgr + ANM_SCRIPT_TBL);
-        char *spr = (char *)(mgr + ANM_SPRITE_TBL);
-        uint32_t liveScript[ANM_MAX_IDS];
-        static unsigned char liveSprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE];
-        int span = ov->idHi - ov->idLo, i;
-        for (i = 0; i < span; i++) {
-            liveScript[i] = *(uint32_t *)(scr + (ov->idLo + i) * 4);
-            memcpy(liveSprite[i], spr + (ov->idLo + i) * ANM_SPRITE_STRIDE,
-                   ANM_SPRITE_STRIDE);
-        }
-        ADDR_ANM_FREE_FN((void *)mgr, ov->slot);
-        for (i = 0; i < span; i++) {
-            *(uint32_t *)(scr + (ov->idLo + i) * 4) = liveScript[i];
-            memcpy(spr + (ov->idLo + i) * ANM_SPRITE_STRIDE, liveSprite[i],
-                   ANM_SPRITE_STRIDE);
-        }
-        Log("overlay: freed slot %d (live window restored)", ov->slot);
-    }
-    ov->slot = -1; ov->idCount = 0; ov->swapped = 0;
-}
-
-/* Exchange the overlay's ids into/out of the live tables (self-inverse swap;
- * re-entrancy-guarded). enter=1 installs the overlay, enter=0 restores live. */
-static void OverlaySwap(AnmOverlay *ov, int enter)
-{
-    uint32_t mgr = *ADDR_ANM_MGR_PP;
-    char *scr, *spr;
-    int i;
-    if (!mgr || ov->idCount == 0 || enter == ov->swapped) return;
-    scr = (char *)(mgr + ANM_SCRIPT_TBL);
-    spr = (char *)(mgr + ANM_SPRITE_TBL);
-    for (i = 0; i < ov->idCount; i++) {
-        int id = ov->ids[i];
-        uint32_t *sScr = &ov->script[i];
-        uint32_t *tScr = (uint32_t *)(scr + id * 4);
-        unsigned char *tSpr = (unsigned char *)(spr + id * ANM_SPRITE_STRIDE);
-        uint32_t tmp; unsigned char tmpS[ANM_SPRITE_STRIDE];
-        tmp = *tScr; *tScr = *sScr; *sScr = tmp;
-        memcpy(tmpS, tSpr, ANM_SPRITE_STRIDE);
-        memcpy(tSpr, ov->sprite[i], ANM_SPRITE_STRIDE);
-        memcpy(ov->sprite[i], tmpS, ANM_SPRITE_STRIDE);
-    }
-    ov->swapped = enter;
-}
-
-/* Load both of P2's char-specific anms (the player body/shot/bomb sprites at
- * 0x400, and the bomb-declaration face at 0x4a0). MUST run with tables at rest. */
-static int LoadP2CharAnm(int charId)
-{
-    static const char *const playerNm[3] =
-        { "data/player00.anm", "data/player01.anm", "data/player02.anm" };
-    static const char *const faceNm[3] =
-        { "data/face_rm00.anm", "data/face_mr00.anm", "data/face_sk00.anm" };
-
-    if (charId < 0 || charId > 2) return 0;
-    if (s_p2AnmChar == charId && s_p2PlayerOv.idCount > 0) return 1;  /* loaded */
-
-    OverlayFree(&s_p2PlayerOv);
-    OverlayFree(&s_p2FaceOv);
-    s_p2AnmChar = -1;
-
-    if (!OverlayLoad(&s_p2PlayerOv, playerNm[charId], ANM_ID_LO,
-                     ANM_ID_LO, ANM_ID_HI))
-        return 0;
-    /* the face is best-effort: if it fails P2 just borrows P1's bomb portrait */
-    OverlayLoad(&s_p2FaceOv, faceNm[charId], FACE_ID_LO, FACE_ID_LO, FACE_ID_HI);
-    s_p2AnmChar = charId;
-    return 1;
 }
 
 static void FreeP2CharAnm(void)
 {
-    OverlayFree(&s_p2PlayerOv);
-    OverlayFree(&s_p2FaceOv);
+    uint32_t mgr = *ADDR_ANM_MGR_PP;
+    /* MUST be called with the tables in P1's (rest) state — callers ensure it. */
+    if (s_p2AnmSlot >= 0 && mgr) {
+        /* The engine slot-free FUN_0044e4e0 ZEROES the global script + sprite
+         * tables for this slot's ids. But P2 loaded at base 0x400, so its ids
+         * are the SAME ones P1 uses, and the table right now holds P1's live
+         * entries — a naive free wipes P1's body/shot scripts (P1 vanishes,
+         * NULL bind crashes). So snapshot P1's window, let the engine free
+         * (which also releases P2's buffer + textures), then restore P1's. */
+        char *scr = (char *)(mgr + ANM_SCRIPT_TBL);
+        char *spr = (char *)(mgr + ANM_SPRITE_TBL);
+        uint32_t p1Script[ANM_MAX_IDS];
+        static unsigned char p1Sprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE];
+        int i;
+        for (i = 0; i < ANM_MAX_IDS; i++) {
+            p1Script[i] = *(uint32_t *)(scr + (ANM_ID_LO + i) * 4);
+            memcpy(p1Sprite[i], spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
+                   ANM_SPRITE_STRIDE);
+        }
+        ADDR_ANM_FREE_FN((void *)mgr, s_p2AnmSlot);
+        for (i = 0; i < ANM_MAX_IDS; i++) {
+            *(uint32_t *)(scr + (ANM_ID_LO + i) * 4) = p1Script[i];
+            memcpy(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
+                   ANM_SPRITE_STRIDE);
+        }
+        Log("P2 char anm: freed slot %d (P1 window restored)", s_p2AnmSlot);
+    }
     s_p2AnmChar = -1;
+    s_p2AnmSlot = -1;
+    s_p2IdCount = 0;
     s_p2AnmActive = 0;
+    s_anmSwapped = 0;
 }
 
-/* P2's body/shot/option/bomb sprites — swap around P2's update + draw. */
+/* Exchange the 0x400-range table entries between P1's (live) and P2's captured
+ * char for exactly the ids P2 defines. enter=1 installs P2, enter=0 restores
+ * P1. Re-entrancy-guarded; only acts while P2 has a different-char anm. */
 static void SwapAnm(int enter)
 {
-    if (s_p2AnmActive) OverlaySwap(&s_p2PlayerOv, enter);
-}
-
-/* P2's bomb-declaration face — swap around the global declaration draw (and
- * P2's update, where the declaration is created and caches its UV). */
-static void SwapFace(int enter)
-{
-    if (s_p2AnmActive) OverlaySwap(&s_p2FaceOv, enter);
-}
-
-/* ---- spell-declaration draw hook ----
- * Runs in the global UI pass when a declaration is on screen. If the active
- * declaration was created by P2's bomb (s_declP2) and P2 has its own face,
- * swap P2's face into the live tables around the draw so the portrait + name
- * plate resolve to P2's character. */
-static void __fastcall HookedDeclDraw(void *self)
-{
-    int face = s_declP2 && s_p2AnmActive;
-    if (face) SwapFace(1);
-    s_origDeclDraw(self);
-    if (face) SwapFace(0);
+    uint32_t mgr = *ADDR_ANM_MGR_PP;
+    char *scr, *spr;
+    int i;
+    if (!s_p2AnmActive || !mgr || s_p2IdCount == 0) return;
+    if (enter == s_anmSwapped) return;
+    scr = (char *)(mgr + ANM_SCRIPT_TBL);
+    spr = (char *)(mgr + ANM_SPRITE_TBL);
+    for (i = 0; i < s_p2IdCount; i++) {
+        int id = s_p2Ids[i];
+        uint32_t *sScr = &s_p2Script[i];
+        uint32_t *tScr = (uint32_t *)(scr + id * 4);
+        unsigned char *tSpr = (unsigned char *)(spr + id * ANM_SPRITE_STRIDE);
+        uint32_t tmp; unsigned char tmpS[ANM_SPRITE_STRIDE];
+        tmp = *tScr; *tScr = *sScr; *sScr = tmp;            /* swap script ptr  */
+        memcpy(tmpS, tSpr, ANM_SPRITE_STRIDE);
+        memcpy(tSpr, s_p2Sprite[i], ANM_SPRITE_STRIDE);
+        memcpy(s_p2Sprite[i], tmpS, ANM_SPRITE_STRIDE);     /* swap sprite def  */
+    }
+    s_anmSwapped = enter;
 }
 
 /* Swap the three selection globals to P2's identity around a P2-context engine
@@ -980,7 +921,6 @@ static void DespawnP2(void)
     if (!p2) return;
     s_p2 = NULL;                            /* stop piggyback FIRST */
     SwapAnm(0);                             /* ensure tables are P1's before free */
-    SwapFace(0);
     FreeP2CharAnm();
     KillP2FocusFx();
     VirtualFree(p2, 0, MEM_RELEASE);
@@ -1608,13 +1548,10 @@ static int __fastcall HookedUpdate(void *self)
         }
     }
 
-    int declBefore = *ADDR_DECL_STATE;
     int r = s_origUpdate(self);             /* P1 (or whatever ctx the task holds) */
 
     /* act only off the real P1 object, never re-entrantly off P2 */
     if (isP1) {
-        /* P1 just created a bomb declaration (state set to 2) -> it's P1's */
-        if (*ADDR_DECL_STATE == 2 && declBefore != 2) s_declP2 = 0;
         if (s_p1Ghost) {
             *ADDR_INPUT_GAMEPLAY = p1GhostSavedIn;
             MoveGhost((void *)ADDR_PLAYER_BASE);
@@ -1701,19 +1638,11 @@ static int __fastcall HookedUpdate(void *self)
             UpdateTeamBorder(p2);
 
             s_inP2Update = 1;               /* effect-spawn detour: redirect slot */
-            {
-                int declBefore = *ADDR_DECL_STATE;
-                SwapSelGlobals(1);          /* char/type-gated branches see P2 */
-                SwapAnm(1);                 /* 0x400-range tables -> P2's char */
-                SwapFace(1);                /* a P2 bomb caches P2's face UV here */
-                s_origUpdate(p2);           /* trampoline → no detour re-entry */
-                SwapFace(0);
-                SwapAnm(0);
-                SwapSelGlobals(0);
-                /* P2 just created a bomb declaration (state 2) -> it's P2's;
-                 * the draw hook then swaps P2's face around the global draw */
-                if (*ADDR_DECL_STATE == 2 && declBefore != 2) s_declP2 = 1;
-            }
+            SwapSelGlobals(1);              /* char/type-gated branches see P2 */
+            SwapAnm(1);                     /* 0x400-range tables -> P2's char */
+            s_origUpdate(p2);               /* trampoline → no detour re-entry */
+            SwapAnm(0);
+            SwapSelGlobals(0);
             s_inP2Update = 0;
 
             if (s_p2SepRes && rb) {
@@ -1879,7 +1808,6 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
-    if (MH_CreateHook(ADDR_DECL_DRAW,      (LPVOID)&HookedDeclDraw,      (LPVOID*)&s_origDeclDraw)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
@@ -1891,7 +1819,6 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_COLLECT_OVERLAP)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_ITEM_LOOP)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;
-    if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
     return 1;
 }
 

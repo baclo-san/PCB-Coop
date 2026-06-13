@@ -1021,6 +1021,45 @@ afterwards and overlay ghost mode ourselves.
   Reimu → P1 stays visible, P2's body+shots+bomb are the new char, no crash on
   spawn / move / shoot / bomb / repeated F2 / stage transition / revive.
 
+### 5f — round-13b: bomb declaration portrait + anm overlay refactor
+
+- **TEST round 13a-fix:** different-char P2 is functional (Marisa/Sakuya body,
+  shots, bomb all correct). Remaining items the user reported:
+  1. **Bomb declaration portrait shows P1's face** (FIXED below — the ask).
+  2. SakuyaA aimed knives don't aim when P2=Sakuya, P1≠Sakuya — the known
+     cross-char GLOBAL-gate (aim acquisition in the ENEMY update @12913 reads
+     the global char id; `SwapSelGlobals` only covers P2's own update). This is
+     the "per-player aim source" task. **Deferred** (user aware).
+  3. Switch crash on a 2nd/3rd F2 — **user said leave it** (real play picks the
+     char once). Cause known: freeing the old char's anm leaves P2's in-flight
+     shots bound to freed bytecode. A per-char anm cache would fix it; not worth
+     it pre-menu.
+  4. Stage transition: P1 briefly renders glyphs/number sprites then doubles
+     before separating — transient, mechanically fine (resources + shot type
+     transfer correctly). Likely the overlay free/restore racing the new
+     stage's anm load for a frame. Noted, not chased.
+- **Portrait fix (the declaration is a SECOND char-specific anm):** the bomb cb
+  calls `FUN_0042868d` which binds the portrait from the FACE anm
+  (`face_{rm,mr,sk}00.anm` @ base 0x4a0, id 0x4a1) loaded for the GLOBAL char.
+  `FUN_0044e8e0` caches UV at set-time but resolves the TEXTURE from the live
+  table entry at DRAW time, and the declaration DRAWS in a global UI pass
+  (`FUN_0042b603`, runs while a player-bomb declaration is active — it draws the
+  +0x574c portrait obj; boss spell cards use a different obj/path). So P2's face
+  must be swapped in at BOTH creation (P2's update) and draw. Implemented:
+  - load P2's face anm alongside the player anm (overlay window [0x4a0,0x4b0));
+  - `SwapFace` folded into P2's update window (so the set-time UV caches P2's);
+  - hook `FUN_0042b603` (ADDR_DECL_DRAW 0x0042b603) and swap P2's face around it
+    when `s_declP2` (the active declaration was created during P2's update,
+    detected by the `DAT_00575ab4`→2 transition; cleared when P1's update makes
+    a declaration).
+- **Refactor:** the load/capture/free/swap is now a generic `AnmOverlay`
+  (slot + captured ids/scripts/sprites + window); the player anm and the face
+  anm are two instances. `LoadP2CharAnm` loads both; `FreeP2CharAnm` frees both
+  (each restores the live window across the engine slot-free — the round-13a
+  clobber fix, now generic).
+- Awaiting test: P2=Sakuya (P1=Reimu) bombs → Sakuya's portrait + spell name in
+  the declaration; P1 bombs → still Reimu's; no crash; repeated bombs both ways.
+
 ## 6. Reference file locations
 - Ghidra dump: `C:\Users\rndmdck\Desktop\th07.exe.c`  (committed in-repo as `PCBdecomp.c`)
 - Reference mod: https://github.com/RUEEE/th06_multi_net (branch `master`, `src/`)

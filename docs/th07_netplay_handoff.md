@@ -1093,10 +1093,61 @@ afterwards and overlay ghost mode ourselves.
   (body/shots/bomb), portrait shows P1's face, SakuyaA cross-char aim absent,
   cycle-back F2 can crash. Good enough to build menu-select on.
 
-### 5g — EoSD-style menu character select (PLAN — RE done, not yet coded)
+### 5g — EoSD-style menu character select (DONE — 2026-06-14)
 
 Goal: P1 picks char+type on the normal screen; instead of starting, the game
 holds on character select and lets P2 pick its own char+type; then start.
+
+**AS BUILT** (commit on `main`, all in `src/coop/coop.c`):
+- Hook the screen dispatcher `FUN_004554d6` (`HookedMenuDispatch`, ECX=menu).
+  FSM `CM_IDLE → CM_P2_CHAR → CM_P2_SHOT → CM_COMMIT`.
+- P1's shot-type COMMIT is intercepted pre-orig (substate==1 + confirm edge +
+  not-practice-locked): capture P1's `645/646`, `MenuGotoState(menu,state-1)`
+  back to char-select, FSM=P2_CHAR. Engages for normal (4/5/6) + practice
+  (0xc/0xd/0xe); extra (8/9/0xa) left vanilla.
+- During P2's pass, route `DAT_004b9e4c|prev` = real P1 menu input OR P2's
+  synthesized menu bits (`ReadP2MenuInput`: IJKL/Space/O in MENU layout —
+  up 0x10 down 0x20 left 0x40 right 0x80 confirm 0x1001 cancel 0xa) so either
+  player can drive P2's cursor (no soft-lock). Restore real input after orig.
+- On P2's shot COMMIT (orig dispatcher returns 0): record `s_p2Sel` +
+  `s_allowDiffChar`, restore P1's `645/646/647`, FSM=COMMIT. The existing
+  in-stage auto-spawn machinery loads P2's char anm + bakes the loadout — the
+  clean **stage-start** load §5g called for (no live entities).
+- `ResetCoopSession()` (called from the dispatcher, front-end only): full
+  teardown on return to menu — frees clone + anm slot, DROPS stale fx/effect
+  handles (never deref), clears every latch. Needed because returning to the
+  menu doesn't hit the in-stage `HookedFrameTask` rebuild; without it the stale
+  P2 clone froze the 2nd game's stage load.
+
+**Companion fixes shipped same session** (different-char robustness):
+- **Anm slot choice**: scan for a slot the engine NEVER loads into
+  (`kGameAnmSlots` blocklist; only 0–0x31 exist, loader frees-first). 0x31 was
+  the staff-roll slot → mid-game reuse freed P2's anm → "crash after some time".
+  Now picks 0x30 down, skipping the blocklist. `SwapAnm` also self-validates the
+  slot still holds our file (retires the overlay gracefully if ever reused).
+- **Reverse-base table** (`mgr+0x2b6f0`): the engine slot-free zeroes script,
+  sprite AND reverse tables; `FreeP2CharAnm`/`LoadP2CharAnm` now snapshot+restore
+  all three (fixes the stage-transition glyph bug). And `SwapAnm` now SWAPS the
+  reverse-base too — the sprite bind does `global = local + reverse[id]`
+  (PCBdecomp.c:34342); at Marisa-only ids P2 was reading Reimu's reverse (0), so
+  MarisaB's laser bound to 0x46 (a font glyph) instead of 0x446 → "red-ish wrong
+  sprite". Swapping reverse fixes the laser graphics.
+- **Per-character starting bombs** `kCharStartBombs = {Reimu 3, Marisa 2,
+  Sakuya 4}`: P2 seeds bombs from its OWN character on a fresh game, and a normal
+  death's respawn refill is overridden to the char default (ZUN refills to the
+  P1-tracking config value otherwise).
+- **Retry vs stage-advance**: `HookedFrameTask` uses a team-score DROP
+  (`RES_SCORE` 0x04, phantom-spare-proof) to tell a retry/fresh start (reset P2)
+  from a stage advance (carry resources).
+
+Remaining gaps: bomb-declaration PORTRAIT still shows P1's face for a
+different-char P2 (the portrait is a global char-id anm at base 0x4a0; not yet
+overlaid); SakuyaA cross-char aim source (deferred); no on-screen "P2 SELECT"
+prompt. See §8.
+
+---
+
+#### Original plan (kept for reference)
 
 **The menu state machine (all verified in PCBdecomp.c):**
 - Dispatcher `FUN_004554d6(menu)` switches on the screen-state word at
@@ -1170,3 +1221,76 @@ Input_Poll=FUN_00430b50, Input_AddJoyBits=FUN_004303f0, Joy_SetBit=FUN_00430370,
 DInput_Init=FUN_004383d8, FrameGovernor=FUN_004346e0, GameUpdate=FUN_0042fd60, GameDraw=FUN_0042fe20,
 ReplayRecord=FUN_00442cd0, ReplayPlayback=FUN_00442ee0, ScoreCherryDisplay=FUN_00427f22.
 (Renaming these in Ghidra + the input/cherry globals is a cheap, high-value early task.)
+
+## 8. Goals / TODO (next sessions)
+
+Ordered by the user's priority. Items marked **[autonomous-ok]** can be drafted
+without live testing (RE + implement + document for the user to verify); items
+marked **[needs user]** require the user's eyes in-game before they're "done".
+
+### 8a — P2 proper, P1-like HUD  **[autonomous-ok to draft, [needs user] to confirm]**
+User spec (2026-06-14): give P2 a HUD that mirrors P1's, not the current ascii
+`P2xx Ln Bn Pn` line. Specifically:
+- **Lives** drawn as the life ICON sprite × current count (like P1's life row),
+  not a number.
+- **Bombs** drawn as the bomb/spell ICON sprite × current count, same style.
+- **Power** drawn as P1's power gauge/number, same widget.
+- **Same layout as P1's HUD**, placed on P2's side: the LIFE counter row starts
+  *just a bit below the current point-item counter* (the "点" / point-item line),
+  NOT below the total score. Match P1's vertical rhythm from there down
+  (lives row, then bombs row, then power).
+- The existing **ghost / revive / share** text HUD is fine as-is — keep it,
+  only replace the resource readout with the sprite-based one.
+
+Implementation pointers (RE first, don't guess offsets):
+- Find ZUN's HUD/sidebar draw (the score-manager draw — near
+  `ScoreCherryDisplay=FUN_00427f22` and the score singleton `0x626270`/struct
+  `0x626278`). Identify the life-icon and bomb-icon sprite ids + the per-icon
+  x-step + the row Y of the life counter, and the power-gauge widget draw.
+- Read P1's point-item counter ("点") Y so P2's life row can sit "just below" it.
+- Draw P2's icons from `s_p2Lives` / `s_p2Bombs` / `s_p2Power` at a P2-side
+  origin (mirror P1's column, or place under P1's stack — pick what fits the
+  448-col sidebar `DrawCoopHud` already uses, then refine after the user looks).
+- Keep it behind the existing `DrawCoopHud(p2)` call in `HookedDraw`.
+- Caveat: drawing engine sprites from the DLL needs the right draw call +
+  sprite ids; the icons live in the front/HUD anm (`front.anm`, slot 0x15, base
+  0x600 — see the FUN_0044df90 table). Resolve the real ids from the decomp.
+
+### 8b — Bomb-declaration portrait for a different-char P2  **[needs user]**
+When P2 bombs as a different char than P1, the big spell portrait shows P1's
+face. The portrait is a separate char-specific anm (`face_{rm,mr,sk}00.anm` @
+base 0x4a0, id 0x4a1), created by `FUN_0042868d`, drawn globally by
+`FUN_0042b603` when `DAT_00575ab4 != 0`, keyed off the GLOBAL char id. Prior
+mid-stage overlay attempts regressed (round-13b). Right approach: load P2's face
+anm cleanly at menu-commit time (alongside the player anm) into its own
+never-reused slot, and swap/redirect the portrait id during P2's bomb only.
+LOW priority / polish; do not destabilize the working build chasing it.
+
+### 8c — SakuyaA cross-char per-player aim source  **[needs user]**
+SakuyaA's aimed (non-homing) shot uses an aim target filled by the enemy update
+keyed off the global char id, only into static P1's block. P2 currently mirrors
+P1's aim block each frame (works when P1 is also Sakuya). For a different-char
+P2=SakuyaA the aim source isn't per-player. Deferred by the user ("can do for
+now"); revisit if it matters.
+
+### 8d — "P2 SELECT" on-screen prompt  **[autonomous-ok]**
+During P2's menu pass there's no visual cue it's P2's turn. Add a prompt via the
+ascii text queue (the same `ADDR_ASCII_PRINT` the coop HUD uses) while
+`s_coopMenu` is `CM_P2_CHAR`/`CM_P2_SHOT`. Cosmetic, safe.
+
+### 8e — Netcode → coop.c wiring  **[bigger, separate effort]**
+The original long-term goal. The input seam is already in place: P2's gameplay
+input is read via `ReadP2InputLocal()` (and menu input via `ReadP2MenuInput()`)
+— the netcode replaces these with the remote word. Menu selection would sync
+P2's char/type over the wire (drive the menu FSM from the remote input). Defer
+until the local co-op game side is fully solid (per memory: defer netplay
+testing).
+
+### Working-build discipline for the overnight session
+The build on `main` is GOOD (menu select + different char + lasers + bombs +
+retry all confirmed by the user). Before any risky change, note the last-good
+commit. Prefer 8a (HUD) and 8d (prompt) which are additive/cosmetic. Do NOT
+refactor the anm swap or the menu FSM. Build with `powershell -File build.ps1`
+and confirm `th07_coop.dll` stays 32-bit (machine 0x014C). Commit incrementally
+with clear messages; leave the tree clean. Anything needing live verification:
+implement + document what to test, don't mark it done.

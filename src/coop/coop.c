@@ -383,6 +383,10 @@ static void KillP2FocusFx(void)
 typedef int (__fastcall *FrameTaskFn_t)(int *self);
 static FrameTaskFn_t s_origFrameTask = NULL;
 static int s_lastLogicFrame = 0x7fffffff;
+static int s_lastScore = 0;            /* prev frame's team score; a DROP at a frame
+                                          reset = retry/fresh start (vs stage advance,
+                                          which carries the score). Phantom-spare logic
+                                          never touches score, so it's a clean signal. */
 
 /* ZUN's on-screen text: FUN_00402060(ascii_mgr, float pos[3], fmt, ...) —
  * vsprintf into a local buffer, then queue on the ascii manager (static at
@@ -500,10 +504,51 @@ typedef int (__fastcall *ShtLoadFn_t)(void **out, const char *name); /* 0 = ok *
 #define OFF_SPD_FOC       0x9a0       /* = sht[+0x10]/2                           */
 #define OFF_HITBOX        0x23f8      /* = sht[+0x8]                              */
 static int   s_p2Sel = -1;             /* P2's sel 0-5; -1 = mirror P1. F3 toggles A/B */
+/* Per-CHARACTER starting bomb stock (user/PCB spec): Reimu 3, Marisa 2, Sakuya 4.
+ * P2 seeds its own bombs from this (by its character) on a fresh game instead of
+ * copying P1's count; resources still carry unchanged across stage transitions. */
+static const float kCharStartBombs[3] = { 3.0f, 2.0f, 4.0f };
 static void *s_shtCache[6][2];         /* loaded .sht pairs (game heap, kept for life) */
 static unsigned char s_selSaved[3];    /* global-swap save slots                  */
 static int   s_selSwapped = 0;
 static int   s_allowDiffChar = 0;      /* F2 enables cycling P2 to a DIFFERENT char */
+
+/* ---- EoSD-style MENU character select (handoff §5g) ----
+ * P1 picks char+type on the normal screen; instead of starting, we hold on
+ * character-select and let P2 pick its own char+type, then start. We hook the
+ * menu screen dispatcher FUN_004554d6 (ECX = menu object), drive a small FSM,
+ * and route P2's input into the menu during its pass. On P2's commit we record
+ * its selection into s_p2Sel/s_allowDiffChar (the in-stage auto-spawn machinery
+ * then loads its char anm + bakes the loadout — a clean stage-start load, no
+ * live entities, which is what the round-13 regression demanded) and restore
+ * P1's selection globals so the engine inits the static player as P1.
+ *
+ * Menu state word (menu+0xd0f8): char-select active 5(normal)/9(extra)/0xd(prac),
+ * shot-select 6/0xa/0xe (the 4/5/6 vs 8/9/0xa vs 0xc/0xd/0xe triples are
+ * normal/extra/practice). We engage for normal (4/5/6) + practice (0xc/0xd/0xe)
+ * only; extra is single-char, left vanilla (P2 just mirrors P1 there).
+ * Menu input word DAT_004b9e4c (vs prev DAT_004b9e54, screens fire on rising
+ * edge): up 0x10, down 0x20, left 0x40, right 0x80, confirm 0x1001, cancel 0xa. */
+#define ADDR_MENU_DISPATCH  ((LPVOID)0x004554d6)            /* __fastcall(ecx=menu) */
+#define ADDR_MENU_IN_CUR    ((volatile uint16_t *)0x004b9e4c)
+#define ADDR_MENU_IN_PREV   ((volatile uint16_t *)0x004b9e54)
+#define ADDR_MODE_FLAGS     ((volatile uint32_t *)0x0062f648) /* bit0 = practice    */
+#define MENU_OFF_STATE      0xd0f8     /* screen-state word (param_1[0x343e])      */
+#define MENU_OFF_SUBSTATE   0x8        /* param_1[2]: 0 anim-in, 1 active          */
+#define MENU_OFF_CURSOR     0x0        /* param_1[0]: cursor index                 */
+#define MENU_OFF_PREVSTATE  0x64       /* FUN_00455435 stashes the old state here  */
+#define MENU_OFF_COUNTER3   0xc        /* param_1[3]                               */
+#define MENU_OFF_FRAMECTR   0xd0fc     /* param_1[0x343f]: per-screen frame ctr    */
+#define MENU_OFF_COUNTER2   0xb0c0     /* param_1[0x2c30]                          */
+#define MENU_CONFIRM        0x1001
+#define MENU_CANCEL         0xa
+enum { CM_IDLE = 0, CM_P2_CHAR, CM_P2_SHOT, CM_COMMIT };
+static int      s_coopMenu  = CM_IDLE; /* coop char-select FSM state               */
+static int      s_menuSelect = 1;      /* feature enable (0 = bypass, vanilla menu)*/
+static int      s_p1Char = 0, s_p1Type = 0; /* P1's pick, saved at its commit      */
+static uint16_t s_menuPrev = 0;        /* prev combined menu-input for P2's pass   */
+typedef int (__fastcall *MenuDispFn_t)(void *menu);
+static MenuDispFn_t s_origMenuDispatch = NULL;
 
 /* ---- DIFFERENT CHARACTER for P2 (charselect stage 2) ----
  * The sprites/animation live in an ANM file (data/player0{0,1,2}.anm) the init
@@ -528,6 +573,7 @@ static int   s_allowDiffChar = 0;      /* F2 enables cycling P2 to a DIFFERENT c
  * so the swap only touches ids P2 actually defines. */
 #define ADDR_ANM_MGR_PP   ((volatile uint32_t *)0x004b9e44) /* -> anm mgr base   */
 #define ANM_SCRIPT_TBL    0x28ef0      /* mgr+: script ptr per id                 */
+#define ANM_REV_TBL       0x2b6f0      /* mgr+: reverse base per id (bind reads it)*/
 #define ANM_SPRITE_TBL    0x60         /* mgr+: sprite def per id, stride 0x40    */
 #define ANM_SPRITE_STRIDE 0x40
 #define ANM_SLOT_TBL      0x2def0      /* mgr+: per-slot file ptr (0=free), 0xc   */
@@ -544,12 +590,32 @@ typedef void (__attribute__((thiscall)) *AnmFreeFn_t)(void *mgr, int slot);
 
 static int      s_p2AnmChar = -1;      /* char id whose anm is loaded for P2; -1 none */
 static int      s_p2AnmSlot = -1;      /* anm slot holding P2's char anm              */
+static uint32_t s_p2AnmFile = 0;       /* slot's file ptr at load; detect engine reuse */
 static int      s_p2AnmActive = 0;     /* P2 currently uses a different-char anm       */
 static int      s_p2IdCount = 0;       /* how many ids P2's char defines in the window */
 static uint16_t s_p2Ids[ANM_MAX_IDS];                 /* the ids P2 defines            */
 static uint32_t s_p2Script[ANM_MAX_IDS];              /* P2's script ptr per id        */
+static uint32_t s_p2Rev[ANM_MAX_IDS];                 /* P2's reverse-base per id      */
 static unsigned char s_p2Sprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE]; /* P2's sprite def    */
 static int      s_anmSwapped = 0;
+
+/* Slots the engine itself loads into via FUN_0044df90 (the ONLY anm loader; the
+ * load FREES the slot first, so reusing any of these would yank P2's anm out
+ * from under our captured script/sprite pointers -> dangling deref crash). We
+ * must load P2's char into a slot NOT in this set. 0x30 is the highest one the
+ * game never touches; 0x31 is the staff-roll, 0x2e/0x2a/0x20 are stage assets. */
+static const unsigned char kGameAnmSlots[] = {
+    0x00,0x01,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,
+    0x0f,0x10,0x11,0x12,0x13,0x15,0x17,0x18,0x19,0x1c,
+    0x20,0x2a,0x2e,0x31
+};
+static int IsGameAnmSlot(int id)
+{
+    int i;
+    for (i = 0; i < (int)(sizeof kGameAnmSlots); i++)
+        if (kGameAnmSlots[i] == id) return 1;
+    return 0;
+}
 
 static void Log(const char *fmt, ...)
 {
@@ -639,23 +705,32 @@ static int LoadP2CharAnm(int charId)
     spr = (char *)(mgr + ANM_SPRITE_TBL);
     slt = (char *)(mgr + ANM_SLOT_TBL);
 
-    /* pick a free anm slot high in the table (menu/result/title slots, free
-     * during a stage); never slot 10 (P1's live char) or the low engine slots */
+    /* pick the highest free slot the ENGINE never loads into (see kGameAnmSlots):
+     * any slot the game itself uses would be freed-then-reloaded out from under
+     * our captured pointers when the game wants it (dialogue, boss, ending) -> a
+     * "crashes after some time" dangling deref. 0x30 down to 0x14 are the safe
+     * candidates. */
     slot = -1;
-    for (id = 0x31; id >= 0x14; id--) {
-        if (id == 10) continue;
+    for (id = 0x30; id >= 0x02; id--) {
+        if (IsGameAnmSlot(id)) continue;
         if (*(uint32_t *)(slt + id * 0xc) == 0) { slot = id; break; }
     }
-    if (slot < 0) { Log("P2 char anm: no free slot"); return 0; }
+    if (slot < 0) { Log("P2 char anm: no free non-engine slot"); return 0; }
 
     /* snapshot P1's tables across the window, then load P2's char OVER base
-     * 0x400 (overwrites only the ids P2's anm defines), diff, restore P1's. */
+     * 0x400 (overwrites only the ids P2's anm defines), diff, restore P1's.
+     * The reverse-base table is snapshot+restored too: the load's internal
+     * slot-free zeroes it, and although the re-register writes back the same
+     * base (0x400), restoring P1's exact values keeps us robust. */
     {
         uint32_t p1Script[ANM_MAX_IDS];
+        uint32_t p1Rev[ANM_MAX_IDS];
         unsigned char p1Sprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE];
+        char *rev = (char *)(mgr + ANM_REV_TBL);
         int i, rc;
         for (i = 0; i < ANM_MAX_IDS; i++) {
             p1Script[i] = *(uint32_t *)(scr + (ANM_ID_LO + i) * 4);
+            p1Rev[i]    = *(uint32_t *)(rev + (ANM_ID_LO + i) * 4);
             memcpy(p1Sprite[i], spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
                    ANM_SPRITE_STRIDE);
         }
@@ -667,6 +742,7 @@ static int LoadP2CharAnm(int charId)
              * case a partial write happened, then bail */
             for (i = 0; i < ANM_MAX_IDS; i++) {
                 *(uint32_t *)(scr + (ANM_ID_LO + i) * 4) = p1Script[i];
+                *(uint32_t *)(rev + (ANM_ID_LO + i) * 4) = p1Rev[i];
                 memcpy(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
                        ANM_SPRITE_STRIDE);
             }
@@ -679,13 +755,19 @@ static int LoadP2CharAnm(int charId)
             if (curS != p1Script[i] || sprChanged) {
                 s_p2Ids[n] = (uint16_t)(ANM_ID_LO + i);
                 s_p2Script[n] = curS;
+                /* capture P2's reverse-base too (= 0x400, the load base). The
+                 * sprite bind computes global id = local + reverse[id]; at
+                 * Marisa-only ids P1's reverse is 0, so without swapping this the
+                 * laser binds to local+0 (a font glyph) instead of local+0x400. */
+                s_p2Rev[n] = *(uint32_t *)(rev + (ANM_ID_LO + i) * 4);
                 memcpy(s_p2Sprite[n],
                        spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
                        ANM_SPRITE_STRIDE);
                 n++;
             }
-            /* restore P1's live tables */
+            /* restore P1's live tables (script, reverse-base, sprite) */
             *(uint32_t *)(scr + (ANM_ID_LO + i) * 4) = p1Script[i];
+            *(uint32_t *)(rev + (ANM_ID_LO + i) * 4) = p1Rev[i];
             memcpy(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
                    ANM_SPRITE_STRIDE);
         }
@@ -693,9 +775,10 @@ static int LoadP2CharAnm(int charId)
 
     s_p2AnmChar  = charId;
     s_p2AnmSlot  = slot;
+    s_p2AnmFile  = *(uint32_t *)(slt + slot * 0xc);  /* our file ptr; SwapAnm guards on it */
     s_p2IdCount  = n;
-    Log("P2 char anm: %s -> slot %d, %d ids captured (0x%x..0x%x)",
-        anmNames[charId], slot, n,
+    Log("P2 char anm: %s -> slot %d (file 0x%08x), %d ids captured (0x%x..0x%x)",
+        anmNames[charId], slot, s_p2AnmFile, n,
         n ? s_p2Ids[0] : 0, n ? s_p2Ids[n - 1] : 0);
     return n > 0;
 }
@@ -705,25 +788,31 @@ static void FreeP2CharAnm(void)
     uint32_t mgr = *ADDR_ANM_MGR_PP;
     /* MUST be called with the tables in P1's (rest) state — callers ensure it. */
     if (s_p2AnmSlot >= 0 && mgr) {
-        /* The engine slot-free FUN_0044e4e0 ZEROES the global script + sprite
-         * tables for this slot's ids. But P2 loaded at base 0x400, so its ids
-         * are the SAME ones P1 uses, and the table right now holds P1's live
-         * entries — a naive free wipes P1's body/shot scripts (P1 vanishes,
-         * NULL bind crashes). So snapshot P1's window, let the engine free
-         * (which also releases P2's buffer + textures), then restore P1's. */
+        /* The engine slot-free FUN_0044e4e0 ZEROES the global script, sprite AND
+         * reverse-base tables for this slot's ids (PCBdecomp.c:32925-32936). But
+         * P2 loaded at base 0x400, so its ids are the SAME ones P1 uses, and the
+         * tables right now hold P1's live entries — a naive free wipes P1's
+         * body/shot scripts AND the reverse-base entries the sprite-bind reads
+         * (P1 vanishes / renders as glyphs, then a bad bind crashes). So snapshot
+         * P1's window (all three tables), let the engine free (which also
+         * releases P2's buffer + textures), then restore P1's. */
         char *scr = (char *)(mgr + ANM_SCRIPT_TBL);
+        char *rev = (char *)(mgr + ANM_REV_TBL);
         char *spr = (char *)(mgr + ANM_SPRITE_TBL);
         uint32_t p1Script[ANM_MAX_IDS];
+        uint32_t p1Rev[ANM_MAX_IDS];
         static unsigned char p1Sprite[ANM_MAX_IDS][ANM_SPRITE_STRIDE];
         int i;
         for (i = 0; i < ANM_MAX_IDS; i++) {
             p1Script[i] = *(uint32_t *)(scr + (ANM_ID_LO + i) * 4);
+            p1Rev[i]    = *(uint32_t *)(rev + (ANM_ID_LO + i) * 4);
             memcpy(p1Sprite[i], spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE,
                    ANM_SPRITE_STRIDE);
         }
         ADDR_ANM_FREE_FN((void *)mgr, s_p2AnmSlot);
         for (i = 0; i < ANM_MAX_IDS; i++) {
             *(uint32_t *)(scr + (ANM_ID_LO + i) * 4) = p1Script[i];
+            *(uint32_t *)(rev + (ANM_ID_LO + i) * 4) = p1Rev[i];
             memcpy(spr + (ANM_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
                    ANM_SPRITE_STRIDE);
         }
@@ -731,6 +820,7 @@ static void FreeP2CharAnm(void)
     }
     s_p2AnmChar = -1;
     s_p2AnmSlot = -1;
+    s_p2AnmFile = 0;
     s_p2IdCount = 0;
     s_p2AnmActive = 0;
     s_anmSwapped = 0;
@@ -738,23 +828,45 @@ static void FreeP2CharAnm(void)
 
 /* Exchange the 0x400-range table entries between P1's (live) and P2's captured
  * char for exactly the ids P2 defines. enter=1 installs P2, enter=0 restores
- * P1. Re-entrancy-guarded; only acts while P2 has a different-char anm. */
+ * P1. Re-entrancy-guarded; only acts while P2 has a different-char anm.
+ *
+ * SAFETY: our captured script pointers (s_p2Script) point INTO the anm file
+ * loaded in s_p2AnmSlot. If the engine ever reused that slot (it shouldn't now
+ * that we avoid kGameAnmSlots, but some path might), those pointers dangle and
+ * swapping them in would crash on the next draw. So before installing P2, verify
+ * the slot still holds OUR file; if not, retire the different-char overlay (P2
+ * falls back to rendering P1's char — safe) and log it. */
 static void SwapAnm(int enter)
 {
     uint32_t mgr = *ADDR_ANM_MGR_PP;
-    char *scr, *spr;
+    char *scr, *spr, *rev;
     int i;
     if (!s_p2AnmActive || !mgr || s_p2IdCount == 0) return;
     if (enter == s_anmSwapped) return;
+    if (enter && s_p2AnmSlot >= 0) {
+        uint32_t cur = *(uint32_t *)(mgr + ANM_SLOT_TBL + s_p2AnmSlot * 0xc);
+        if (cur != s_p2AnmFile) {
+            Log("SwapAnm: slot %d reused by engine (file 0x%08x != 0x%08x) "
+                "-> retiring P2 different-char overlay (no crash, mirrors P1)",
+                s_p2AnmSlot, cur, s_p2AnmFile);
+            s_p2AnmActive = 0;
+            s_anmSwapped = 0;
+            return;
+        }
+    }
     scr = (char *)(mgr + ANM_SCRIPT_TBL);
     spr = (char *)(mgr + ANM_SPRITE_TBL);
+    rev = (char *)(mgr + ANM_REV_TBL);
     for (i = 0; i < s_p2IdCount; i++) {
         int id = s_p2Ids[i];
         uint32_t *sScr = &s_p2Script[i];
+        uint32_t *sRev = &s_p2Rev[i];
         uint32_t *tScr = (uint32_t *)(scr + id * 4);
+        uint32_t *tRev = (uint32_t *)(rev + id * 4);
         unsigned char *tSpr = (unsigned char *)(spr + id * ANM_SPRITE_STRIDE);
         uint32_t tmp; unsigned char tmpS[ANM_SPRITE_STRIDE];
         tmp = *tScr; *tScr = *sScr; *sScr = tmp;            /* swap script ptr  */
+        tmp = *tRev; *tRev = *sRev; *sRev = tmp;            /* swap reverse-base */
         memcpy(tmpS, tSpr, ANM_SPRITE_STRIDE);
         memcpy(tSpr, s_p2Sprite[i], ANM_SPRITE_STRIDE);
         memcpy(s_p2Sprite[i], tmpS, ANM_SPRITE_STRIDE);     /* swap sprite def  */
@@ -893,9 +1005,11 @@ static void SpawnP2(void)
         if (s_p2Carry) {
             s_p2Carry = 0;          /* stage transition: P2 keeps its own resources */
         } else if (res) {
+            int p2char = ((s_p2Sel >= 0 ? s_p2Sel : *ADDR_SEL_ID) / 2) % 3;
             s_p2Lives = *(float *)(res + RES_LIVES);
-            s_p2Bombs = *(float *)(res + RES_BOMBS);
             s_p2Power = *(float *)(res + RES_POWER);
+            /* bombs: P2's own CHARACTER default, not a copy of P1's count */
+            s_p2Bombs = kCharStartBombs[p2char];
         }
         s_p2Ghost = 0;
         s_p1Ghost = 0;
@@ -1501,12 +1615,20 @@ static int __fastcall HookedFrameTask(int *self)
 {
     int r = s_origFrameTask(self);
     int f = *self;
+    uint32_t res = *ADDR_RES_PTR;
+    int score = res ? *(int *)(res + RES_SCORE) : s_lastScore;
     if (f < s_lastLogicFrame && (s_p2 || s_p1Ghost || s_runOver)) {
-        if (s_runOver) {
-            Log("frame counter reset after game over -> full co-op reset");
-            s_p2Carry = 0;              /* fresh run: reseed P2 from P1 */
+        /* A frame-counter reset is a stage ADVANCE (carry resources), a RETRY /
+         * fresh start (reset to starting resources), or a post-game-over reset.
+         * Retry restarts the run with a 0 score; a stage advance carries the
+         * (only-growing) score. So a score DROP marks a fresh start. */
+        int fresh = s_runOver || (res && s_lastScore > 0 && score < s_lastScore);
+        if (fresh) {
+            Log("frame counter reset -> FRESH start (score %d < %d) -> P2 reset",
+                score, s_lastScore);
+            s_p2Carry = 0;              /* reseed P2 fresh (lives from P1, char bombs) */
         } else {
-            Log("frame counter reset (stage start) -> P2 rebuild (resources carried)");
+            Log("frame counter reset (stage advance) -> P2 rebuild (resources carried)");
             s_p2Carry = (s_p2 != NULL);
         }
         s_runOver = 0;
@@ -1520,6 +1642,7 @@ static int __fastcall HookedFrameTask(int *self)
         s_readyFrames = 0;
     }
     s_lastLogicFrame = f;
+    s_lastScore = score;
     return r;
 }
 
@@ -1621,6 +1744,8 @@ static int __fastcall HookedUpdate(void *self)
             int p2Fake = 0;
             uint32_t res = *ADDR_RES_PTR;
             unsigned char goBefore = *ADDR_GAMEOVER;
+            float p2LivesBefore = s_p2Lives;   /* detect ZUN's on-death respawn */
+            int p2char = ((s_p2Sel >= 0 ? s_p2Sel : *ADDR_SEL_ID) / 2) % 3;
             if (s_p2SepRes && res) {
                 rl = (float *)(res + RES_LIVES);
                 rb = (float *)(res + RES_BOMBS); rp = (float *)(res + RES_POWER);
@@ -1653,6 +1778,13 @@ static int __fastcall HookedUpdate(void *self)
                     if (s_p2Lives < 1.0f) { s_p2Lives = 0.f; EnterGhostP2(); }
                     else                    s_p2Lives -= 1.0f;
                 }
+                /* on a NORMAL respawn (a spare was just consumed, P2 still alive),
+                 * ZUN refilled bombs to its global/config default (which tracks
+                 * P1's character). Override to P2's OWN character default so each
+                 * player keeps its canonical bomb stock. Ghost deaths are handled
+                 * by the revive system (death-stock bombs), so skip those. */
+                if (!s_p2Ghost && s_p2Lives < p2LivesBefore)
+                    s_p2Bombs = kCharStartBombs[p2char];
                 *rl = saveL; *rb = saveB; *rp = saveP;              /* restore P1's */
                 if (*(volatile uint32_t *)(res + RES_CHECKSUM) != ckBefore)
                     ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);         /* re-heal checksum */
@@ -1794,6 +1926,167 @@ static int __fastcall HookedDraw(void *self)
     return r;
 }
 
+/* ---- menu character-select hook (handoff §5g) ---- */
+
+/* Full coop teardown for a return to the front-end menu. Unlike DespawnP2 (which
+ * runs in-stage and pops P2's focus ring through the engine), the ended game's
+ * engine objects — the focus-FX effect, the effect array, the stage anms — are
+ * all gone or recycled by now, so we must NOT dereference any of them: we just
+ * DROP the stale handles, free our own clone buffer + the anm slot, and clear
+ * every session latch back to its pristine pre-game state. Players reset and
+ * re-enter character select constantly, so each new game must start clean — a
+ * surviving clone froze the 2nd game's stage load. */
+static void ResetCoopSession(void)
+{
+    void *p2 = (void *)s_p2;
+    s_p2 = NULL;                 /* stop any piggyback FIRST                       */
+    s_p2FocusFx = NULL;          /* DROP the stale fx handle — never KillP2FocusFx */
+    if (s_p2AnmSlot >= 0) { SwapAnm(0); FreeP2CharAnm(); }
+    if (p2) VirtualFree(p2, 0, MEM_RELEASE);
+    s_autoSpawned   = 0;
+    s_readyFrames   = 0;
+    s_p1Ghost       = 0;
+    s_p2Ghost       = 0;
+    s_runOver       = 0;
+    s_reviveFrames  = 0;
+    s_shareFrames   = 0;
+    s_p2Carry       = 0;
+    s_p2Shadow      = 0;
+    s_lastLogicFrame = 0x7fffffff;
+    Log("coop session reset (returned to front-end menu)");
+}
+
+/* P2's menu input in the MENU bit layout (same physical keys as ReadP2InputLocal). */
+static uint16_t ReadP2MenuInput(void)
+{
+    uint16_t w = 0;
+    if (Down('I'))      w |= 0x10;          /* up    */
+    if (Down('K'))      w |= 0x20;          /* down  */
+    if (Down('J'))      w |= 0x40;          /* left  */
+    if (Down('L'))      w |= 0x80;          /* right */
+    if (Down(VK_SPACE)) w |= MENU_CONFIRM;  /* confirm */
+    if (Down('O'))      w |= MENU_CANCEL;   /* cancel  */
+    return w;
+}
+
+/* Inline the engine's screen-transition setter FUN_00455435(menu, state): stash
+ * the old state, set the new one, and reset the per-screen counters + substate so
+ * the target screen re-runs its first-frame setup. */
+static void MenuGotoState(char *menu, uint32_t state)
+{
+    *(uint32_t *)(menu + MENU_OFF_PREVSTATE) = *(uint32_t *)(menu + MENU_OFF_STATE);
+    *(uint32_t *)(menu + MENU_OFF_STATE)     = state;
+    *(uint32_t *)(menu + MENU_OFF_COUNTER3)  = 0;
+    *(uint32_t *)(menu + MENU_OFF_FRAMECTR)  = 0;
+    *(uint32_t *)(menu + MENU_OFF_SUBSTATE)  = 0;
+    *(uint32_t *)(menu + MENU_OFF_COUNTER2)  = 0;
+}
+
+static int MenuIsCharState(uint32_t s) { return s == 5 || s == 0xd; }
+static int MenuIsShotState(uint32_t s) { return s == 6 || s == 0xe; }
+static int MenuInCoopFlow(uint32_t s)
+{ return s == 4 || s == 5 || s == 6 || s == 0xc || s == 0xd || s == 0xe; }
+
+static int __fastcall HookedMenuDispatch(void *menuv)
+{
+    char *menu = (char *)menuv;
+    uint32_t state = *(uint32_t *)(menu + MENU_OFF_STATE);
+    int r;
+
+    /* The menu dispatcher ONLY runs in the front-end (title/main/char-select),
+     * never during gameplay. So if a co-op session is still alive here, the
+     * previous game ended/quit without an in-stage teardown — fully reset it now
+     * so (a) the char-select portraits don't glyph from a leftover anm slot and
+     * (b) a stale clone can't survive into the next game's stage load (which
+     * froze the 2nd run). Idempotent: after the reset s_p2/s_p2AnmSlot are clear. */
+    if (s_p2 || s_p2AnmSlot >= 0)
+        ResetCoopSession();
+
+    if (!s_menuSelect) return s_origMenuDispatch(menuv);
+
+    /* left the char/shot-select flow (back to title/difficulty, or post-game):
+     * reset the FSM so the next game starts a fresh P2 selection. */
+    if (!MenuInCoopFlow(state)) {
+        if (s_coopMenu != CM_IDLE) {
+            Log("coop-menu: left select flow (state %u) -> reset", state);
+            s_coopMenu = CM_IDLE;
+        }
+        return s_origMenuDispatch(menuv);
+    }
+
+    /* ---- P1's pass: intercept the shot-type COMMIT, divert to P2 ---- */
+    if (s_coopMenu == CM_IDLE) {
+        if (MenuIsShotState(state)) {
+            int substate    = *(int *)(menu + MENU_OFF_SUBSTATE);
+            uint16_t cur     = *ADDR_MENU_IN_CUR, prev = *ADDR_MENU_IN_PREV;
+            int confirmEdge  = (cur & MENU_CONFIRM) &&
+                               ((cur & MENU_CONFIRM) != (prev & MENU_CONFIRM));
+            if (substate == 1 && confirmEdge && (*ADDR_MODE_FLAGS & 1) == 0) {
+                /* P1 just locked its shot type — orig would start the game now.
+                 * Capture P1's pick and send the menu back to char-select for P2. */
+                s_p1Char = *ADDR_CHAR_ID;     /* set during P1's char-select pass   */
+                s_p1Type = (int)*(uint32_t *)(menu + MENU_OFF_CURSOR); /* shot cursor */
+                if (s_p1Type < 0 || s_p1Type > 1) s_p1Type = 0;
+                *ADDR_TYPE_ID = (unsigned char)s_p1Type;   /* what orig would store  */
+                s_p2Sel = -1;                 /* fresh P2 selection for this game    */
+                s_allowDiffChar = 0;
+                MenuGotoState(menu, state - 1);            /* 6->5, 0xe->0xd          */
+                s_coopMenu = CM_P2_CHAR;
+                /* seed prev with currently-held keys so a held confirm (P1's Z, or
+                 * a held Space) reads as already-down, not a fresh edge */
+                s_menuPrev = (uint16_t)(*ADDR_MENU_IN_CUR | ReadP2MenuInput());
+                Log("coop-menu: P1 locked %s -> P2 character select",
+                    ADDR_SEL_NAMES[s_p1Char * 2 + s_p1Type]);
+            }
+        }
+        return s_origMenuDispatch(menuv);
+    }
+
+    /* ---- P2's pass: route P2 (and P1, as a helper) input into the menu ---- */
+    if (s_coopMenu == CM_P2_CHAR || s_coopMenu == CM_P2_SHOT) {
+        uint16_t realCur  = *ADDR_MENU_IN_CUR;
+        uint16_t realPrev = *ADDR_MENU_IN_PREV;
+        uint16_t combined = (uint16_t)(realCur | ReadP2MenuInput()); /* either player */
+
+        *ADDR_MENU_IN_PREV = s_menuPrev;
+        *ADDR_MENU_IN_CUR  = combined;
+        r = s_origMenuDispatch(menuv);
+        *ADDR_MENU_IN_CUR  = realCur;
+        *ADDR_MENU_IN_PREV = realPrev;
+        s_menuPrev = combined;
+
+        {
+            uint32_t newState = *(uint32_t *)(menu + MENU_OFF_STATE);
+            if (s_coopMenu == CM_P2_CHAR && MenuIsShotState(newState)) {
+                s_coopMenu = CM_P2_SHOT;                /* P2 confirmed its char     */
+                Log("coop-menu: P2 char=%d -> shot select", *ADDR_CHAR_ID);
+            } else if (s_coopMenu == CM_P2_SHOT && MenuIsCharState(newState)) {
+                s_coopMenu = CM_P2_CHAR;                /* P2 cancelled back to char */
+            } else if (s_coopMenu == CM_P2_SHOT && r == 0) {
+                /* P2's shot-type COMMIT (dispatcher returns 0 only on the start
+                 * path): orig set 645/646 to P2's pick and began the stage start.
+                 * Record P2's selection, then restore P1's globals so the engine
+                 * inits the static player as P1 (player init reads them later, at
+                 * the game scene — async from this drain). */
+                int p2char = *ADDR_CHAR_ID;
+                int p2type = *ADDR_TYPE_ID;
+                s_p2Sel = p2char * 2 + p2type;
+                s_allowDiffChar = (p2char != s_p1Char) ? 1 : 0;
+                *ADDR_CHAR_ID = (unsigned char)s_p1Char;
+                *ADDR_TYPE_ID = (unsigned char)s_p1Type;
+                *ADDR_SEL_ID  = (unsigned char)(s_p1Char * 2 + s_p1Type);
+                s_coopMenu = CM_COMMIT;
+                Log("coop-menu: P2 locked %s; P1=%s -> start (p2Sel=%d diff=%d)",
+                    ADDR_SEL_NAMES[s_p2Sel], ADDR_SEL_NAMES[s_p1Char * 2 + s_p1Type],
+                    s_p2Sel, s_allowDiffChar);
+            }
+        }
+        return r;
+    }
+
+    return s_origMenuDispatch(menuv);
+}
+
 static int InstallHooks(void)
 {
     if (MH_Initialize() != MH_OK) return 0;
@@ -1808,6 +2101,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_MENU_DISPATCH,  (LPVOID)&HookedMenuDispatch,  (LPVOID*)&s_origMenuDispatch)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
@@ -1819,6 +2113,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_COLLECT_OVERLAP)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_ITEM_LOOP)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_MENU_DISPATCH)  != MH_OK) return 0;
     return 1;
 }
 
@@ -1831,9 +2126,11 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         GetModuleFileNameA((HMODULE)hinst, s_dir, MAX_PATH);
         { char *s = strrchr(s_dir, '\\'); if (s) s[1] = '\0'; }
         { char p[MAX_PATH]; snprintf(p, sizeof(p), "%scoop_log.txt", s_dir); s_log = fopen(p, "w"); }
-        Log("th07_coop attached. AUTO-spawn P2 ~3s. P2: IJKL move, Space shot, U focus, O bomb. "
-            "F4=team-border, F5=boss-HP-scale, F6=sep-resources, F7=shot-damage, F8=killable, "
-            "F9=spawn, F10=despawn, F11=revive.");
+        Log("th07_coop attached. Menu char-select: P1 picks, then P2 picks with "
+            "IJKL move / Space confirm / O cancel; game starts after both. AUTO-spawn "
+            "P2 ~3s into the stage. In-stage P2: IJKL move, Space shot, U focus, O bomb. "
+            "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
+            "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, F11=revive.");
         if (!InstallHooks())
             MessageBoxA(NULL, "th07_coop: hook install failed (wrong build/addresses?)",
                         "th07_coop", MB_ICONERROR);

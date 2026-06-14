@@ -74,7 +74,20 @@ injector.exe "D:\Touhou 7 - Perfect Cherry Blossom\th07.exe"
 (or use `build/run_coop.bat`). The injector loads whichever DLL is configured —
 harness uses `harness.ini`, the netcode integration DLL uses `coop_net.ini`. For the
 co-op DLL: get into a stage, P2 auto-spawns after ~3 s; see the header comment in
-`src/coop/coop.c` for the live hotkeys (IJKL/Space/U/O = P2, F4–F11 = toggles).
+`src/coop/coop.c` for the live hotkeys (IJKL/Space/U/O = P2, F2–F12 = toggles).
+
+## Status (2026-06-14)
+- ✅ **EoSD-style menu character select**: P1 picks, then P2 picks its own char+type,
+  then the game starts (handoff §5g). Different-char P2 works (body/shots/bomb/lasers).
+- 🟡 **P2 icon HUD (§8a, PR #2)**: lives/bombs as P1-style `front.anm` icon sprites +
+  power number, drawn in ZUN's sidebar pass below the point-item line; F12 toggles to
+  the legacy text line. **Awaiting in-game visual confirm.**
+- 🟡 **"P2 SELECT" menu prompt (§8d, PR #2)**: on-screen cue during P2's pick. Position
+  tunable; awaiting visual confirm.
+- ✅ RE coverage extended (2026-06-14): HUD/sprite, enemy-bullet, and enemy systems now
+  mapped (`docs/th07_{hud_sprite,bullet,enemy}_system.md`); player shot/bomb offsets in
+  `th07_player_struct.md`. The ECL danmaku VM (`FUN_00410520`) is the lone function
+  Ghidra can't decompile in this dump — map it from another source.
 
 ## Status (2026-06-12)
 - ✅ Netcode core: built + unit-tested + **lockstep verified end-to-end** (`netsim`),

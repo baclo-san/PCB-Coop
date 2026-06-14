@@ -26,6 +26,9 @@ by an RNG-seed comparison every frame.
 - **`docs/th07_hud_sprite_system.md`** — the HUD/score-manager draw, the anm
   sprite-object layout + blit (`FUN_0044f770`), the sprite-batch flush, and the
   ascii text queue — the ground truth for drawing sprites/text from the DLL.
+- **`docs/th07_bullet_system.md`** — the enemy-bullet (danmaku) manager, per-bullet
+  struct map, spawn/update/draw fns, and the graze→hit collision gate that Fork B
+  rides.
 
 ## Layout
 | Path | What |

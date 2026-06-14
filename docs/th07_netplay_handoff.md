@@ -1217,6 +1217,51 @@ the ECL VM (get it from the user's fuller Desktop `th07.exe.c`, a raw disasm of
 still worth mapping next: the player shot/.sht + bomb dispatch (supports 8c), the
 item system, effects/particles, and the menu beyond char-select.
 
+### 5j — aim/suction nearer-player + per-player aim/homing source (2026-06-15)
+
+Two gameplay-targeting features, both committed on `main` (the latter awaits an
+in-game look — implemented per the decomp, no live host this session):
+
+- **Enemy aim + item suction now target the NEARER player (committed, user-confirmed
+  working).** The one choke point every "toward the player" direction flows through
+  is `Player::AngleToPlayer = FUN_00442370(this=player, pos)` (reads player+0x930/4,
+  returns the atan2 angle as x87 long double). Its callers are enemy aimed shots
+  (ECL 7825/8142, bullet fire 14298/14346, lasers 9591/14538) AND item-collection
+  suction (`FUN_00432990` @20399). `HookedAngleToPlayer` hands the original a
+  different `this` (the P2 object) when P2 is nearer to the fire/suction origin
+  `pos` than P1 (or P1 is a ghost) — so shots/items track whoever was closer. No
+  position/cache poking, no ECL-VM hook. This is the breakthrough the EoSD clean
+  decomp pointed at (`BulletManager::AngleProvokedPlayer` → one seam). The
+  `coop-enemy-aim-nearest-wip` memory hunt is **closed** by this.
+
+- **Per-player aim/homing SOURCE for P2 (committed, needs in-game look).** P2's
+  ReimuA homing amulets / SakuyaA aimed knives chased P1's target: the enemy update
+  (`FUN_00420620`, PCBdecomp 12904-12943) fills the homing/aim block at the static
+  P1 (`+0x2428` homing xyz, `+0x2434` aim xyz, `+0x2440` valid) using **P1's**
+  position, and coop.c mirrored it to P2. Now `BuildP2TargetBlock` replicates ZUN's
+  acquisition relative to **P2**: among bit6 (boss/lifebar) enemies pick nearest-in-X
+  for homing; SakuyaA additionally records the nearest enemy in the upward ±30° cone
+  as the aim target; popcorn falls back to lowest-enemy / in-cone (same valid-flag
+  semantics as ZUN). The enemy set is snapshotted **for free** from `HookedDamage`
+  (`FUN_0043d9e0(enemy+0x2b0c, …)` fires per damageable enemy → enemy base =
+  `pos-0x2b0c`), avoiding an enemy-manager-base pointer-walk (crash risk). Cone is
+  geometric (`dy<0 && |dx| ≤ -dy·tan30`) — no atan2/math.h dep. `FUN_0048bcaa` =
+  the x87 `fpatan` intrinsic, confirming ZUN's cone is `atan2(dy,dx)∈[-120°,-60°]`.
+  - **Never worse than the old mirror:** any channel P2 doesn't resolve this frame
+    (empty snapshot, e.g. a boss mid-invuln that isn't currently damageable) falls
+    back to mirroring P1's block.
+  - **Also fixes §8c cross-char SakuyaA aim** as a bonus: `BuildP2TargetBlock` gates
+    the cone on **P2's** character (`s_p2Sel`), not the global char id, and computes
+    independently of the engine's P1-only acquisition. So P2=SakuyaA aims per-player
+    even when P1≠Sakuya (the engine never fills an aim block then). The remaining §8c
+    note is retired.
+  - **To verify in-game:** (1) ReimuA P2 homing amulets prefer the boss nearest P2's
+    column (vs P1's); (2) SakuyaA P2 focused knives aim up at the enemy in P2's cone,
+    differing from P1's, both same-char and cross-char (P1≠Sakuya); (3) no perf hit
+    from the per-frame snapshot; (4) bombs (consumed at P2's draw, fresh) home
+    correctly, homing shots (consumed in P2's update) acceptably (1-frame source lag,
+    same as the old mirror). `s_perPlayerAim` default on (no hotkey; F-keys full).
+
 ---
 
 #### Original plan (kept for reference)
@@ -1350,12 +1395,13 @@ anm cleanly at menu-commit time (alongside the player anm) into its own
 never-reused slot, and swap/redirect the portrait id during P2's bomb only.
 LOW priority / polish; do not destabilize the working build chasing it.
 
-### 8c — SakuyaA cross-char per-player aim source  **[needs user]**
-SakuyaA's aimed (non-homing) shot uses an aim target filled by the enemy update
-keyed off the global char id, only into static P1's block. P2 currently mirrors
-P1's aim block each frame (works when P1 is also Sakuya). For a different-char
-P2=SakuyaA the aim source isn't per-player. Deferred by the user ("can do for
-now"); revisit if it matters.
+### 8c — SakuyaA cross-char per-player aim source  **[IMPLEMENTED 2026-06-15 (§5j) — needs in-game look]**
+SakuyaA's aimed shot used an aim target filled by the enemy update keyed off the
+GLOBAL char id, only into static P1's block; P2 mirrored it. Now `BuildP2TargetBlock`
+(handoff §5j) computes P2's homing AND aim target relative to P2's own position,
+gating the SakuyaA cone on P2's own character (`s_p2Sel`) rather than the global —
+so it is per-player both same-char and cross-char (P1≠Sakuya). The same change also
+gives ReimuA per-player homing. Verify the targeting feel in-game (see §5j).
 
 ### 8d — "P2 SELECT" on-screen prompt  **[DONE 2026-06-14 (§5h, PR #2) — visual tune pending]**
 During P2's menu pass there's no visual cue it's P2's turn. Add a prompt via the

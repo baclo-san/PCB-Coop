@@ -126,6 +126,8 @@
  *         sprite/script tables to P2 around its update+draw (live re-apply OK).
  *   F11 = debug instant-revive of a ghost P2 (the graze resurrection above is
  *         the real mechanic; this stays as a test shortcut).
+ *   F12 = toggle P2 HUD style: sprite ICONS that mirror P1's life/bomb rows
+ *         (default, handoff §8a) <-> the legacy ascii "P2xx Ln Bn Pn" text line.
  *
  * !!! ALL ADDRESSES are build-specific to th07.exe ver 1.00b
  * !!! SHA256 35467EAF8DC7FC85F024F16FB2037255F151CEFDA33CF4867BC9122AAA2E80CA
@@ -286,7 +288,12 @@ static ItemLoopFn_t      s_origItemLoop       = NULL;
 static volatile void *s_p2   = NULL;   /* P2 object base, NULL until spawned     */
 static int   s_p2Killable = 1;         /* on by default; F8 toggles              */
 static unsigned char s_p2PrevState = 0;/* for death-transition logging           */
-static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0, s_prevF5 = 0, s_prevF4 = 0, s_prevF3 = 0, s_prevF2 = 0;
+static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0, s_prevF5 = 0, s_prevF4 = 0, s_prevF3 = 0, s_prevF2 = 0, s_prevF12 = 0;
+/* P2 HUD style: 1 = sprite ICONS that mirror P1's life/bomb rows (handoff §8a);
+ * 0 = the legacy ascii "P2xx Ln Bn Pn" line. F12 toggles, so the icon HUD (which
+ * needs an in-game visual check this session couldn't do) has a known-good
+ * fallback. Default ON per the user spec. */
+static int   s_p2IconHud = 1;
 
 /* P2's own LIVES + BOMBS + POWER, field-swapped into the shared struct around P2's
  * update; ZUN's anti-tamper checksum is re-healed afterward (see the heal below).
@@ -397,6 +404,46 @@ static int s_lastScore = 0;            /* prev frame's team score; a DROP at a f
 typedef void (__cdecl *AsciiPrintFn_t)(void *mgr, float *pos, const char *fmt, ...);
 #define ADDR_ASCII_PRINT ((AsciiPrintFn_t)0x00402060)
 #define ADDR_ASCII_MGR   ((void *)0x0134ce18)
+
+/* ---- P1-style ICON HUD for P2 (handoff §8a) ----
+ * The in-game sidebar/score draw FUN_0042b603 (__fastcall, ECX = score-manager
+ * singleton 0x626270) paints the whole right-hand HUD onto a persistent surface:
+ * the dark background tiles redraw only on a "full-dirty" condition, and each
+ * value section (lives/bombs/power/...) redraws only when its 2-bit dirty field
+ * in *(singleton+4) is set. Lives are drawn as a ROW OF ICONS (one front.anm
+ * sprite per life) and bombs likewise; power + point-items are ascii numbers.
+ *   Life-icon sprite object: *(singleton+8) [= the score data struct, *0x626278]
+ *     + 0x14ac. Bomb-icon object: + 0x16f8. Each is a baked anm sprite already
+ *     bound to the correct front.anm id; the draw just writes screen X/Y/scale at
+ *     +0x1c8 / +0x1cc / +0x1d0 and calls the sprite blit FUN_0044f770(obj).
+ *   ZUN's P1 rows: X origin 496, +16px per icon, lives Y=96, bombs Y=112,
+ *     icon scale 0x3eeb851f; power number at (496,160); point-items "%d/%d" at
+ *     (496,176). (PCBdecomp.c FUN_0042b603 @16832; sprite blit FUN_0044f770 @33506.)
+ * We hook FUN_0042b603, FORCE the full sidebar redraw each frame (set the redraw
+ * flag at struct+0x1d70, one of the OR-terms of the 16943 condition) so a P2
+ * count DROP can't leave a stale icon on the persistent surface, let the original
+ * paint P1's HUD, then append P2's life/bomb icon quads + power number BELOW the
+ * point-item line. FUN_0044f770 self-validates the object (no-ops if unbound), so
+ * the calls are crash-safe. F12 falls back to the legacy ascii text line. */
+#define ADDR_HUD_DRAW    ((LPVOID)0x0042b603)   /* __fastcall(ecx = score singleton) */
+#define ADDR_SPRITE_BLIT ((SpriteBlitFn_t)0x0044f770) /* __cdecl(spriteObj)          */
+#define HUD_OFF_LIFE_ICON 0x14ac   /* score-struct off: baked life-icon sprite object */
+#define HUD_OFF_BOMB_ICON 0x16f8   /* score-struct off: baked bomb-icon sprite object */
+#define HUD_OFF_REDRAW    0x1d70   /* score-struct off: nonzero => full sidebar redraw */
+#define HUD_SPR_X         0x1c8    /* sprite-object off: screen X (float)              */
+#define HUD_SPR_Y         0x1cc    /* sprite-object off: screen Y (float)              */
+#define HUD_SPR_Z         0x1d0    /* sprite-object off: scale/Z (float)               */
+#define HUD_ICON_SCALE    0x3eeb851fu  /* ZUN's life/bomb icon scale (~0.46)          */
+#define HUD_ICON_X        496.f    /* same column as P1's rows                         */
+#define HUD_ICON_STEP     16.f     /* per-icon X step                                 */
+#define HUD_P2_LIVES_Y    192.f    /* just below P1's point-item line (Y=176)          */
+#define HUD_P2_BOMBS_Y    208.f    /* P1's 16px row rhythm continued                   */
+#define HUD_P2_POWER_Y    224.f
+#define HUD_P2_LABEL_X    472.f    /* "2P" marker left of the icon row                */
+#define HUD_ICON_MAX      9        /* clamp icon count so a row can't overrun         */
+typedef int  (__cdecl   *SpriteBlitFn_t)(void *spriteObj);
+typedef void (__fastcall *HudDrawFn_t)(void *singleton);
+static HudDrawFn_t s_origHudDraw = NULL;
 
 /* Graze credit leaf FUN_0043eb90: __thiscall(player, float *grazed_pos) — bumps
  * the graze counters, spawns the graze spark at the midpoint, queues the graze
@@ -1332,6 +1379,7 @@ static void PollHotkeys(void)
     int f11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     int f3  = (GetAsyncKeyState(VK_F3)  & 0x8000) != 0;
     int f2  = (GetAsyncKeyState(VK_F2)  & 0x8000) != 0;
+    int f12 = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
     if (f9  && !s_prevF9)  { Log("F9 edge detected");  SpawnP2(); }
     if (f3  && !s_prevF3) {
         int cur = (s_p2Sel < 0) ? *ADDR_SEL_ID : s_p2Sel;
@@ -1358,6 +1406,7 @@ static void PollHotkeys(void)
         Log("F11 edge detected");
         if (s_p2Ghost) ReviveP2(); else if (s_p1Ghost) ReviveP1();
     }
+    if (f12 && !s_prevF12) { s_p2IconHud = !s_p2IconHud; Log("P2 HUD style -> %s", s_p2IconHud ? "ICONS" : "TEXT"); }
     s_prevF9  = f9;
     s_prevF10 = f10;
     s_prevF8  = f8;
@@ -1368,6 +1417,7 @@ static void PollHotkeys(void)
     s_prevF11 = f11;
     s_prevF3  = f3;
     s_prevF2  = f2;
+    s_prevF12 = f12;
 }
 
 /* ---- collision detours: make P2 killable ----
@@ -1880,7 +1930,8 @@ static void DrawCoopHud(void *p2)
     pos[1] = 296.f;
     if (s_p2Ghost)
         ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P2 GHOST");
-    else {
+    else if (!s_p2IconHud) {
+        /* legacy text readout — replaced by the icon HUD (HookedHudDraw) when ON */
         int psel = (s_p2Sel >= 0 ? s_p2Sel : *ADDR_SEL_ID);
         char ch = "RMS"[(psel / 2) % 3];          /* Reimu/Marisa/Sakuya       */
         ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "P2%c%c L%d B%d P%d",
@@ -1903,6 +1954,49 @@ static void DrawCoopHud(void *p2)
                          SHARE_FRAMES);
     }
     (void)p2;
+}
+
+/* Draw ONE row of `count` icons (the baked sprite object at `iconObj`) starting
+ * at (HUD_ICON_X, y), stepping HUD_ICON_STEP px right per icon. The blit reads
+ * X/Y/scale straight off the sprite object, so we set them before each call. */
+static void DrawIconRow(char *iconObj, int count, float y)
+{
+    int i;
+    if (count > HUD_ICON_MAX) count = HUD_ICON_MAX;
+    for (i = 0; i < count; i++) {
+        *(float *)(iconObj + HUD_SPR_X) = HUD_ICON_X + HUD_ICON_STEP * (float)i;
+        *(float *)(iconObj + HUD_SPR_Y) = y;
+        *(uint32_t *)(iconObj + HUD_SPR_Z) = HUD_ICON_SCALE;
+        ADDR_SPRITE_BLIT(iconObj);
+    }
+}
+
+/* §8a: P1-style icon HUD for P2, drawn in ZUN's own sidebar pass (full-screen
+ * viewport, HUD render target) so the coords/clip match P1's rows exactly. */
+static void __fastcall HookedHudDraw(void *self)
+{
+    void *p2  = (void *)s_p2;
+    void *res = (void *)*ADDR_RES_PTR;
+
+    /* Force the full sidebar redraw this frame so a dropped P2 life/bomb can't
+     * leave a stale icon on the persistent HUD surface (clears P2's row region,
+     * which the bg tiles at x416..624 / y16..464 cover, then repaints P1). */
+    if (s_p2IconHud && p2 && !s_p2Ghost && res)
+        *(int *)((char *)res + HUD_OFF_REDRAW) = 1;
+
+    s_origHudDraw(self);                      /* ZUN paints P1's full HUD */
+
+    if (s_p2IconHud && p2 && !s_p2Ghost && res) {
+        DrawIconRow((char *)res + HUD_OFF_LIFE_ICON, (int)s_p2Lives, HUD_P2_LIVES_Y);
+        DrawIconRow((char *)res + HUD_OFF_BOMB_ICON, (int)s_p2Bombs, HUD_P2_BOMBS_Y);
+        {   /* "2P" marker + power number (ascii, to the backbuffer like P1's) */
+            float pos[3];
+            pos[0] = HUD_P2_LABEL_X; pos[1] = HUD_P2_LIVES_Y; pos[2] = 0.f;
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "2P");
+            pos[0] = HUD_ICON_X;     pos[1] = HUD_P2_POWER_Y;
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "%d", (int)s_p2Power);
+        }
+    }
 }
 
 static int __fastcall HookedDraw(void *self)
@@ -2118,6 +2212,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
     if (MH_CreateHook(ADDR_MENU_DISPATCH,  (LPVOID)&HookedMenuDispatch,  (LPVOID*)&s_origMenuDispatch)  != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_HUD_DRAW,       (LPVOID)&HookedHudDraw,       (LPVOID*)&s_origHudDraw)       != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
@@ -2130,6 +2225,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_ITEM_LOOP)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;
     if (MH_EnableHook(ADDR_MENU_DISPATCH)  != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_HUD_DRAW)       != MH_OK) return 0;
     return 1;
 }
 
@@ -2146,7 +2242,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "IJKL move / Space confirm / O cancel; game starts after both. AUTO-spawn "
             "P2 ~3s into the stage. In-stage P2: IJKL move, Space shot, U focus, O bomb. "
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
-            "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, F11=revive.");
+            "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
+            "F11=revive, F12=HUD-style(icons/text).");
         if (!InstallHooks())
             MessageBoxA(NULL, "th07_coop: hook install failed (wrong build/addresses?)",
                         "th07_coop", MB_ICONERROR);
@@ -2154,7 +2251,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             Log("hooks installed (update @0x441fb0, draw @0x4420b0, "
                 "collide-bullet @0x43e260, collide-laser @0x43e6b0, graze @0x43e3b0, "
                 "damage @0x43d9e0, collect-overlap @0x43e4e0, item-loop @0x432990, "
-                "border-break @0x441bd0)");
+                "border-break @0x441bd0, hud-draw @0x42b603)");
         break;
     case DLL_PROCESS_DETACH:
         if (s_log) { Log("detach"); fclose(s_log); }

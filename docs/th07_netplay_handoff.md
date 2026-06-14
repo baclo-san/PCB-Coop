@@ -1266,6 +1266,18 @@ DInput_Init=FUN_004383d8, FrameGovernor=FUN_004346e0, GameUpdate=FUN_0042fd60, G
 ReplayRecord=FUN_00442cd0, ReplayPlayback=FUN_00442ee0, ScoreCherryDisplay=FUN_00427f22.
 (Renaming these in Ghidra + the input/cherry globals is a cheap, high-value early task.)
 
+**Mapped 2026-06-14 (see the new RE docs):**
+HudDraw=FUN_0042b603 (singleton 0x626270), SpriteBlit=FUN_0044f770,
+SpriteBatchFlush=FUN_0044f5c0, AsciiPrint=FUN_00402060 (mgr 0x0134ce18) —
+`docs/th07_hud_sprite_system.md`. BulletMgrUpdate=FUN_00425a50,
+BulletMgrDraw=FUN_00426f60, BulletSpawn=FUN_00423730 (mgr 0x0062f958, array
++0xb8c0, stride 0xd68) — `docs/th07_bullet_system.md`. EnemyUpdate=FUN_00420620
+(enemy array in the 0x954xxx globals; pos +0x2b0c, box +0x2b3c/+0x2b48, state
+byte +0x2e29 [bit0 alive, bit1 collidable, bit3 invuln, bit4 takes-damage,
+bit6 boss], multi-hitbox +0x4f30/+0x4f34, per-frame shot-damage via
+FUN_0043d9e0 @12822 — see `docs/th07_boss_hp_scaling.md`; full enemy struct map
+is a good next RE target, only entry points pinned so far).
+
 ## 8. Goals / TODO (next sessions)
 
 Ordered by the user's priority. Items marked **[autonomous-ok]** can be drafted

@@ -1413,7 +1413,19 @@ Implementation pointers (RE first, don't guess offsets):
   sprite ids; the icons live in the front/HUD anm (`front.anm`, slot 0x15, base
   0x600 — see the FUN_0044df90 table). Resolve the real ids from the decomp.
 
-### 8b — Bomb-declaration portrait for a different-char P2  **[2nd attempt REVERTED 2026-06-15 (§5j); same regression as round-13b]**
+### 8b — Bomb-declaration portrait for a different-char P2  **[RESOLVED via SUPPRESSION 2026-06-15 (commit ec1955f); correct-face load still open]**
+**Shipped fallback (user-accepted): hide the wrong face instead of loading P2's.**
+A different-char P2's bomb declaration showed P1's face; rather than load P2's face
+(the unsolved glyph problem below), we now HIDE just the face for a P2 declaration
+and keep the spell name + bar + sound. `HookedDeclMake` (FUN_0042868d create, runs in
+P2's update window) flags the live declaration as P2's via `s_inP2Update && s_p2AnmActive`;
+`HookedDeclDraw` (FUN_0042c577) clears the face-block draw-gate bit `declBase+0x590c & 1`
+(PCBdecomp 17300-17304) around the original and restores it — the name block (gated
+separately at +0x66d4) still draws, P1 is never touched, no anm load/swap so zero §8b
+corruption risk. Default on (`s_hideP2Portrait`). **Awaiting in-game confirm.** The
+correct-face-for-P2 goal is still open below (low priority; the suppression covers the
+visible bug).
+
 2nd attempt (commit c7741e4) **regressed identically to round-13b and was reverted**
 (f850120). User test (P1=ReimuA + P2=SakuyaA): at the P2 spawn, P1 renders as glyph
 sprites, P2 is invisible (still grazeable), and P1 shooting crashes. **What this rules

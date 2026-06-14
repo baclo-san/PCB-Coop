@@ -1189,6 +1189,30 @@ too — not just in-stage. Position is `MENU_PROMPT_X/Y` (#defines, tune visuall
   a life or bombs; (3) no perf hit from the forced redraw; (4) the `2P`/power
   text sits where intended. Tune the `HUD_*` #defines if positions are off.
 
+### 5i — general RE mapping pass + dump-completeness note (2026-06-14 overnight)
+
+After 8a/8d, spent the rest of the unattended window mapping core systems the
+repo hadn't documented (per the user's "map more of PCB" directive). New docs:
+- **`docs/th07_hud_sprite_system.md`** — HUD/score draw `FUN_0042b603`, the anm
+  sprite-object layout + blit `FUN_0044f770`, the batch flush `FUN_0044f5c0`, the
+  ascii text queue `FUN_00402060`. (Basis for 8a; also for the 8b portrait.)
+- **`docs/th07_bullet_system.md`** — enemy-bullet manager (singleton 0x0062f958),
+  per-bullet struct (stride 0xd68, pos +0xb8c, graze flag +0xc01…), spawn
+  `FUN_00423730`, update `FUN_00425a50`, draw `FUN_00426f60`.
+- **`docs/th07_enemy_system.md`** — enemy manager/array (slots stride 0x4f48 in the
+  0x954xxx region), per-enemy struct, the ECL-VM tick `FUN_00410520`, death
+  `FUN_004202d0`, and the shot-damage sweep `FUN_0043d9e0` co-op scales.
+
+**Dump-completeness finding:** `PCBdecomp.c` has exactly **ONE** function Ghidra
+couldn't lift — `FUN_00410520` (the **ECL danmaku VM**, "Unable to decompile" at
+line 8840). Everything else is present. The other genuinely-absent pieces are the
+top-level loop fns noted in `fork_a` §6 (frame governor `FUN_004346e0`, task-chain
+mgr `0x626218`). So the highest-value un-mapped systems all live OUTSIDE this dump:
+the ECL VM (get it from the user's fuller Desktop `th07.exe.c`, a raw disasm of
+0x410520, or community thtk/ECL docs) and the frame governor. In-dump systems
+still worth mapping next: the player shot/.sht + bomb dispatch (supports 8c), the
+item system, effects/particles, and the menu beyond char-select.
+
 ---
 
 #### Original plan (kept for reference)

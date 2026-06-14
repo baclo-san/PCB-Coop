@@ -88,7 +88,12 @@ Verified from `FUN_00420620` (12664-13099) unless noted.
 
 ## 5. Open / next RE
 - The **ECL VM** (`FUN_00410520` + the opcode table) — the scripting language that
-  drives every enemy/boss pattern. Big; the single highest-value remaining map.
+  drives every enemy/boss pattern. **⚠️ NOT available in this dump:** Ghidra emits
+  `Unable to decompile 'FUN_00410520'` (PCBdecomp.c:8840) — almost certainly a
+  huge computed-goto opcode dispatch it couldn't lift. Mapping it needs either the
+  user's fuller Desktop `th07.exe.c` db, a raw disassembly of 0x410520, or the
+  public thtk/ECL format docs (PCB ECL is well-documented in the touhou RE
+  community). Don't burn time trying to read it from PCBdecomp.c.
 - The 8-byte gap between the first slot (`+0x4f50`) and the stride (`0x4f48`) is
   just header alignment — not re-derived here.
 - Boss-specific fields (spell-card timer, name plate, the `+0x424`/`+0x498`

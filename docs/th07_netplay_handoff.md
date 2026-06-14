@@ -1262,6 +1262,34 @@ in-game look — implemented per the decomp, no live host this session):
     correctly, homing shots (consumed in P2's update) acceptably (1-frame source lag,
     same as the old mirror). `s_perPlayerAim` default on (no hotkey; F-keys full).
 
+- **Character-specific bomb-declaration PORTRAIT for a different-char P2 (committed,
+  needs in-game look).** 2nd attempt at §8b (round-13b regressed→reverted). The
+  portrait is `data/face_{rm,mr,sk}00.anm`, loaded by the engine at base 0x4a0 into
+  slot 0x19 for the GLOBAL char only (`FUN_0044df90`, PCBdecomp 15833/43/53); the
+  player face id window is **[0x4a0,0x4ad)** (boss faces start at 0x4ad). Created by
+  `FUN_0042868d` (a bomb cb; sets the portrait sprite, UV cached at set-time) and —
+  **the key new finding** — drawn in **`FUN_0042c577` (@0x42c577, PCBdecomp 17301)**,
+  NOT the `0x42b603` round-13b hooked (the likely regression cause). Implementation:
+  a **parallel** face overlay (a copy of the proven player-anm overlay, NOT a refactor
+  of it — working-build discipline) — `LoadP2FaceAnm` loads P2's face into its own
+  spare slot at the CLEAN stage-start point (`ApplyP2Selection`/`SpawnP2`, no live
+  entities — the round-13c lesson), diff-captures the ids, restores P1's tables;
+  in-stage only SWAPS. `SwapFace` exchanges the portrait ids to P2 around (a) P2's
+  update+draw window (create-time UV) and (b) `FUN_0042c577` when the live
+  declaration is P2's. Ownership via hooking the create fn `FUN_0042868d`
+  (`HookedDeclMake`, the proven `__fastcall`-models-`__thiscall` pattern): whoever's
+  update/draw window created it owns it. Best-effort + isolated: a face-load failure
+  / engine slot reuse retires the overlay (P2 shows P1's face, no crash); default-on
+  (`s_p2Portrait`); freed on despawn/session reset; **`git revert c7741e4` restores
+  the prior build** if it regresses.
+  - **To verify in-game** (different-char team, e.g. P1 Reimu + P2 Marisa/Sakuya):
+    (1) P2 bombs → the big spell portrait + name shows P2's char's face, not P1's;
+    (2) P1 bombs → still P1's face; (3) both bomb near-simultaneously → no glitch;
+    (4) **regression guard:** P1 + bullets/bomb textures still render correctly (the
+    round-13b failure was glyph-sprite corruption); (5) stage transition + revive
+    with a different-char P2 still clean. If the portrait is wrong for a specific
+    char, the face-load log line (`P2 face anm: … N ids …`) shows what was captured.
+
 ---
 
 #### Original plan (kept for reference)
@@ -1385,15 +1413,18 @@ Implementation pointers (RE first, don't guess offsets):
   sprite ids; the icons live in the front/HUD anm (`front.anm`, slot 0x15, base
   0x600 — see the FUN_0044df90 table). Resolve the real ids from the decomp.
 
-### 8b — Bomb-declaration portrait for a different-char P2  **[needs user]**
-When P2 bombs as a different char than P1, the big spell portrait shows P1's
-face. The portrait is a separate char-specific anm (`face_{rm,mr,sk}00.anm` @
-base 0x4a0, id 0x4a1), created by `FUN_0042868d`, drawn globally by
-`FUN_0042b603` when `DAT_00575ab4 != 0`, keyed off the GLOBAL char id. Prior
-mid-stage overlay attempts regressed (round-13b). Right approach: load P2's face
-anm cleanly at menu-commit time (alongside the player anm) into its own
-never-reused slot, and swap/redirect the portrait id during P2's bomb only.
-LOW priority / polish; do not destabilize the working build chasing it.
+### 8b — Bomb-declaration portrait for a different-char P2  **[IMPLEMENTED 2026-06-15 (§5j, commit c7741e4) — needs in-game look]**
+2nd attempt (round-13b regressed→reverted). Corrected the draw seam — the portrait
+blits in **`FUN_0042c577` (@0x42c577, PCBdecomp 17301)**, not the `0x42b603`
+round-13b hooked — and moved the face-anm load to the CLEAN stage-start point via a
+**parallel** face overlay (a copy of the player-anm overlay, not a refactor):
+`LoadP2FaceAnm` loads `data/face_{rm,mr,sk}00.anm` at base 0x4a0 (id window
+[0x4a0,0x4ad)) into a spare slot, diff-captures, restores P1's tables; `SwapFace`
+swaps the portrait ids to P2 around P2's update/draw (create-time UV) and
+`FUN_0042c577` (draw-time texture) when the live declaration is P2's
+(`HookedDeclMake` on `FUN_0042868d` attributes ownership). Best-effort/isolated:
+a load failure leaves P2 showing P1's face; `git revert c7741e4` restores the prior
+build. See §5j for the full design + the in-game verification checklist.
 
 ### 8c — SakuyaA cross-char per-player aim source  **[IMPLEMENTED 2026-06-15 (§5j) — needs in-game look]**
 SakuyaA's aimed shot used an aim target filled by the enemy update keyed off the

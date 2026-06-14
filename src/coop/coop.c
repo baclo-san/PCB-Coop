@@ -591,6 +591,11 @@ static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch             
 static void *s_enemySnap[COOP_MAX_ENEMY_SNAP]; /* enemy base ptrs, this frame     */
 static int   s_enemyCount = 0;
 static int   s_perPlayerAim = 1;       /* per-player homing/aim source (default on)*/
+/* P2 bomb-declaration portrait suppression (different-char P2); see the hooks
+ * near HookedDamage. Declared here so DespawnP2 (earlier in the file) can reset. */
+static int   s_hideP2Portrait   = 1;   /* hide P2's wrong bomb face (default on)   */
+static int   s_declSuppressFace = 0;   /* live declaration is a different-char P2's*/
+static int   s_declSuppressLogged = 0;
 
 /* ---- P2 SHOT-TYPE SELECT (charselect stage 1: same character, own A/B) ----
  * The engine keeps the chosen loadout in three globals and a per-player cache:
@@ -1169,6 +1174,7 @@ static void DespawnP2(void)
     if (!p2) return;
     s_p2 = NULL;                            /* stop piggyback FIRST */
     s_enemyCount = 0;                       /* drop the enemy snapshot (stale ptrs) */
+    s_declSuppressFace = 0;                 /* no P2 declaration to hide once gone   */
     SwapAnm(0);                             /* ensure tables are P1's before free */
     FreeP2CharAnm();
     KillP2FocusFx();
@@ -1636,6 +1642,58 @@ static void __fastcall HookedItemLoop(void *self)
     s_itemMgr = self;                   /* captured for DropOneUp */
     s_origItemLoop(self);
     RestoreHeldRes();
+}
+
+/* ---- suppress P2's bomb-declaration portrait (different-char P2) ----
+ * The bomb spell declaration shows the GLOBAL char's face from data/face_*00.anm
+ * (loaded once for P1's char at stage start). For a DIFFERENT-char P2 that face
+ * is wrong, and loading P2's face is the unsolved §8b problem. So instead we HIDE
+ * just the face portrait for a P2 declaration, keeping the spell name + bar + bomb
+ * sound — informative and crash-free (no anm load/swap, just a draw-gate bit).
+ *   create  FUN_0042868d(this, faceSprite, name) runs inside the bomb cb, i.e.
+ *           inside P2's update window -> s_inP2Update marks ownership.
+ *   draw    FUN_0042c577(this) draws the player portrait block only when
+ *           declBase+0x590c bit0 is set (PCBdecomp 17300-17304). We clear that bit
+ *           around the original when the live declaration is a different-char P2's,
+ *           then restore it; the spell-name block (gated separately at +0x66d4,
+ *           17323) is untouched and still draws. P1's declaration is never changed. */
+typedef void (__fastcall *DeclMakeFn_t)(void *self, void *edx, int faceSprite, char *name);
+typedef void (__fastcall *DeclDrawFn_t)(void *self);
+#define ADDR_DECL_MAKE    ((LPVOID)0x0042868d) /* __thiscall(this,faceSprite,name) */
+#define ADDR_DECL_DRAW    ((LPVOID)0x0042c577) /* __fastcall(ecx = decl manager)   */
+#define DECL_OBJ_OFF      8        /* this+8 -> the UI object base                 */
+#define DECL_PORTRAIT_FLG 0x590c   /* declBase+: bit0 gates the face-portrait draw */
+static DeclMakeFn_t s_origDeclMake = NULL;
+static DeclDrawFn_t s_origDeclDraw = NULL;
+/* s_hideP2Portrait / s_declSuppressFace / s_declSuppressLogged declared earlier
+ * (near s_perPlayerAim) so DespawnP2 can clear the flag. */
+
+static void __fastcall HookedDeclMake(void *self, void *edx, int faceSprite, char *name)
+{
+    s_origDeclMake(self, edx, faceSprite, name);
+    /* whoever's update window we're in owns this declaration; only a different-char
+     * P2 (s_p2AnmActive) shows the wrong face and needs hiding. */
+    s_declSuppressFace = (s_hideP2Portrait && s_inP2Update && s_p2AnmActive) ? 1 : 0;
+    if (s_declSuppressFace && !s_declSuppressLogged) {
+        Log("decl portrait: hiding P2's bomb face (P2 is a different char)");
+        s_declSuppressLogged = 1;
+    }
+}
+
+static void __fastcall HookedDeclDraw(void *self)
+{
+    if (s_declSuppressFace && self) {
+        uint32_t declBase = *(uint32_t *)((char *)self + DECL_OBJ_OFF);
+        if (declBase) {
+            volatile uint32_t *flg = (volatile uint32_t *)(declBase + DECL_PORTRAIT_FLG);
+            uint32_t saved = *flg;
+            *flg = saved & ~1u;          /* hide the face block for this draw only */
+            s_origDeclDraw(self);
+            *flg = saved;                /* restore — never permanently corrupt    */
+            return;
+        }
+    }
+    s_origDeclDraw(self);
 }
 
 /* ---- boss/enemy HP scaling detour (damage-side) ----
@@ -2474,6 +2532,8 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_MENU_DISPATCH,  (LPVOID)&HookedMenuDispatch,  (LPVOID*)&s_origMenuDispatch)  != MH_OK) return 0;
     if (MH_CreateHook(ADDR_HUD_DRAW,       (LPVOID)&HookedHudDraw,       (LPVOID*)&s_origHudDraw)       != MH_OK) return 0;
     if (MH_CreateHook((LPVOID)ADDR_ANGLE_TO_PLAYER, (LPVOID)&HookedAngleToPlayer, (LPVOID*)&s_origAngleToPlayer) != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_DECL_MAKE,      (LPVOID)&HookedDeclMake,      (LPVOID*)&s_origDeclMake)      != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_DECL_DRAW,      (LPVOID)&HookedDeclDraw,      (LPVOID*)&s_origDeclDraw)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
@@ -2488,6 +2548,8 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_MENU_DISPATCH)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_HUD_DRAW)       != MH_OK) return 0;
     if (MH_EnableHook((LPVOID)ADDR_ANGLE_TO_PLAYER) != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_DECL_MAKE)      != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
     return 1;
 }
 

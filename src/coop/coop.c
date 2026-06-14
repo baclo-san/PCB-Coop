@@ -1345,7 +1345,7 @@ static void GrazeFeedback(void *player, float *pos)
  * reviving P2 AND P2 reviving P1. Runs while the shared struct holds P1's
  * values (after the P2 field-swap restore), so a P1 donation is a direct
  * write + checksum re-heal — the same proven pattern as the swap. */
-#define REVIVE_RADIUS  24.0f
+#define REVIVE_RADIUS  32.0f
 #define REVIVE_FRAMES  90
 #define REVIVE_TICK     6          /* graze-feedback cadence while channeling */
 
@@ -1737,7 +1737,7 @@ static int __fastcall HookedDamage(void *self, void *edx,
     }
 
     if (s_bossHpScale && s_p2 && r > 0) {
-        r /= 2;                              /* player count (3P: divide by 3) */
+        r = (int)(r * 0.6f);                 /* 2P team DPS damper (was /2) */
         if (r == 0) r = 1;
     }
     return r;

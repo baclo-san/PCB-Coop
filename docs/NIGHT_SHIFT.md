@@ -33,3 +33,11 @@ prototype "P2 fades near P1" single-machine, but the real asymmetry needs #1.
   name — committed, user-confirmed.
 - Damage modifier: halving -> **0.6** (`HookedDamage`, `r = (int)(r*0.6f)`).
 - Revival graze range: 24 -> **32px** (`REVIVE_RADIUS`).
+
+## Stretch (when above are done)
+- **3P expansion:** generalize the P2 piggyback to P3 (clone #2, own input word,
+  own res field-swap, own anm overlay slot, own target block). Damage modifier
+  becomes /N (3P = 0.4-ish). The /2 and `s_p2*` pairs are the template.
+- **Total RE:** finish the ECL VM (`FUN_00410520` opcode table — see
+  `th07_enemy_system.md` §5; use thtk/public ECL docs, not PCBdecomp), then map
+  remaining boss-specific fields + the anm chained-slot/texture internals (§8b).

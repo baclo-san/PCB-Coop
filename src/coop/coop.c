@@ -290,9 +290,10 @@ static int   s_p2Killable = 1;         /* on by default; F8 toggles             
 static unsigned char s_p2PrevState = 0;/* for death-transition logging           */
 static int   s_prevF9 = 0, s_prevF10 = 0, s_prevF8 = 0, s_prevF7 = 0, s_prevF6 = 0, s_prevF11 = 0, s_prevF5 = 0, s_prevF4 = 0, s_prevF3 = 0, s_prevF2 = 0, s_prevF12 = 0;
 /* P2 HUD style: 1 = sprite ICONS that mirror P1's life/bomb rows (handoff §8a);
- * 0 = the legacy ascii "P2xx Ln Bn Pn" line. F12 toggles, so the icon HUD (which
- * needs an in-game visual check this session couldn't do) has a known-good
- * fallback. Default ON per the user spec. */
+ * 0 = the legacy ascii "P2xx Ln Bn Pn" line. F12 toggles (text is the fallback).
+ * Icons now draw from CAPTURED copies of ZUN's life/bomb icon objects (snapshot
+ * at HUD-draw entry, see CaptureIconTemplates) instead of poking ZUN's live
+ * structs -- the latter crashed non-deterministically (2026-06-14). */
 static int   s_p2IconHud = 1;
 
 /* P2's own LIVES + BOMBS + POWER, field-swapped into the shared struct around P2's
@@ -425,11 +426,20 @@ typedef void (__cdecl *AsciiPrintFn_t)(void *mgr, float *pos, const char *fmt, .
  * paint P1's HUD, then append P2's life/bomb icon quads + power number BELOW the
  * point-item line. FUN_0044f770 self-validates the object (no-ops if unbound), so
  * the calls are crash-safe. F12 falls back to the legacy ascii text line. */
-#define ADDR_HUD_DRAW    ((LPVOID)0x0042b603)   /* __fastcall(ecx = score singleton) */
-#define ADDR_SPRITE_BLIT ((SpriteBlitFn_t)0x0044f770) /* __cdecl(spriteObj)          */
-#define HUD_OFF_LIFE_ICON 0x14ac   /* score-struct off: baked life-icon sprite object */
-#define HUD_OFF_BOMB_ICON 0x16f8   /* score-struct off: baked bomb-icon sprite object */
-#define HUD_OFF_REDRAW    0x1d70   /* score-struct off: nonzero => full sidebar redraw */
+#define ADDR_HUD_DRAW     ((LPVOID)0x0042b603)   /* __fastcall(ecx = score singleton) */
+#define ADDR_SPRITE_BLIT  ((SpriteBlitFn_t)0x0044f770)  /* AnmManager::Draw, __thiscall(ecx=mgr, obj) */
+#define ADDR_SPRITE_FLUSH ((SpriteFlushFn_t)0x0044f5c0) /* __fastcall(anmMgr) draw+reset batch */
+#define ADDR_SPRITE_MGR   ((volatile uint32_t *)0x004b9e44) /* -> anm sprite-batch mgr base   */
+/* Sidebar redraw-request counter (DAT_00575ab4): ZUN sets it to 2 whenever a HUD
+ * value changes and decrements it each frame; while it's nonzero FUN_0042b603
+ * fully redraws the cached sidebar panel (bg tiles + every element). We keep it
+ * >=2 every frame P2 is live so the panel is cleared+repainted each frame -- the
+ * fix for P2's own per-frame text (power, GHOST/REVIVE) smearing on a stale panel.
+ * It's a plain global ZUN writes constantly, so setting it here is safe. */
+#define ADDR_HUD_REDRAW_REQ ((volatile int *)0x00575ab4)
+#define HUD_OFF_LIFE_ICON 0x14ac   /* *(hud+8) off: baked life-icon sprite object */
+#define HUD_OFF_BOMB_ICON 0x16f8   /* *(hud+8) off: baked bomb-icon sprite object */
+#define HUD_OFF_REDRAW    0x1d70   /* *(hud+8) off: nonzero => full sidebar redraw */
 #define HUD_SPR_X         0x1c8    /* sprite-object off: screen X (float)              */
 #define HUD_SPR_Y         0x1cc    /* sprite-object off: screen Y (float)              */
 #define HUD_SPR_Z         0x1d0    /* sprite-object off: scale/Z (float)               */
@@ -441,9 +451,27 @@ typedef void (__cdecl *AsciiPrintFn_t)(void *mgr, float *pos, const char *fmt, .
 #define HUD_P2_POWER_Y    224.f
 #define HUD_P2_LABEL_X    472.f    /* "2P" marker left of the icon row                */
 #define HUD_ICON_MAX      9        /* clamp icon count so a row can't overrun         */
-typedef int  (__cdecl   *SpriteBlitFn_t)(void *spriteObj);
+/* FUN_0044f770 is AnmManager::Draw(AnmVm*) -- a __thiscall method: ecx = the anm
+ * manager (*0x4b9e44), the sprite object on the stack. ZUN sets ecx every call;
+ * we MUST too (the appender derefs the manager via that ecx, e.g. mgr+0x2e4cc).
+ * GCC has no __thiscall keyword for C, so we emulate it with __fastcall: arg1->ecx
+ * (manager), arg2->edx (dummy, unused by the callee), arg3->stack (object). Stack
+ * cleanup matches (callee pops the single stack arg in both conventions). */
+typedef int  (__fastcall *SpriteBlitFn_t)(void *mgr, int edx, void *spriteObj);
+typedef void (__fastcall *SpriteFlushFn_t)(void *anmMgr);
 typedef void (__fastcall *HudDrawFn_t)(void *singleton);
 static HudDrawFn_t s_origHudDraw = NULL;
+#define SPR_OBJ_SIZE     0x24c                  /* HUD sprite-object stride (0x14ac->0x16f8)*/
+#define SPR_OFF_FLAGS    0x1c0                  /* sprite-obj: draw-enable bits (b0|b1) + flip*/
+#define SPR_OFF_ANM      0x1e4                  /* sprite-obj: bound anm sprite-entry ptr  */
+/* We draw P2's life/bomb rows by re-blitting ZUN's OWN live icon objects (at
+ * *(hud+8)+0x14ac / +0x16f8) -- the exact objects ZUN blits for P1 every frame --
+ * after temporarily writing P2's row position and restoring it. Blitting a COPY
+ * crashed inside the renderer's appender (FUN_0044efb0 reaches object-relative
+ * state our standalone buffer can't satisfy); the live object always works. We do
+ * this AFTER s_origHudDraw, so P1's HUD is already painted and ZUN won't read the
+ * object again until next frame (when it rewrites the position anyway). */
+static int s_lifeReady = 0, s_bombReady = 0;   /* "drew P2's row at least once" trackers */
 
 /* Graze credit leaf FUN_0043eb90: __thiscall(player, float *grazed_pos) — bumps
  * the graze counters, spawns the graze spark at the midpoint, queues the graze
@@ -1956,56 +1984,105 @@ static void DrawCoopHud(void *p2)
     (void)p2;
 }
 
-/* Draw ONE row of `count` icons (the baked sprite object at `iconObj`) starting
- * at (HUD_ICON_X, y), stepping HUD_ICON_STEP px right per icon. The blit reads
- * X/Y/scale straight off the sprite object, so we set them before each call. */
-static void DrawIconRow(char *iconObj, int count, float y)
+/* A HUD icon sprite-object is only safe to blit if ZUN's own blit gate would
+ * pass: FUN_0044f770 returns early unless draw-enable bits 0&1 (+0x1c0) are set
+ * and the +0x1bb byte is nonzero, and it then DEREFERENCES the bound anm entry
+ * (+0x1e4) -- so a zero/stale anm pointer there is a hard crash. We snapshot the
+ * live object only when all of that holds, the same frame we replay it, so the
+ * captured anm pointer is always current (no stale char-select / pre-reload ptr).
+ * We copy ZUN's object and replay our copy; we NEVER poke ZUN's live object. */
+static int IconValid(char *obj)
 {
+    return (*(unsigned *)(obj + SPR_OFF_FLAGS) & 3) == 3
+        &&  obj[0x1bb] != 0
+        &&  *(unsigned *)(obj + SPR_OFF_ANM) != 0;
+}
+
+/* Draw a row of `count` icons by re-blitting ZUN's live icon object `obj` at
+ * (HUD_ICON_X + i*step, y) through the anm manager `mgr` (ecx). We save the
+ * object's current pos/scale, blit each icon, then restore -- so P1's HUD is
+ * untouched. FUN_0044f770 is no longer hooked, so calling it directly is safe. */
+static void DrawIconRowLive(void *mgr, char *obj, int count, float y)
+{
+    float    ox = *(float *)(obj + HUD_SPR_X);
+    float    oy = *(float *)(obj + HUD_SPR_Y);
+    uint32_t oz = *(uint32_t *)(obj + HUD_SPR_Z);
     int i;
     if (count > HUD_ICON_MAX) count = HUD_ICON_MAX;
     for (i = 0; i < count; i++) {
-        *(float *)(iconObj + HUD_SPR_X) = HUD_ICON_X + HUD_ICON_STEP * (float)i;
-        *(float *)(iconObj + HUD_SPR_Y) = y;
-        *(uint32_t *)(iconObj + HUD_SPR_Z) = HUD_ICON_SCALE;
-        ADDR_SPRITE_BLIT(iconObj);
+        *(float *)(obj + HUD_SPR_X) = HUD_ICON_X + HUD_ICON_STEP * (float)i;
+        *(float *)(obj + HUD_SPR_Y) = y;
+        *(uint32_t *)(obj + HUD_SPR_Z) = HUD_ICON_SCALE;
+        ADDR_SPRITE_BLIT(mgr, 0, obj);
     }
+    *(float *)(obj + HUD_SPR_X) = ox;
+    *(float *)(obj + HUD_SPR_Y) = oy;
+    *(uint32_t *)(obj + HUD_SPR_Z) = oz;
 }
 
-/* §8a: P1-style icon HUD for P2, drawn in ZUN's own sidebar pass (full-screen
- * viewport, HUD render target) so the coords/clip match P1's rows exactly. */
-static int s_p2HudClear = 0;   /* frames to keep force-clearing after P2 icons stop */
+/* §8a: P1-style icon HUD for P2. We append P2's life/bomb rows (from captured
+ * templates) right after ZUN's HUD pass, then flush the shared sprite batch. */
+static int s_p2HudClear = 0;   /* (reserved) frames to keep clearing after P2 stops */
 
 static void __fastcall HookedHudDraw(void *self)
 {
     void *p2  = (void *)s_p2;
-    void *res = (void *)*ADDR_RES_PTR;
-    int  drawP2 = (s_p2IconHud && p2 && !s_p2Ghost && res != NULL);
+    /* The life/bomb icon sprite objects live in the HUD object block at
+     * *(self+8)+0x14ac / +0x16f8 (PCBdecomp FUN_0042b603 @17069/17085) -- NOT at
+     * the score-pointer global. Reading the wrong base was why every capture came
+     * back zeroed. */
+    char *iconBase = (char *)*(uint32_t *)((char *)self + 8);
+    int  drawP2 = (s_p2IconHud && p2 && !s_p2Ghost && iconBase != NULL);
 
-    /* Force the full sidebar redraw so a CHANGED/REMOVED P2 row can't leave a
-     * stale icon on the persistent HUD surface (the bg tiles span x416..624 /
-     * y16..464, covering P2's region, then ZUN repaints P1). Keep forcing for a
-     * few frames AFTER P2 icons stop (death->ghost / despawn) to wipe the
-     * residue, then fall back to ZUN's vanilla on-change cadence (so a SOLO game
-     * with the icon HUD still enabled isn't repainting every frame). */
-    if (res && (drawP2 || s_p2HudClear > 0))
-        *(int *)((char *)res + HUD_OFF_REDRAW) = 1;
+    /* Keep ZUN's sidebar redraw-request live so the cached panel is cleared+
+     * repainted every frame. Without this, P2's own per-frame text (power number
+     * here, GHOST/REVIVE/SHARE in DrawCoopHud) smears on the stale panel. Raise
+     * only -- never stomp a longer request ZUN may have set (e.g. pause). */
+    if (p2 && *ADDR_HUD_REDRAW_REQ < 2)
+        *ADDR_HUD_REDRAW_REQ = 2;
 
     s_origHudDraw(self);                      /* ZUN paints P1's full HUD */
 
+    /* Snapshot the LIVE icon objects right AFTER ZUN drew P1's with them -- their
+     * anm binding is guaranteed current this frame (no stale char-select ptr).
+     * IconValid mirrors FUN_0044f770's own gate so a bad object is skipped, never
+     * blitted (the blit dereferences the anm ptr). */
     if (drawP2) {
-        DrawIconRow((char *)res + HUD_OFF_LIFE_ICON, (int)s_p2Lives, HUD_P2_LIVES_Y);
-        DrawIconRow((char *)res + HUD_OFF_BOMB_ICON, (int)s_p2Bombs, HUD_P2_BOMBS_Y);
-        {   /* "2P" marker + power number (ascii, to the backbuffer like P1's) */
+        void *mgr = (void *)*ADDR_SPRITE_MGR;   /* g_AnmManager -- ecx for the blit */
+        char *ll = iconBase + HUD_OFF_LIFE_ICON;
+        char *lb = iconBase + HUD_OFF_BOMB_ICON;
+        int   lifeOK = mgr && IconValid(ll);
+        int   bombOK = mgr && IconValid(lb);
+        static int announced = 0;
+        if (!announced) {
+            Log("P2 icon HUD: mgr=%p base=%p lifeOK=%d bombOK=%d", mgr, (void *)iconBase, lifeOK, bombOK);
+            Log("  life: flags=%08x b1bb=%02x anm=%08x | bomb: flags=%08x b1bb=%02x anm=%08x",
+                *(unsigned *)(ll + SPR_OFF_FLAGS), (unsigned char)ll[0x1bb], *(unsigned *)(ll + SPR_OFF_ANM),
+                *(unsigned *)(lb + SPR_OFF_FLAGS), (unsigned char)lb[0x1bb], *(unsigned *)(lb + SPR_OFF_ANM));
+        }
+        if (lifeOK) {
+            DrawIconRowLive(mgr, ll, (int)s_p2Lives, HUD_P2_LIVES_Y);
+            s_lifeReady = 1;
+        }
+        if (!announced) Log("  life row done");
+        if (bombOK) {
+            DrawIconRowLive(mgr, lb, (int)s_p2Bombs, HUD_P2_BOMBS_Y);
+            s_bombReady = 1;
+        }
+        if (!announced) Log("  bomb row done");
+        {   /* P2 power number via the ascii queue ("2P" label dropped per user) */
             float pos[3];
-            pos[0] = HUD_P2_LABEL_X; pos[1] = HUD_P2_LIVES_Y; pos[2] = 0.f;
-            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "2P");
-            pos[0] = HUD_ICON_X;     pos[1] = HUD_P2_POWER_Y;
+            pos[0] = HUD_ICON_X; pos[1] = HUD_P2_POWER_Y; pos[2] = 0.f;
             ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "%d", (int)s_p2Power);
         }
-        s_p2HudClear = 3;
-    } else if (s_p2HudClear > 0) {
-        s_p2HudClear--;
+        if (!announced) Log("  ascii done");
+        /* push our appended quads: ZUN's last flush already happened inside the
+         * orig pass, so without this our quads sit in an unflushed batch. */
+        if (mgr) ADDR_SPRITE_FLUSH(mgr);
+        if (!announced) Log("  flush done");
+        announced = 1;
     }
+    (void)s_p2HudClear;
 }
 
 static int __fastcall HookedDraw(void *self)
@@ -2064,6 +2141,8 @@ static void ResetCoopSession(void)
     s_p2Carry       = 0;
     s_p2Shadow      = 0;
     s_p2HudClear    = 0;
+    s_lifeReady     = 0;   /* re-capture icon templates next stage (front.anm may reload) */
+    s_bombReady     = 0;
     s_lastLogicFrame = 0x7fffffff;
     Log("coop session reset (returned to front-end menu)");
 }

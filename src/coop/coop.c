@@ -556,6 +556,41 @@ static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch             
  * for P2 (round-11 bug). */
 #define OFF_HOMING_TGT 0x2428          /* base of the target block               */
 #define HOMING_TGT_LEN 0x1c            /* homing xyz + aim xyz + valid flag      */
+#define OFF_HOMING_X   0x2428          /* float[3] homing target x,y,z           */
+#define OFF_AIM_X      0x2434          /* float[3] SakuyaA aim target x,y,z      */
+#define OFF_TGT_VALID  0x2440          /* int target-valid flag                  */
+#define OFF_POS_Z      0x938           /* float player Z (OFF_POS_X + 8)         */
+
+/* ---- PER-PLAYER aim/homing SOURCE (handoff §8c) ----
+ * The block above is filled by the enemy update (FUN_00420620, PCBdecomp.c
+ * 12904-12943) using the STATIC P1's position (DAT_004be408/40c/410) and written
+ * only into P1's +0x2428 block, then mirrored to P2 each frame. So P2's homing
+ * amulets / SakuyaA aimed knives chase whatever was nearest/in-cone for P1.
+ * To make P2 choose targets relative to ITS OWN position we replicate that exact
+ * acquisition for P2 (BuildP2TargetBlock) over a per-frame snapshot of the
+ * targetable enemies. We get the snapshot for FREE from HookedDamage: the enemy
+ * update calls the shot-damage sweep FUN_0043d9e0(enemy+0x2b0c, ...) once per
+ * damageable enemy, so the `pos` arg points at enemy+0x2b0c -> enemy base =
+ * pos - 0x2b0c. This avoids reverse-engineering the enemy-manager base out of the
+ * task system (a wrong pointer walk would crash). It does miss enemies that are
+ * on-screen but NOT currently damageable (e.g. a boss mid-invuln) -> for those
+ * frames P2's acquisition finds nothing and we fall back to mirroring P1's block,
+ * so behaviour is never worse than the old full mirror.
+ *
+ * Enemy struct fields (docs/th07_enemy_system.md): pos float[3] @+0x2b0c; state
+ * byte @+0x2e29 with bit6 (0x40) = boss/has-lifebar (gates the nearest-x branch;
+ * non-bit6 popcorn uses the lowest-enemy / in-cone fallback, same as ZUN). */
+#define ENEMY_OFF_POS   0x2b0c
+#define ENEMY_OFF_FLAGS 0x2e29
+#define ENEMY_FLAG_BOSS 0x40
+#define COOP_MAX_ENEMY_SNAP 256        /* damageable enemies per frame (bounded)  */
+/* SakuyaA upward aim cone: ZUN tests atan2(dy,dx) in [-120deg,-60deg] (±30deg of
+ * straight up). Expressed geometrically (no atan2 dep): enemy above (dy<0) and
+ * |dx| within tan(30deg) of |dy|. */
+#define COOP_AIM_CONE_TAN30 0.57735027f
+static void *s_enemySnap[COOP_MAX_ENEMY_SNAP]; /* enemy base ptrs, this frame     */
+static int   s_enemyCount = 0;
+static int   s_perPlayerAim = 1;       /* per-player homing/aim source (default on)*/
 
 /* ---- P2 SHOT-TYPE SELECT (charselect stage 1: same character, own A/B) ----
  * The engine keeps the chosen loadout in three globals and a per-player cache:
@@ -1133,6 +1168,7 @@ static void DespawnP2(void)
     void *p2 = (void *)s_p2;
     if (!p2) return;
     s_p2 = NULL;                            /* stop piggyback FIRST */
+    s_enemyCount = 0;                       /* drop the enemy snapshot (stale ptrs) */
     SwapAnm(0);                             /* ensure tables are P1's before free */
     FreeP2CharAnm();
     KillP2FocusFx();
@@ -1613,6 +1649,19 @@ static int __fastcall HookedDamage(void *self, void *edx,
 {
     int r = s_origDamage(self, edx, pos, size, out_flag);
     void *p2 = (void *)s_p2;
+
+    /* ENEMY SNAPSHOT for P2's per-player aim/homing (BuildP2TargetBlock): the
+     * engine calls this once per damageable enemy with pos = enemy+0x2b0c, so
+     * record the enemy base. Only on the engine's P1 call (self == P1); the P2
+     * re-invoke below passes self = P2 and must not double-record. The two box
+     * calls per enemy (primary + secondary) share the same pos -> skip the
+     * consecutive duplicate. Reset is done once consumed, in HookedDraw. */
+    if (s_perPlayerAim && p2 && !s_p2Ghost && (uint32_t)self == ADDR_PLAYER_BASE && pos) {
+        void *en = (void *)((char *)pos - ENEMY_OFF_POS);
+        if (s_enemyCount < COOP_MAX_ENEMY_SNAP &&
+            (s_enemyCount == 0 || s_enemySnap[s_enemyCount - 1] != en))
+            s_enemySnap[s_enemyCount++] = en;
+    }
 
     /* P2 SHOT + BOMB DAMAGE: the per-enemy sweep is hardwired to ECX = the
      * static P1 (bisect-proven), so re-invoke param-relative for a live P2 —
@@ -2121,6 +2170,86 @@ static long double __fastcall HookedAngleToPlayer(void *player, void *edx, float
     return s_origAngleToPlayer(player, edx, pos);
 }
 
+/* Replicate the enemy-update target acquisition (PCBdecomp.c 12904-12943) for P2,
+ * relative to P2's OWN position + character, over this frame's enemy snapshot, and
+ * write P2's +0x2428 block. Mirrors ZUN's logic: among bit6 (boss) enemies pick the
+ * one nearest in X; SakuyaA additionally records the nearest in-cone enemy as the
+ * aim target; popcorn (no bit6 target yet) falls back to the lowest enemy on screen
+ * (homing) and any in-cone enemy (aim). Whatever P2 doesn't resolve itself (no
+ * damageable enemy of that kind this frame) falls back to mirroring P1's block, so
+ * this is never worse than the old full mirror. */
+static void BuildP2TargetBlock(void *p2)
+{
+    char *pp = (char *)p2, *p1 = (char *)ADDR_PLAYER_BASE;
+    float Px = *(float *)(pp + OFF_POS_X);
+    float Py = *(float *)(pp + OFF_POS_Y);
+    float Pz = *(float *)(pp + OFF_POS_Z);
+    int sakuya = (((s_p2Sel >= 0 ? s_p2Sel : *ADDR_SEL_ID) / 2) % 3) == 2;
+    float hX = -1000.f, hY = -1000.f, hZ = -1000.f;   /* homing target            */
+    float aX = -1000.f, aY = -1000.f, aZ = -1000.f;   /* SakuyaA aim target       */
+    int valid = 0;
+    int i;
+    (void)Pz;
+
+    for (i = 0; i < s_enemyCount; i++) {
+        char *en = (char *)s_enemySnap[i];
+        unsigned char fl = *(unsigned char *)(en + ENEMY_OFF_FLAGS);
+        float ex = *(float *)(en + ENEMY_OFF_POS);
+        float ey = *(float *)(en + ENEMY_OFF_POS + 4);
+        float ez = *(float *)(en + ENEMY_OFF_POS + 8);
+        float dx = ex - Px,  dy = ey - Py;
+        float adx = dx < 0.f ? -dx : dx;
+
+        if (fl & ENEMY_FLAG_BOSS) {
+            float ahx = hX - Px;  if (ahx < 0.f) ahx = -ahx;
+            if (!valid || adx < ahx) { hX = ex; hY = ey; hZ = ez; }
+            if (sakuya) {
+                int inCone = (dy < 0.f) && (adx <= -dy * COOP_AIM_CONE_TAN30);
+                float aax = aX - Px;  if (aax < 0.f) aax = -aax;
+                if (inCone && (!valid || adx < aax)) { aX = ex; aY = ey; aZ = ez; valid = 1; }
+            } else {
+                valid = 1;
+            }
+        }
+        if (!valid) {
+            if (hY < ey) { hX = ex; hY = ey; hZ = ez; }   /* lowest enemy on screen */
+            if (sakuya && aY < -900.f) {
+                int inCone = (dy < 0.f) && (adx <= -dy * COOP_AIM_CONE_TAN30);
+                if (inCone) { aX = ex; aY = ey; aZ = ez; }
+            }
+        }
+    }
+
+    /* No damageable enemy this frame (e.g. boss mid-invuln) -> P2 acquired nothing;
+     * mirror P1's whole block, exactly the legacy behaviour (never worse). */
+    if (s_enemyCount == 0) {
+        memcpy(pp + OFF_HOMING_TGT, p1 + OFF_HOMING_TGT, HOMING_TGT_LEN);
+        return;
+    }
+    /* homing: a non-empty snapshot always resolves one (bit6 nearest-x or the
+     * lowest-enemy fallback); guard defensively and mirror P1 if somehow not. */
+    if (hY > -900.f) {
+        *(float *)(pp + OFF_HOMING_X)     = hX;
+        *(float *)(pp + OFF_HOMING_X + 4) = hY;
+        *(float *)(pp + OFF_HOMING_X + 8) = hZ;
+    } else {
+        memcpy(pp + OFF_HOMING_X, p1 + OFF_HOMING_X, 12);
+    }
+    /* aim: P2's own in-cone pick, else mirror P1's aim target (SakuyaA only reads
+     * it; for other chars it stays sentinel/P1's and is unused). */
+    if (aY > -900.f) {
+        *(float *)(pp + OFF_AIM_X)     = aX;
+        *(float *)(pp + OFF_AIM_X + 4) = aY;
+        *(float *)(pp + OFF_AIM_X + 8) = aZ;
+    } else {
+        memcpy(pp + OFF_AIM_X, p1 + OFF_AIM_X, 12);
+    }
+    /* valid flag: engine-accurate — set only when a bit6 target locked (for Sakuya,
+     * only with an in-cone enemy). The lowest-enemy/cone fallback leaves it 0 and
+     * the consumer reads the coord sentinel instead. */
+    *(int *)(pp + OFF_TGT_VALID) = valid;
+}
+
 static int __fastcall HookedDraw(void *self)
 {
     int r = s_origDraw(self);               /* P1 draw */
@@ -2134,11 +2263,16 @@ static int __fastcall HookedDraw(void *self)
             if (s_p2FocusFx)
                 memcpy((char *)s_p2FocusFx + OFF_FX_POS,
                        (char *)p2 + OFF_POS_X, 12);
-            /* feed P2 this frame's homing + SakuyaA aim targets (see the
-             * OFF_HOMING_TGT note) — the consumers run param-relative but the
-             * enemy update only ever fills static P1's block */
-            memcpy((char *)p2 + OFF_HOMING_TGT,
-                   (char *)ADDR_PLAYER_BASE + OFF_HOMING_TGT, HOMING_TGT_LEN);
+            /* feed P2 this frame's homing + SakuyaA aim targets. With per-player
+             * aim on, acquire P2's own targets relative to ITS position (see
+             * BuildP2TargetBlock); otherwise mirror P1's block (legacy). Consume
+             * + clear the per-frame enemy snapshot either way. */
+            if (s_perPlayerAim && !s_p2Ghost)
+                BuildP2TargetBlock(p2);
+            else
+                memcpy((char *)p2 + OFF_HOMING_TGT,
+                       (char *)ADDR_PLAYER_BASE + OFF_HOMING_TGT, HOMING_TGT_LEN);
+            s_enemyCount = 0;
             SwapSelGlobals(1);
             SwapAnm(1);                     /* P2's char sprites for its draw */
             s_origDraw(p2);
@@ -2167,6 +2301,7 @@ static void ResetCoopSession(void)
     s_p2FocusFx = NULL;          /* DROP the stale fx handle — never KillP2FocusFx */
     if (s_p2AnmSlot >= 0) { SwapAnm(0); FreeP2CharAnm(); }
     if (p2) VirtualFree(p2, 0, MEM_RELEASE);
+    s_enemyCount    = 0;         /* drop the enemy snapshot (stale ptrs)          */
     s_autoSpawned   = 0;
     s_readyFrames   = 0;
     s_p1Ghost       = 0;

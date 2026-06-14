@@ -23,6 +23,9 @@ by an RNG-seed comparison every frame.
   (power/bombs/points/1up) + the per-player resource attribution design.
 - **`docs/th07_player_struct.md`** — verified PCB Player-object offset map + the death
   FSM / resurrection seam (for the Fork-B second-player graft).
+- **`docs/th07_hud_sprite_system.md`** — the HUD/score-manager draw, the anm
+  sprite-object layout + blit (`FUN_0044f770`), the sprite-batch flush, and the
+  ascii text queue — the ground truth for drawing sprites/text from the DLL.
 
 ## Layout
 | Path | What |

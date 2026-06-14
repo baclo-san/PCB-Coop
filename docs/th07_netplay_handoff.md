@@ -1156,7 +1156,11 @@ queue `P2 SELECT CHARACTER` / `P2 SELECT SHOT` on the global ascii manager
 (`FUN_00402060` @0x402060, mgr 0x0134ce18). Confirmed the ascii subsystem is
 registered at process init (`FUN_00401e30`→`FUN_00401d70` loads `data/ascii.anm`
 into anm slot 1; its draw task is a global task), so it renders in the menu scene
-too — not just in-stage. Position is `MENU_PROMPT_X/Y` (#defines, tune visually).
+too — not just in-stage. **Cross-confirmed:** ZUN's own front-end menus (high-score
+/ music room / stats list at PCBdecomp.c 30405-30602, 38085-38190) print via the
+same `FUN_00402060`/mgr 0x0134ce18, proving the queue draws on menu screens. So the
+prompt WILL show; only its position vs the char-select art is unverified — tune
+`MENU_PROMPT_X/Y` (#defines) after a look.
 
 **8a — P1-style icon HUD for P2.** RE of ZUN's sidebar draw:
 - HUD draw fn `FUN_0042b603` (@0x42b603, `__fastcall(ECX = score singleton

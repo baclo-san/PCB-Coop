@@ -1425,26 +1425,56 @@ the draw window. The player-anm overlay loads ONE extra anm (`player0N.anm` at b
 0x400) and is fine; adding a SECOND extra anm (`face_{rm,mr,sk}00.anm` at base 0x4a0,
 id window [0x4a0,0x4ad)) corrupts 0x400 even though the two id windows are disjoint
 and both diff-capture+restore their windows. ⇒ the corruption is in **shared global
-state the per-id table restore doesn't cover** — most likely the per-slot **texture
-array** or the global **sprite-sequence counter** (`mgr+0x28eec`), exactly round-13c's
-standing hypothesis. **Reusable findings (decomp-confirmed, keep):** portrait =
-`data/face_{rm,mr,sk}00.anm` @ base 0x4a0 slot 0x19 by GLOBAL char id; player face id
-window [0x4a0,0x4ad); created by `FUN_0042868d` (a bomb cb, sets sprite + UV at
-set-time, sets `DAT_00575ab4`); drawn by `FUN_0042c577`; ownership attributable by
-hooking `FUN_0042868d`. **Next approach (untried): do NOT load a second whole anm.**
-Either (a) load P2's face at MENU-SELECT into the SAME engine slot 0x19 used for the
-face (so no extra texture/slot pressure) and capture P2's face ids before the stage
-overwrites them, or (b) RE the texture-array + sprite-sequence globals the load
-touches and snapshot/restore THOSE around the load too. LOW priority / polish; needs
-live iteration — do not retry blind.
+state the per-id table restore doesn't cover**.
 
-### 8c — SakuyaA cross-char per-player aim source  **[IMPLEMENTED 2026-06-15 (§5j) — needs in-game look]**
+**EoSD-decomp consult (2026-06-15, `d:/PCB Co-op/th06_multi_net`, per user request):**
+The th06 netplay fork solves per-player portraits cleanly — P2 gets a FULLY PARALLEL
+anm namespace: separate file slots (`ANM_FILE_FACE_CHARA_A2`=48..53), separate id
+range (`ANM_OFFSET_PLAYER_DIFFERENCE` = `ANM_OFFSET_PLAYER2(0x719) - ANM_OFFSET_PLAYER(0x400)`
+= 0x319, so P2 face at 0x4a0+0x319=0x7b9), separate face anm *files*, all loaded ONCE
+at GUI init (`Gui::ActualAddedCallback`) keyed on `g_GameManager.character` (P1) +
+`.character2` (P2) — never per-bomb. `BombData` then draws with the P1 vs P2 script id
+(`ANM_SCRIPT_FACE_BOMB_PORTRAIT` vs `…PORTRAIT2`). **But that requires recompiling the
+engine to ENLARGE the fixed arrays** (more file slots, id space up to 0x9ff already
+tight) — not available to a binary DLL mod. The swap technique is the binary-feasible
+equivalent and is already PROVEN by the player overlay.
+
+**CORRECTION (disproves the old hypothesis): PCB textures are PER-SLOT, not a shared
+surface pool.** `FUN_0044e070` (the per-entry registrar, PCBdecomp 32841-32847) stores
+the loaded texture object at `mgr+0x282ac + slot*4` and `mgr+0x28acc + slot*4`, keyed by
+the **anm FILE slot number** — NOT by an absolute surface index from the anm header
+(that was the th06 `surfaces[32]` model; PCB differs). So loading the face into its own
+free slot CANNOT clobber the player's texture. **The "per-slot texture array" guess in
+the old note is WRONG.** What the load/free DO touch beyond the id tables: a CHAINED anm
+(sub-files linked by `+0x38`) consumes CONSECUTIVE slots at rising bases (`FUN_0044df90`
+outer loop 32762-32772, per-slot span at `mgr+0x2def8+slot*0xc`); the free `FUN_0044e4e0`
+RECURSIVELY frees slot+1.. up to that span and resets global sprite caches at
+`mgr+0x2e4cc/0x2e4d0..2` (32945-32948).
+
+**Where this leaves it:** the player overlay uses the IDENTICAL recipe (base into a free
+non-engine slot, diff-capture+restore the id window, swap around P2's draw) and works;
+static analysis does NOT explain why the face overlay glyphs 0x400 at spawn. ⇒ **the next
+attempt must be INSTRUMENTED, not blind.** Log, around `LoadP2FaceAnm`: (1) the face's
+consumed slot count + span `mgr+0x2def8+faceslot*0xc` — does `face_*00.anm` CHAIN past
+[0x4a0,0x4ad)? if so the capture window is too small and ids above 0x4ad are overwritten-
+not-restored; (2) the player sprite/script/rev entries for 0x400..0x404 immediately
+before vs after the face load — catch exactly who writes 0x400; (3) the actual id span
+the face defines (engine loads it at slot 0x19 base 0x4a0, next engine load is far away
+at 0x61e, so faces have room to be wider than 13 ids). **Reusable findings (keep):**
+portrait = `data/face_{rm,mr,sk}00.anm`, engine-loaded via `FUN_0044df90(0x19,…,0x4a0)`
+by GLOBAL char id `DAT_0062f645`; player face id window starts 0x4a0; created by
+`FUN_0042868d` (bomb cb, sets sprite + UV at set-time, sets `DAT_00575ab4`); drawn by
+`FUN_0042c577`; ownership attributable by hooking `FUN_0042868d`. LOW priority / polish;
+needs live iteration — do not retry blind.
+
+### 8c — SakuyaA cross-char per-player aim source  **[IMPLEMENTED + USER-CONFIRMED 2026-06-15 (§5j, commit 1789e0e)]**
 SakuyaA's aimed shot used an aim target filled by the enemy update keyed off the
 GLOBAL char id, only into static P1's block; P2 mirrored it. Now `BuildP2TargetBlock`
 (handoff §5j) computes P2's homing AND aim target relative to P2's own position,
 gating the SakuyaA cone on P2's own character (`s_p2Sel`) rather than the global —
 so it is per-player both same-char and cross-char (P1≠Sakuya). The same change also
-gives ReimuA per-player homing. Verify the targeting feel in-game (see §5j).
+gives ReimuA per-player homing. **User-confirmed working in-game (2026-06-15)** with
+P1=ReimuA + P2=SakuyaA after the portrait revert unmasked it.
 
 ### 8d — "P2 SELECT" on-screen prompt  **[DONE 2026-06-14 (§5h, PR #2) — visual tune pending]**
 During P2's menu pass there's no visual cue it's P2's turn. Add a prompt via the

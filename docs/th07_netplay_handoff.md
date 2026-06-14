@@ -1142,8 +1142,52 @@ holds on character select and lets P2 pick its own char+type; then start.
 
 Remaining gaps: bomb-declaration PORTRAIT still shows P1's face for a
 different-char P2 (the portrait is a global char-id anm at base 0x4a0; not yet
-overlaid); SakuyaA cross-char aim source (deferred); no on-screen "P2 SELECT"
-prompt. See §8.
+overlaid); SakuyaA cross-char aim source (deferred). See §8.
+
+### 5h — P2 icon HUD (§8a) + P2 SELECT prompt (§8d) — 2026-06-14 (overnight)
+
+Both shipped on branch `claude/affectionate-cray-grpwnb` (PR #2, draft). Additive
++ toggleable so the known-good build is preserved. **Not yet visually confirmed
+in-game** — no game host this session; F12 falls back to the old text HUD if the
+icons render wrong.
+
+**8d — "P2 SELECT" prompt** (`HookedMenuDispatch`): during P2's char/shot pass,
+queue `P2 SELECT CHARACTER` / `P2 SELECT SHOT` on the global ascii manager
+(`FUN_00402060` @0x402060, mgr 0x0134ce18). Confirmed the ascii subsystem is
+registered at process init (`FUN_00401e30`→`FUN_00401d70` loads `data/ascii.anm`
+into anm slot 1; its draw task is a global task), so it renders in the menu scene
+too — not just in-stage. Position is `MENU_PROMPT_X/Y` (#defines, tune visually).
+
+**8a — P1-style icon HUD for P2.** RE of ZUN's sidebar draw:
+- HUD draw fn `FUN_0042b603` (@0x42b603, `__fastcall(ECX = score singleton
+  0x626270)`). Sets a full-screen (0,0,640,480) viewport then paints the sidebar
+  onto a **persistent surface**: background tiles redraw only on a "full-dirty"
+  condition (line 16943: `DAT_00575a9c>>0xc&1 || *(scoreStruct+0x1d70) ||
+  DAT_00575ab4`), each value section only when its 2-bit dirty field in
+  `*(singleton+4)` is set.
+- `scoreStruct = *(singleton+8) = *0x626278` — the LARGE score-manager data block
+  (~0x20a30 bytes, cleared at FUN_00427… init), NOT a 200-byte struct (the old
+  coop.c "operator_new(200)" note is a misread; the VALUE offsets it uses —
+  lives +0x5c, bombs +0x68, power +0x7c — are still correct).
+- LIVES are a **row of icon sprites**: baked sprite object at `scoreStruct+0x14ac`,
+  one per life, X=496 +16px each, Y=96, scale 0x3eeb851f. BOMBS: object
+  `scoreStruct+0x16f8`, Y=112. The blit is `FUN_0044f770(spriteObj)` (@0x44f770,
+  `__cdecl`; self-validates flags at +0x1c0/+0x1bb → no-ops if unbound, so it's
+  crash-safe). It writes screen X/Y/scale to the object at +0x1c8/+0x1cc/+0x1d0
+  then APPENDS a quad to the anm sprite batch; the batch is flushed by
+  `FUN_0044f5c0` (@0x44f5c0). Power + point-items are ascii numbers
+  ((496,160) and (496,176) "%d/%d").
+- **Implementation**: hook `FUN_0042b603`; before orig set `*(scoreStruct+0x1d70)=1`
+  to force the full sidebar redraw each frame (so a dropped P2 count can't leave a
+  stale icon on the persistent surface — the bg tiles span x416..624/y16..464,
+  covering P2's region); after orig, append P2's life/bomb rows with the SAME icon
+  objects + `FUN_0044f770`, just below P1's point line (lives Y=192, bombs Y=208),
+  plus a `2P` marker and the power number (Y=224). Reusing P1's icon objects is
+  safe because the blit reads position per-call. F12 toggles icons⇄text.
+- **What to verify in-game**: (1) icons actually appear at x≈496 below the point
+  line and look like P1's stars/bomb icons; (2) no stale/ghost icon when P2 loses
+  a life or bombs; (3) no perf hit from the forced redraw; (4) the `2P`/power
+  text sits where intended. Tune the `HUD_*` #defines if positions are off.
 
 ---
 
@@ -1228,7 +1272,7 @@ Ordered by the user's priority. Items marked **[autonomous-ok]** can be drafted
 without live testing (RE + implement + document for the user to verify); items
 marked **[needs user]** require the user's eyes in-game before they're "done".
 
-### 8a — P2 proper, P1-like HUD  **[autonomous-ok to draft, [needs user] to confirm]**
+### 8a — P2 proper, P1-like HUD  **[DRAFTED 2026-06-14 (§5h, PR #2) — needs in-game confirm]**
 User spec (2026-06-14): give P2 a HUD that mirrors P1's, not the current ascii
 `P2xx Ln Bn Pn` line. Specifically:
 - **Lives** drawn as the life ICON sprite × current count (like P1's life row),
@@ -1273,10 +1317,12 @@ P1's aim block each frame (works when P1 is also Sakuya). For a different-char
 P2=SakuyaA the aim source isn't per-player. Deferred by the user ("can do for
 now"); revisit if it matters.
 
-### 8d — "P2 SELECT" on-screen prompt  **[autonomous-ok]**
+### 8d — "P2 SELECT" on-screen prompt  **[DONE 2026-06-14 (§5h, PR #2) — visual tune pending]**
 During P2's menu pass there's no visual cue it's P2's turn. Add a prompt via the
 ascii text queue (the same `ADDR_ASCII_PRINT` the coop HUD uses) while
-`s_coopMenu` is `CM_P2_CHAR`/`CM_P2_SHOT`. Cosmetic, safe.
+`s_coopMenu` is `CM_P2_CHAR`/`CM_P2_SHOT`. Cosmetic, safe. SHIPPED: shows
+`P2 SELECT CHARACTER` / `P2 SELECT SHOT` at `MENU_PROMPT_X/Y`; verify the
+position looks right (and isn't behind menu art) and tune the #defines.
 
 ### 8e — Netcode → coop.c wiring  **[bigger, separate effort]**
 The original long-term goal. The input seam is already in place: P2's gameplay

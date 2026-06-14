@@ -1262,8 +1262,9 @@ in-game look — implemented per the decomp, no live host this session):
     correctly, homing shots (consumed in P2's update) acceptably (1-frame source lag,
     same as the old mirror). `s_perPlayerAim` default on (no hotkey; F-keys full).
 
-- **Character-specific bomb-declaration PORTRAIT for a different-char P2 (committed,
-  needs in-game look).** 2nd attempt at §8b (round-13b regressed→reverted). The
+- **Character-specific bomb-declaration PORTRAIT for a different-char P2 — 2nd
+  attempt, REGRESSED + REVERTED (f850120). See §8b for the verdict + next approach.**
+  2nd attempt at §8b (round-13b regressed→reverted). The
   portrait is `data/face_{rm,mr,sk}00.anm`, loaded by the engine at base 0x4a0 into
   slot 0x19 for the GLOBAL char only (`FUN_0044df90`, PCBdecomp 15833/43/53); the
   player face id window is **[0x4a0,0x4ad)** (boss faces start at 0x4ad). Created by
@@ -1280,15 +1281,14 @@ in-game look — implemented per the decomp, no live host this session):
   (`HookedDeclMake`, the proven `__fastcall`-models-`__thiscall` pattern): whoever's
   update/draw window created it owns it. Best-effort + isolated: a face-load failure
   / engine slot reuse retires the overlay (P2 shows P1's face, no crash); default-on
-  (`s_p2Portrait`); freed on despawn/session reset; **`git revert c7741e4` restores
-  the prior build** if it regresses.
-  - **To verify in-game** (different-char team, e.g. P1 Reimu + P2 Marisa/Sakuya):
-    (1) P2 bombs → the big spell portrait + name shows P2's char's face, not P1's;
-    (2) P1 bombs → still P1's face; (3) both bomb near-simultaneously → no glitch;
-    (4) **regression guard:** P1 + bullets/bomb textures still render correctly (the
-    round-13b failure was glyph-sprite corruption); (5) stage transition + revive
-    with a different-char P2 still clean. If the portrait is wrong for a specific
-    char, the face-load log line (`P2 face anm: … N ids …`) shows what was captured.
+  (`s_p2Portrait`); freed on despawn/session reset.
+  - **TEST RESULT: REGRESSED → REVERTED (f850120).** P1=ReimuA + P2=SakuyaA: at the P2
+    spawn P1 turned to glyph sprites, P2 invisible (still grazeable), crash on P1
+    shoot — the round-13b failure. Since the clean stage-start load + the corrected
+    draw fn did NOT prevent it, the fault is the face-anm LOAD touching shared global
+    state (texture array / sprite-sequence counter), not the swap/draw. Full verdict +
+    the untried next approach (don't load a second whole anm; load at menu-select into
+    the engine's own face slot 0x19, or snapshot the texture/sequence globals) in §8b.
 
 ---
 
@@ -1413,18 +1413,30 @@ Implementation pointers (RE first, don't guess offsets):
   sprite ids; the icons live in the front/HUD anm (`front.anm`, slot 0x15, base
   0x600 — see the FUN_0044df90 table). Resolve the real ids from the decomp.
 
-### 8b — Bomb-declaration portrait for a different-char P2  **[IMPLEMENTED 2026-06-15 (§5j, commit c7741e4) — needs in-game look]**
-2nd attempt (round-13b regressed→reverted). Corrected the draw seam — the portrait
-blits in **`FUN_0042c577` (@0x42c577, PCBdecomp 17301)**, not the `0x42b603`
-round-13b hooked — and moved the face-anm load to the CLEAN stage-start point via a
-**parallel** face overlay (a copy of the player-anm overlay, not a refactor):
-`LoadP2FaceAnm` loads `data/face_{rm,mr,sk}00.anm` at base 0x4a0 (id window
-[0x4a0,0x4ad)) into a spare slot, diff-captures, restores P1's tables; `SwapFace`
-swaps the portrait ids to P2 around P2's update/draw (create-time UV) and
-`FUN_0042c577` (draw-time texture) when the live declaration is P2's
-(`HookedDeclMake` on `FUN_0042868d` attributes ownership). Best-effort/isolated:
-a load failure leaves P2 showing P1's face; `git revert c7741e4` restores the prior
-build. See §5j for the full design + the in-game verification checklist.
+### 8b — Bomb-declaration portrait for a different-char P2  **[2nd attempt REVERTED 2026-06-15 (§5j); same regression as round-13b]**
+2nd attempt (commit c7741e4) **regressed identically to round-13b and was reverted**
+(f850120). User test (P1=ReimuA + P2=SakuyaA): at the P2 spawn, P1 renders as glyph
+sprites, P2 is invisible (still grazeable), and P1 shooting crashes. **What this rules
+in/out:** the 2nd attempt FIXED two suspected round-13b causes — it used the CLEAN
+stage-start load (not mid-stage) and the CORRECT draw fn `FUN_0042c577` (@0x42c577,
+PCBdecomp 17301; NOT the `0x42b603` round-13b hooked) — and it STILL corrupted the
+0x400 player table. So the fault is in the face-anm **LOAD itself**, not the swap or
+the draw window. The player-anm overlay loads ONE extra anm (`player0N.anm` at base
+0x400) and is fine; adding a SECOND extra anm (`face_{rm,mr,sk}00.anm` at base 0x4a0,
+id window [0x4a0,0x4ad)) corrupts 0x400 even though the two id windows are disjoint
+and both diff-capture+restore their windows. ⇒ the corruption is in **shared global
+state the per-id table restore doesn't cover** — most likely the per-slot **texture
+array** or the global **sprite-sequence counter** (`mgr+0x28eec`), exactly round-13c's
+standing hypothesis. **Reusable findings (decomp-confirmed, keep):** portrait =
+`data/face_{rm,mr,sk}00.anm` @ base 0x4a0 slot 0x19 by GLOBAL char id; player face id
+window [0x4a0,0x4ad); created by `FUN_0042868d` (a bomb cb, sets sprite + UV at
+set-time, sets `DAT_00575ab4`); drawn by `FUN_0042c577`; ownership attributable by
+hooking `FUN_0042868d`. **Next approach (untried): do NOT load a second whole anm.**
+Either (a) load P2's face at MENU-SELECT into the SAME engine slot 0x19 used for the
+face (so no extra texture/slot pressure) and capture P2's face ids before the stage
+overwrites them, or (b) RE the texture-array + sprite-sequence globals the load
+touches and snapshot/restore THOSE around the load too. LOW priority / polish; needs
+live iteration — do not retry blind.
 
 ### 8c — SakuyaA cross-char per-player aim source  **[IMPLEMENTED 2026-06-15 (§5j) — needs in-game look]**
 SakuyaA's aimed shot used an aim target filled by the enemy update keyed off the

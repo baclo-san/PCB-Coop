@@ -285,6 +285,22 @@ static CollectOverlapFn_t s_origCollectOverlap = NULL;
 static DamageFn_t        s_origDamage        = NULL;
 static ItemLoopFn_t      s_origItemLoop       = NULL;
 
+/* ---- aim & item-suction: target the NEARER player (coop gameplay) ----
+ * FUN_00442370 is Player::AngleToPlayer(this=player, pos): the angle from world
+ * point `pos` to the player's centre (player+0x930/+0x934, atan2). It is the ONE
+ * choke point every "toward the player" direction flows through -- enemy aimed
+ * shots (ECL angle-to-player 7825/8142; bullet-pattern fire 14298/14346; lasers;
+ * 9591/14538) AND item-collection suction (FUN_00432990 @20399). We hook it and,
+ * choosing the player nearer to `pos` (or P2 when P1 is a ghost), pass THAT
+ * player as `this` to the original -- so shots and items track whoever was closer
+ * at fire/suction time. No position/cache poking, no hot ECL-VM hook (the EoSD
+ * clean decomp BulletManager::AngleProvokedPlayer confirmed this is the seam).
+ * __thiscall (ECX=player, pos on stack), returns float10 = x87 long double. */
+typedef long double (__fastcall *AngleToPlayerFn_t)(void *player, void *edx, float *pos);
+#define ADDR_ANGLE_TO_PLAYER ((AngleToPlayerFn_t)0x00442370)
+static AngleToPlayerFn_t s_origAngleToPlayer = NULL;
+static int s_coopAim = 1;               /* aim/suction-at-nearer enabled (default on) */
+
 static volatile void *s_p2   = NULL;   /* P2 object base, NULL until spawned     */
 static int   s_p2Killable = 1;         /* on by default; F8 toggles              */
 static unsigned char s_p2PrevState = 0;/* for death-transition logging           */
@@ -2085,6 +2101,26 @@ static void __fastcall HookedHudDraw(void *self)
     (void)s_p2HudClear;
 }
 
+/* Redirect "angle toward the player" to whichever live player is nearer to the
+ * firing/suction origin `pos` (or P2 when P1 is a ghost): we just hand the
+ * original FUN_00442370 a different `this` (the P2 object). Covers enemy aimed
+ * shots and item suction in one place. Passthrough when off / no P2 / P2 ghost. */
+static long double __fastcall HookedAngleToPlayer(void *player, void *edx, float *pos)
+{
+    void *p2 = (void *)s_p2;
+    if (s_coopAim && p2 && !s_p2Ghost && pos) {
+        char *p1 = (char *)ADDR_PLAYER_BASE;
+        float px = pos[0], py = pos[1];
+        float ax = *(float *)(p1 + OFF_POS_X),          ay = *(float *)(p1 + OFF_POS_Y);
+        float bx = *(float *)((char *)p2 + OFF_POS_X),  by = *(float *)((char *)p2 + OFF_POS_Y);
+        float d1 = (ax - px) * (ax - px) + (ay - py) * (ay - py);
+        float d2 = (bx - px) * (bx - px) + (by - py) * (by - py);
+        if (s_p1Ghost || d2 < d1)
+            return s_origAngleToPlayer(p2, edx, pos);
+    }
+    return s_origAngleToPlayer(player, edx, pos);
+}
+
 static int __fastcall HookedDraw(void *self)
 {
     int r = s_origDraw(self);               /* P1 draw */
@@ -2302,6 +2338,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
     if (MH_CreateHook(ADDR_MENU_DISPATCH,  (LPVOID)&HookedMenuDispatch,  (LPVOID*)&s_origMenuDispatch)  != MH_OK) return 0;
     if (MH_CreateHook(ADDR_HUD_DRAW,       (LPVOID)&HookedHudDraw,       (LPVOID*)&s_origHudDraw)       != MH_OK) return 0;
+    if (MH_CreateHook((LPVOID)ADDR_ANGLE_TO_PLAYER, (LPVOID)&HookedAngleToPlayer, (LPVOID*)&s_origAngleToPlayer) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
@@ -2315,6 +2352,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;
     if (MH_EnableHook(ADDR_MENU_DISPATCH)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_HUD_DRAW)       != MH_OK) return 0;
+    if (MH_EnableHook((LPVOID)ADDR_ANGLE_TO_PLAYER) != MH_OK) return 0;
     return 1;
 }
 

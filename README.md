@@ -29,6 +29,8 @@ by an RNG-seed comparison every frame.
 - **`docs/th07_bullet_system.md`** — the enemy-bullet (danmaku) manager, per-bullet
   struct map, spawn/update/draw fns, and the graze→hit collision gate that Fork B
   rides.
+- **`docs/th07_enemy_system.md`** — the enemy manager/array, per-enemy struct,
+  the ECL VM tick + death flow, and the shot-damage sweep co-op scales.
 
 ## Layout
 | Path | What |

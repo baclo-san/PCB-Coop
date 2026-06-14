@@ -1973,20 +1973,26 @@ static void DrawIconRow(char *iconObj, int count, float y)
 
 /* §8a: P1-style icon HUD for P2, drawn in ZUN's own sidebar pass (full-screen
  * viewport, HUD render target) so the coords/clip match P1's rows exactly. */
+static int s_p2HudClear = 0;   /* frames to keep force-clearing after P2 icons stop */
+
 static void __fastcall HookedHudDraw(void *self)
 {
     void *p2  = (void *)s_p2;
     void *res = (void *)*ADDR_RES_PTR;
+    int  drawP2 = (s_p2IconHud && p2 && !s_p2Ghost && res != NULL);
 
-    /* Force the full sidebar redraw this frame so a dropped P2 life/bomb can't
-     * leave a stale icon on the persistent HUD surface (clears P2's row region,
-     * which the bg tiles at x416..624 / y16..464 cover, then repaints P1). */
-    if (s_p2IconHud && p2 && !s_p2Ghost && res)
+    /* Force the full sidebar redraw so a CHANGED/REMOVED P2 row can't leave a
+     * stale icon on the persistent HUD surface (the bg tiles span x416..624 /
+     * y16..464, covering P2's region, then ZUN repaints P1). Keep forcing for a
+     * few frames AFTER P2 icons stop (death->ghost / despawn) to wipe the
+     * residue, then fall back to ZUN's vanilla on-change cadence (so a SOLO game
+     * with the icon HUD still enabled isn't repainting every frame). */
+    if (res && (drawP2 || s_p2HudClear > 0))
         *(int *)((char *)res + HUD_OFF_REDRAW) = 1;
 
     s_origHudDraw(self);                      /* ZUN paints P1's full HUD */
 
-    if (s_p2IconHud && p2 && !s_p2Ghost && res) {
+    if (drawP2) {
         DrawIconRow((char *)res + HUD_OFF_LIFE_ICON, (int)s_p2Lives, HUD_P2_LIVES_Y);
         DrawIconRow((char *)res + HUD_OFF_BOMB_ICON, (int)s_p2Bombs, HUD_P2_BOMBS_Y);
         {   /* "2P" marker + power number (ascii, to the backbuffer like P1's) */
@@ -1996,6 +2002,9 @@ static void __fastcall HookedHudDraw(void *self)
             pos[0] = HUD_ICON_X;     pos[1] = HUD_P2_POWER_Y;
             ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "%d", (int)s_p2Power);
         }
+        s_p2HudClear = 3;
+    } else if (s_p2HudClear > 0) {
+        s_p2HudClear--;
     }
 }
 
@@ -2054,6 +2063,7 @@ static void ResetCoopSession(void)
     s_shareFrames   = 0;
     s_p2Carry       = 0;
     s_p2Shadow      = 0;
+    s_p2HudClear    = 0;
     s_lastLogicFrame = 0x7fffffff;
     Log("coop session reset (returned to front-end menu)");
 }

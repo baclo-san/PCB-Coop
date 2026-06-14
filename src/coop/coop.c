@@ -542,6 +542,14 @@ static int   s_allowDiffChar = 0;      /* F2 enables cycling P2 to a DIFFERENT c
 #define MENU_OFF_COUNTER2   0xb0c0     /* param_1[0x2c30]                          */
 #define MENU_CONFIRM        0x1001
 #define MENU_CANCEL         0xa
+/* On-screen "P2 SELECT" prompt position during P2's char/shot pass (handoff §8d).
+ * Drawn via the global ascii queue (FUN_00402060), which renders every scene —
+ * including the front-end menu — so the cue is visible while P2 picks. The menu
+ * uses the full 640px width; this sits in the upper-left, clear of the right-side
+ * char portraits. Coords are a best guess (no live test this session) — tune to
+ * taste after a visual check. */
+#define MENU_PROMPT_X       64.f
+#define MENU_PROMPT_Y       40.f
 enum { CM_IDLE = 0, CM_P2_CHAR, CM_P2_SHOT, CM_COMMIT };
 static int      s_coopMenu  = CM_IDLE; /* coop char-select FSM state               */
 static int      s_menuSelect = 1;      /* feature enable (0 = bypass, vanilla menu)*/
@@ -2044,6 +2052,14 @@ static int __fastcall HookedMenuDispatch(void *menuv)
 
     /* ---- P2's pass: route P2 (and P1, as a helper) input into the menu ---- */
     if (s_coopMenu == CM_P2_CHAR || s_coopMenu == CM_P2_SHOT) {
+        /* on-screen cue that it's P2's turn (handoff §8d) — queued every frame on
+         * the global ascii manager, which the menu scene also flushes */
+        float ppos[3];
+        ppos[0] = MENU_PROMPT_X; ppos[1] = MENU_PROMPT_Y; ppos[2] = 0.f;
+        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, ppos,
+                         s_coopMenu == CM_P2_CHAR ? "P2 SELECT CHARACTER"
+                                                  : "P2 SELECT SHOT");
+
         uint16_t realCur  = *ADDR_MENU_IN_CUR;
         uint16_t realPrev = *ADDR_MENU_IN_PREV;
         uint16_t combined = (uint16_t)(realCur | ReadP2MenuInput()); /* either player */

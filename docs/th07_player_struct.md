@@ -78,6 +78,41 @@ calls for the live test.
 > This section independently re-confirms coop.c's `OFF_STATE` (0x2408), `RES_POWER`
 > (0x7c), `OFF_POS_X/Y` (0x930/0x934) and `ADDR_GAMEOVER` (0x62f64d).
 
+## Shot / laser / bomb subsystem (2026-06-14 mapping pass)
+
+The player's own shots live IN the player struct and are created/moved/drawn
+param-relative (so P2's shots live in P2's clone — coop.c relies on this).
+
+| Field | Meaning | src |
+|---|---|---|
+| `+0x2444` + i·`0x364` | shot slot array, 96 slots | coop.c `OFF_SHOTS` |
+| slot `+0x34a` | u16 active flag (0 = free) | FUN_0043c700:25369 |
+| slot `+0x34e` | i16 **laser-slot index** into the owner's laser table | FUN_0043c700:25351 |
+| slot `+0x350` | i16 option index (which option fired it) | 25377 |
+| slot `+0x1c0` | render flags (bit0xd = needs anm rebind) | 25352 |
+| slot `+0x1c6` | anm rebind request (same field as any anm sprite obj) | 25353 |
+| `+0x169d0` + idx·`0x10` | **laser-slot pointer table** (owner-side; the slot ptr a live laser is bound through — moving the slot orphans it, which broke MarisaB until coop.c kept P2 shots home) | 25090-25368, FUN_0043d2f0 |
+| `+0x169cc` + idx·`0x10` | per-laser life/timer (`<1` ⇒ retire the slot) | 25357-25368 |
+| `+0x169c4` + idx·`0x10` | per-laser sub-fields (countdown sentinel `0xfffffc19`) | 25358-25366 |
+| `+0x16a20` | bombing flag (nonzero while a bomb runs) | OFF_BOMBING; 25356 |
+| `+0x16a24` | bomb sub-state (selects the bomb update fn ptr) | (struct table above) |
+| `+0x16a40` / `+0x16a48` | bomb update fn pointers (called indirectly) | (struct table above) |
+
+- **`.sht` character shot config:** the per-character shot/bomb setup fns run at
+  PCBdecomp.c 5932-7625 (one block per char×type; each clears `+0x16a20`). They
+  install the shot-spawn callbacks + the bomb fn ptrs (`+0x16a40/48`) for the
+  selected character — i.e. the data coop.c swaps when P2 picks a different char
+  (`ApplyP2Selection`). The full `.sht` binary layout isn't mapped here.
+- **Shot→enemy damage:** `FUN_0043d9e0(player, pos, size, &flag)` sweeps this shot
+  array against an enemy box and returns the frame's damage — the function the enemy
+  update calls (`th07_enemy_system.md` §3) and coop.c's boss-HP divisor targets.
+- **8c (SakuyaA cross-char aim):** the aimed (non-homing) shot reads an aim target
+  the enemy update fills keyed off the GLOBAL char id into static P1's block only;
+  for a different-char P2=SakuyaA the source isn't per-player (coop.c mirrors P1's
+  block each frame). A proper fix would give P2 its own aim-target fill — start from
+  the enemy-update site that writes P1's aim block and the shot-spawn callback that
+  reads it.
+
 ## Open / unverified
 - Hitbox/graze radius offsets, focus-mode flag, and the power-shot level field are not
   yet located (collision uses the leaf primitives FUN_0043e260/6b0 that coop.c detours,

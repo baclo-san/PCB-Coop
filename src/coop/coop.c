@@ -477,6 +477,12 @@ typedef int  (__fastcall *SpriteBlitFn_t)(void *mgr, int edx, void *spriteObj);
 typedef void (__fastcall *SpriteFlushFn_t)(void *anmMgr);
 typedef void (__fastcall *HudDrawFn_t)(void *singleton);
 static HudDrawFn_t s_origHudDraw = NULL;
+typedef void (__fastcall *DeclDrawFn_t)(void *declMgr); /* FUN_0042c577 portrait pass */
+static DeclDrawFn_t s_origDeclDraw = NULL;
+/* FUN_0042868d is __thiscall(this, int spriteIdx, char *name); model it as the
+ * collision hooks do (__fastcall with a dummy edx) — both clean 8 stack bytes. */
+typedef void (__fastcall *DeclMakeFn_t)(void *self, void *edx, int spriteIdx, char *name);
+static DeclMakeFn_t s_origDeclMake = NULL;
 #define SPR_OBJ_SIZE     0x24c                  /* HUD sprite-object stride (0x14ac->0x16f8)*/
 #define SPR_OFF_FLAGS    0x1c0                  /* sprite-obj: draw-enable bits (b0|b1) + flip*/
 #define SPR_OFF_ANM      0x1e4                  /* sprite-obj: bound anm sprite-entry ptr  */
@@ -1008,6 +1014,204 @@ static void SwapAnm(int enter)
     s_anmSwapped = enter;
 }
 
+/* ---- P2 bomb-declaration PORTRAIT (handoff §8b) ---------------------------
+ * A different-char P2's bomb spell-declaration shows P1's face: the portrait is a
+ * SECOND char-specific anm, data/face_{rm,mr,sk}00.anm, loaded by the engine at
+ * base 0x4a0 into slot 0x19 for the GLOBAL char id only (PCBdecomp.c 15833/43/53).
+ * The declaration is CREATED by FUN_0042868d (in a bomb cb) — it binds the
+ * portrait obj to face id 0x4a1 and sets its sprite (UV cached at SET-time) — and
+ * DRAWS in FUN_0042c577 (@0x42c577, PCBdecomp.c:17301), a global pass, with the
+ * TEXTURE resolved from the live table at DRAW-time. Boss/dialogue faces are a
+ * separate anm at base 0x4ad, so the player face id window is [0x4a0,0x4ad).
+ *
+ * Same proven overlay pattern as the player char anm (NOT a refactor of it — a
+ * parallel copy, per the working-build discipline): load P2's face into its own
+ * spare slot at the CLEAN stage-start point (ApplyP2Selection, no live entities —
+ * the round-13c lesson; the earlier mid-stage load corrupted the 0x400 table),
+ * diff-capture the ids it defines, restore P1's live tables, then SWAP those ids
+ * to P2 only around (a) P2's update+draw (so the create-time UV caches P2's face;
+ * a declaration may be created from either an update or a draw bomb cb) and (b)
+ * FUN_0042c577 when the live declaration is P2's (s_declP2). Best-effort: a
+ * face-load failure just leaves P2 showing P1's face — the body/shots still work.
+ * Ownership (s_declP2) is attributed by hooking the create fn FUN_0042868d
+ * (HookedDeclMake): whoever's update/draw window we're in when a declaration is
+ * created owns it. */
+#define FACE_ID_LO   0x4a0
+#define FACE_ID_HI   0x4ad             /* exclusive; boss faces start at 0x4ad      */
+#define FACE_MAX_IDS (FACE_ID_HI - FACE_ID_LO)
+#define ADDR_DECL_DRAW   ((LPVOID)0x0042c577)         /* __fastcall(ecx = decl mgr)  */
+#define ADDR_DECL_MAKE   ((LPVOID)0x0042868d)         /* declaration create (thiscall)*/
+static int      s_faceChar = -1;
+static int      s_faceSlot = -1;
+static uint32_t s_faceFile = 0;
+static int      s_faceActive = 0;      /* P2 portrait overlay armed (P2 != global)  */
+static int      s_faceSwapped = 0;
+static int      s_faceIdCount = 0;
+static uint16_t s_faceIds[FACE_MAX_IDS];
+static uint32_t s_faceScript[FACE_MAX_IDS];
+static uint32_t s_faceRev[FACE_MAX_IDS];
+static unsigned char s_faceSprite[FACE_MAX_IDS][ANM_SPRITE_STRIDE];
+static int      s_declP2 = 0;          /* the live declaration was created by P2     */
+static int      s_inP2Draw = 0;        /* inside s_origDraw(P2) right now            */
+static int      s_p2Portrait = 1;      /* feature on (default; git revert to drop)   */
+
+static void FreeP2FaceAnm(void);
+
+/* Load P2's face anm into its own spare slot at base 0x4a0, diff-capture the ids
+ * it defines, restore P1's tables. Mirrors LoadP2CharAnm; returns 1 on success. */
+static int LoadP2FaceAnm(int charId)
+{
+    static const char *const faceNames[3] =
+        { "data/face_rm00.anm", "data/face_mr00.anm", "data/face_sk00.anm" };
+    uint32_t mgr = *ADDR_ANM_MGR_PP;
+    int slot, id, n = 0;
+    char *scr, *spr, *slt, *rev;
+
+    if (charId < 0 || charId > 2 || !mgr) return 0;
+    if (s_faceChar == charId && s_faceIdCount > 0) return 1;   /* already loaded */
+    FreeP2FaceAnm();
+
+    scr = (char *)(mgr + ANM_SCRIPT_TBL);
+    spr = (char *)(mgr + ANM_SPRITE_TBL);
+    rev = (char *)(mgr + ANM_REV_TBL);
+    slt = (char *)(mgr + ANM_SLOT_TBL);
+
+    /* a free non-engine slot, distinct from the player overlay's slot */
+    slot = -1;
+    for (id = 0x30; id >= 0x02; id--) {
+        if (IsGameAnmSlot(id) || id == s_p2AnmSlot) continue;
+        if (*(uint32_t *)(slt + id * 0xc) == 0) { slot = id; break; }
+    }
+    if (slot < 0) { Log("P2 face anm: no free non-engine slot"); return 0; }
+
+    {
+        uint32_t p1Script[FACE_MAX_IDS];
+        uint32_t p1Rev[FACE_MAX_IDS];
+        unsigned char p1Sprite[FACE_MAX_IDS][ANM_SPRITE_STRIDE];
+        int i, rc;
+        for (i = 0; i < FACE_MAX_IDS; i++) {
+            p1Script[i] = *(uint32_t *)(scr + (FACE_ID_LO + i) * 4);
+            p1Rev[i]    = *(uint32_t *)(rev + (FACE_ID_LO + i) * 4);
+            memcpy(p1Sprite[i], spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE,
+                   ANM_SPRITE_STRIDE);
+        }
+        rc = ADDR_ANM_LOAD_FN((void *)mgr, slot, faceNames[charId], FACE_ID_LO);
+        if (rc != 0) {
+            Log("P2 face anm: load %s -> slot %d FAILED rc=%d",
+                faceNames[charId], slot, rc);
+            for (i = 0; i < FACE_MAX_IDS; i++) {
+                *(uint32_t *)(scr + (FACE_ID_LO + i) * 4) = p1Script[i];
+                *(uint32_t *)(rev + (FACE_ID_LO + i) * 4) = p1Rev[i];
+                memcpy(spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
+                       ANM_SPRITE_STRIDE);
+            }
+            return 0;
+        }
+        for (i = 0; i < FACE_MAX_IDS; i++) {
+            uint32_t curS = *(uint32_t *)(scr + (FACE_ID_LO + i) * 4);
+            int sprChanged = memcmp(spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE,
+                                    p1Sprite[i], ANM_SPRITE_STRIDE) != 0;
+            if (curS != p1Script[i] || sprChanged) {
+                s_faceIds[n]    = (uint16_t)(FACE_ID_LO + i);
+                s_faceScript[n] = curS;
+                s_faceRev[n]    = *(uint32_t *)(rev + (FACE_ID_LO + i) * 4);
+                memcpy(s_faceSprite[n], spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE,
+                       ANM_SPRITE_STRIDE);
+                n++;
+            }
+            *(uint32_t *)(scr + (FACE_ID_LO + i) * 4) = p1Script[i];
+            *(uint32_t *)(rev + (FACE_ID_LO + i) * 4) = p1Rev[i];
+            memcpy(spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
+                   ANM_SPRITE_STRIDE);
+        }
+    }
+
+    s_faceChar    = charId;
+    s_faceSlot    = slot;
+    s_faceFile    = *(uint32_t *)(slt + slot * 0xc);
+    s_faceIdCount = n;
+    Log("P2 face anm: %s -> slot %d (file 0x%08x), %d ids (0x%x..0x%x)",
+        faceNames[charId], slot, s_faceFile, n,
+        n ? s_faceIds[0] : 0, n ? s_faceIds[n - 1] : 0);
+    return n > 0;
+}
+
+static void FreeP2FaceAnm(void)
+{
+    uint32_t mgr = *ADDR_ANM_MGR_PP;
+    if (s_faceSlot >= 0 && mgr) {
+        /* the engine slot-free zeroes the global tables for this slot's ids; P2's
+         * face loaded at base 0x4a0 = the SAME ids as P1's face, so snapshot P1's
+         * window, free, then restore (the round-13a clobber fix, for the face). */
+        char *scr = (char *)(mgr + ANM_SCRIPT_TBL);
+        char *rev = (char *)(mgr + ANM_REV_TBL);
+        char *spr = (char *)(mgr + ANM_SPRITE_TBL);
+        uint32_t p1Script[FACE_MAX_IDS];
+        uint32_t p1Rev[FACE_MAX_IDS];
+        static unsigned char p1Sprite[FACE_MAX_IDS][ANM_SPRITE_STRIDE];
+        int i;
+        for (i = 0; i < FACE_MAX_IDS; i++) {
+            p1Script[i] = *(uint32_t *)(scr + (FACE_ID_LO + i) * 4);
+            p1Rev[i]    = *(uint32_t *)(rev + (FACE_ID_LO + i) * 4);
+            memcpy(p1Sprite[i], spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE,
+                   ANM_SPRITE_STRIDE);
+        }
+        ADDR_ANM_FREE_FN((void *)mgr, s_faceSlot);
+        for (i = 0; i < FACE_MAX_IDS; i++) {
+            *(uint32_t *)(scr + (FACE_ID_LO + i) * 4) = p1Script[i];
+            *(uint32_t *)(rev + (FACE_ID_LO + i) * 4) = p1Rev[i];
+            memcpy(spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE, p1Sprite[i],
+                   ANM_SPRITE_STRIDE);
+        }
+        Log("P2 face anm: freed slot %d (P1 window restored)", s_faceSlot);
+    }
+    s_faceChar = -1;
+    s_faceSlot = -1;
+    s_faceFile = 0;
+    s_faceIdCount = 0;
+    s_faceActive = 0;
+    s_faceSwapped = 0;
+}
+
+/* Exchange the face id table entries between P1's (live) and P2's captured face.
+ * Mirrors SwapAnm; self-validates the slot still holds our file (retires safely
+ * if the engine reused it). Only the portrait ids 0x4a1..0x4ac move. */
+static void SwapFace(int enter)
+{
+    uint32_t mgr = *ADDR_ANM_MGR_PP;
+    char *scr, *spr, *rev;
+    int i;
+    if (!s_faceActive || !mgr || s_faceIdCount == 0) return;
+    if (enter == s_faceSwapped) return;
+    if (enter && s_faceSlot >= 0) {
+        uint32_t cur = *(uint32_t *)(mgr + ANM_SLOT_TBL + s_faceSlot * 0xc);
+        if (cur != s_faceFile) {
+            Log("SwapFace: slot %d reused by engine (0x%08x != 0x%08x) -> retiring "
+                "P2 portrait overlay (P2 bomb shows P1 face, no crash)",
+                s_faceSlot, cur, s_faceFile);
+            s_faceActive = 0;
+            s_faceSwapped = 0;
+            return;
+        }
+    }
+    scr = (char *)(mgr + ANM_SCRIPT_TBL);
+    spr = (char *)(mgr + ANM_SPRITE_TBL);
+    rev = (char *)(mgr + ANM_REV_TBL);
+    for (i = 0; i < s_faceIdCount; i++) {
+        int id = s_faceIds[i];
+        uint32_t *tScr = (uint32_t *)(scr + id * 4);
+        uint32_t *tRev = (uint32_t *)(rev + id * 4);
+        unsigned char *tSpr = (unsigned char *)(spr + id * ANM_SPRITE_STRIDE);
+        uint32_t tmp; unsigned char tmpS[ANM_SPRITE_STRIDE];
+        tmp = *tScr; *tScr = s_faceScript[i]; s_faceScript[i] = tmp;
+        tmp = *tRev; *tRev = s_faceRev[i];    s_faceRev[i]    = tmp;
+        memcpy(tmpS, tSpr, ANM_SPRITE_STRIDE);
+        memcpy(tSpr, s_faceSprite[i], ANM_SPRITE_STRIDE);
+        memcpy(s_faceSprite[i], tmpS, ANM_SPRITE_STRIDE);
+    }
+    s_faceSwapped = enter;
+}
+
 /* Swap the three selection globals to P2's identity around a P2-context engine
  * call so char/type-gated branches (MarisaB fire-suppress during a border,
  * SakuyaB checks, ...) see P2, not P1. No-op when P2 mirrors P1. */
@@ -1054,14 +1258,19 @@ static void ApplyP2Selection(void *p2)
     if (sel / 2 != p1sel / 2) {
         if (LoadP2CharAnm(sel / 2)) {
             s_p2AnmActive = 1;
+            /* portrait is best-effort: a face-load failure leaves P2 showing P1's
+             * face but the body/shots still work. Off when the feature is off. */
+            s_faceActive = (s_p2Portrait && LoadP2FaceAnm(sel / 2));
         } else {
             Log("P2 loadout: char anm load failed -> falling back to P1's char");
             sel = (p1sel & ~1) | (sel & 1);
             s_p2Sel = sel;
             FreeP2CharAnm();
+            FreeP2FaceAnm();
         }
     } else {
         FreeP2CharAnm();
+        FreeP2FaceAnm();
     }
 
     if (sel == p1sel) {
@@ -1171,6 +1380,8 @@ static void DespawnP2(void)
     s_enemyCount = 0;                       /* drop the enemy snapshot (stale ptrs) */
     SwapAnm(0);                             /* ensure tables are P1's before free */
     FreeP2CharAnm();
+    SwapFace(0);                            /* restore P1 face tables before free   */
+    FreeP2FaceAnm();
     KillP2FocusFx();
     VirtualFree(p2, 0, MEM_RELEASE);
     Log("despawn: P2 freed");
@@ -1916,7 +2127,9 @@ static int __fastcall HookedUpdate(void *self)
             s_inP2Update = 1;               /* effect-spawn detour: redirect slot */
             SwapSelGlobals(1);              /* char/type-gated branches see P2 */
             SwapAnm(1);                     /* 0x400-range tables -> P2's char */
+            SwapFace(1);                    /* face ids -> P2 (decl create caches UV) */
             s_origUpdate(p2);               /* trampoline → no detour re-entry */
+            SwapFace(0);
             SwapAnm(0);
             SwapSelGlobals(0);
             s_inP2Update = 0;
@@ -2252,9 +2465,10 @@ static void BuildP2TargetBlock(void *p2)
 
 static int __fastcall HookedDraw(void *self)
 {
+    int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
     int r = s_origDraw(self);               /* P1 draw */
 
-    if ((uint32_t)self == ADDR_PLAYER_BASE) {
+    if (isP1) {
         void *p2 = (void *)s_p2;
         if (p2) {
             /* re-pin the P2 focus ring before anything draws it — the effect
@@ -2273,15 +2487,44 @@ static int __fastcall HookedDraw(void *self)
                 memcpy((char *)p2 + OFF_HOMING_TGT,
                        (char *)ADDR_PLAYER_BASE + OFF_HOMING_TGT, HOMING_TGT_LEN);
             s_enemyCount = 0;
+            s_inP2Draw = 1;
             SwapSelGlobals(1);
             SwapAnm(1);                     /* P2's char sprites for its draw */
+            SwapFace(1);                    /* face ids -> P2 (draw-cb decl create) */
             s_origDraw(p2);
+            SwapFace(0);
             SwapAnm(0);
             SwapSelGlobals(0);
+            s_inP2Draw = 0;
             DrawCoopHud(p2);
         }
     }
     return r;
+}
+
+/* The declaration is CREATED here (FUN_0042868d). Attribute its ownership to
+ * whichever player's update/draw window we're in — definitive, no dependence on
+ * the dirty-flag dynamics. (The create-time portrait UV is captured as P2's by the
+ * SwapFace already active in P2's update/draw window.) */
+static void __fastcall HookedDeclMake(void *self, void *edx, int spriteIdx, char *name)
+{
+    s_declP2 = (s_inP2Update || s_inP2Draw) ? 1 : 0;
+    s_origDeclMake(self, edx, spriteIdx, name);
+}
+
+/* The bomb spell-declaration portrait blits here (FUN_0042c577, PCBdecomp 17301):
+ * the texture is resolved from the LIVE face-id table at draw-time. When the live
+ * declaration is a different-char P2's (s_declP2 + the face overlay armed), swap
+ * P2's face ids in for the duration so the portrait renders P2's face, not P1's. */
+static void __fastcall HookedDeclDraw(void *self)
+{
+    if (s_p2Portrait && s_declP2 && s_faceActive) {
+        SwapFace(1);
+        s_origDeclDraw(self);
+        SwapFace(0);
+    } else {
+        s_origDeclDraw(self);
+    }
 }
 
 /* ---- menu character-select hook (handoff §5g) ---- */
@@ -2300,8 +2543,10 @@ static void ResetCoopSession(void)
     s_p2 = NULL;                 /* stop any piggyback FIRST                       */
     s_p2FocusFx = NULL;          /* DROP the stale fx handle — never KillP2FocusFx */
     if (s_p2AnmSlot >= 0) { SwapAnm(0); FreeP2CharAnm(); }
+    if (s_faceSlot  >= 0) { SwapFace(0); FreeP2FaceAnm(); }
     if (p2) VirtualFree(p2, 0, MEM_RELEASE);
     s_enemyCount    = 0;         /* drop the enemy snapshot (stale ptrs)          */
+    s_declP2        = 0;
     s_autoSpawned   = 0;
     s_readyFrames   = 0;
     s_p1Ghost       = 0;
@@ -2473,6 +2718,8 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
     if (MH_CreateHook(ADDR_MENU_DISPATCH,  (LPVOID)&HookedMenuDispatch,  (LPVOID*)&s_origMenuDispatch)  != MH_OK) return 0;
     if (MH_CreateHook(ADDR_HUD_DRAW,       (LPVOID)&HookedHudDraw,       (LPVOID*)&s_origHudDraw)       != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_DECL_DRAW,      (LPVOID)&HookedDeclDraw,      (LPVOID*)&s_origDeclDraw)      != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_DECL_MAKE,      (LPVOID)&HookedDeclMake,      (LPVOID*)&s_origDeclMake)      != MH_OK) return 0;
     if (MH_CreateHook((LPVOID)ADDR_ANGLE_TO_PLAYER, (LPVOID)&HookedAngleToPlayer, (LPVOID*)&s_origAngleToPlayer) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
@@ -2487,6 +2734,8 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;
     if (MH_EnableHook(ADDR_MENU_DISPATCH)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_HUD_DRAW)       != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_DECL_MAKE)      != MH_OK) return 0;
     if (MH_EnableHook((LPVOID)ADDR_ANGLE_TO_PLAYER) != MH_OK) return 0;
     return 1;
 }

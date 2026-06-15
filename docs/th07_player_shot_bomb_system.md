@@ -11,8 +11,8 @@ labels in `PCBdecomp.c`; the hex **is** the VA. Line numbers cite `PCBdecomp.c`.
 
 **Confidence key:** ✅ = read + cross-checked this session (or already verified in
 coop.c by the running mod); 🟡 = decomp-derived sketch, plausible but NOT
-independently confirmed — verify before relying. The §6 appendix is mostly 🟡
-(some items promoted to ✅ after reading the spawn loop `FUN_0043d160`, §3a).
+independently confirmed — verify before relying. §6 (the `.sht` format) is now
+mostly ✅ after reading the writer `FUN_0043bbd0`; a few header details remain 🟡.
 
 ---
 
@@ -82,8 +82,8 @@ So `player+0x240b` is the focus-mode byte for shots (the focus *input* bit is
 So a `.sht` fire-entry record is **0x34 bytes** (NOT 0x1a — the §6-sketch source
 read `short* + 0x1a` as 26 bytes, but it scales ×2 = 52). Its `+0x24` = per-entry
 fire-callback ptr, `+0x28/+0x2c/+0x30` = the update/draw/collide callbacks copied
-into each spawned shot. The remaining entry fields (pos/vel/damage/angle) are
-written by the default fire cb `FUN_0043bdc0` / `FUN_0043bbd0` — still 🟡 (§6).
+into each spawned shot. The remaining entry fields (pos/speed/damage/angle) are
+written by the default fire cb `FUN_0043bdc0` → `FUN_0043bbd0` — now mapped in §6.
 
 ---
 
@@ -106,9 +106,10 @@ slots (`base = player+0x2444`) and reads these, so the offsets below are
 
 The sweep’s damage value per slot is applied by the caller (the per-enemy update
 `FUN_00420620` subtracts the sweep return from enemy HP — see
-`docs/th07_boss_hp_scaling.md`). The slot’s **damage / angle / velocity / sprite**
-fields are filled at fire time (🟡 offsets in §6: damage `+0x348`, angle
-`+0x334/+0x338`, velocity `+0x324/+0x328`, sprite `+0x1d8`).
+`docs/th07_boss_hp_scaling.md`). The slot’s damage/angle/velocity/sprite
+fields are filled at fire time by `FUN_0043bbd0` from the `.sht` entry (✅ §6:
+damage `+0x348`, angle `+0x338`, speed `+0x334`, velocity `+0x324/+0x328`, sprite
+`+0x1d8`).
 
 ---
 
@@ -203,36 +204,51 @@ collision leaves (`FUN_0043e260` family); confirm which offset before reusing
 
 ---
 
-## 6. Decomp sketch — `.sht` format & extra slot/bomb fields (🟡 ALL UNVERIFIED)
+## 6. `.sht` format & shot-slot fields (mostly ✅ — verified via the writer)
 
-From an assisted read of `FUN_00442b70` / `FUN_0043bcc0` / the fire path. Treat as
-a starting hypothesis; each needs confirmation (the assist also mislabeled some
-items, since corrected above). **Do not cite as ground truth.**
+The `.sht` entry format and the slot writes are now read directly from
+`FUN_0043bbd0`/`FUN_0043bdc0`/`FUN_0043d160` (✅). A few header/option details
+remain 🟡 and are flagged inline.
 
 **`.sht` header** (buffer base, ✅ partly from `FUN_0043d160`): `+0x34` = the
 power→pattern table, an array of 8-byte `{chain_ptr, threshold}` pairs (pick the
 pair whose threshold > current power). `+0x08`/`+0x0c`/`+0x10` = hitbox/unfoc-speed/
 foc-speed (coop.c-baked). The `+0x02` count is 🟡.
 
-**`.sht` per-fire-entry record — stride `0x34` bytes (✅ corrected; `<0` at +0x00
-terminates ✅).** `+0x24` = per-entry fire callback ptr (0 ⇒ default `FUN_0043bdc0`),
-`+0x28`/`+0x2c`/`+0x30` = the shot update/draw/collide callbacks copied to the slot
-(✅). The geometry fields below are 🟡 (written by the fire cb, not yet read — and
-the old offsets came from a misread 0x1a stride, so treat as ESPECIALLY suspect):
+**`.sht` per-fire-entry record — stride `0x34` bytes, `<0` at +0x00 terminates.**
+Now ✅ — read from the timing cb `FUN_0043bdc0` @25066 (`fire = frame % e[0] ==
+e[1]`) and the slot writer `FUN_0043bbd0` @25018:
 
-| Off | Type | Guess (🟡 needs a fresh read of `FUN_0043bdc0`/`FUN_0043bbd0`) |
-|---|---|---|
-| +0x00 | i16 | fire-timing / terminator (`<0` ends the chain ✅) |
-| +0x04..+0x10 | f32 | spawn offset + velocity (offsets unconfirmed) |
-| +0x14 | f32 | angle → slot +0x334 |
-| +0x1c | i16 | damage → slot +0x348 |
-| +0x24 | ptr | per-entry fire callback (✅) |
-| +0x28/+0x2c/+0x30 | ptr | slot update/draw/collide callbacks (✅) |
+| Off | Type | Meaning | → shot slot |
+|---|---|---|---|
+| +0x00 | i16 | fire-timing modulo (`frame % e[0]`); `<0` ends the chain | — |
+| +0x02 | i16 | fire-timing remainder (`== e[1]`) | — |
+| +0x04 | f32 | spawn offset X (added to base pos) | +0x24c |
+| +0x08 | f32 | spawn offset Y | +0x250 |
+| +0x0c | f32 | shot **hitbox width** | +0x318 |
+| +0x10 | f32 | shot **hitbox height** | +0x31c |
+| +0x14 | f32 | **angle** (radians) | +0x338 |
+| +0x18 | f32 | **speed**; velocity = `cos·speed`,`sin·speed` (`FUN_0048bbf0`/`FUN_0048bb40` = x87 cos/sin) | +0x334; vel +0x324/+0x328 |
+| +0x1c | i16 | **damage** | +0x348 |
+| +0x1e | i8  | spawn source: `0` = player center (+0x930/4/8), `n` = option n-1 (+0x9b4 + (n-1)·0xc) | (selects base pos) |
+| +0x1f | i8  | shot type/script id | +0x34c |
+| +0x20 | i16 | sprite/anim id (`FUN_0044ea20`, script `DAT_004b9e44+0x28ef0 + id·4`) | +0x1d8 |
+| +0x22 | i16 | sound id (≥0 ⇒ `FUN_0044c930`) | — |
+| +0x24 | ptr | per-entry fire callback (0 ⇒ default `FUN_0043bdc0`) | — |
+| +0x28/+0x2c/+0x30 | ptr | shot update/draw/collide callbacks | +0x354/+0x358/+0x35c |
 
-**Extra shot-slot fields (🟡):** `+0x1d8` sprite id, `+0x254` z/scale, `+0x324`
-vel X, `+0x328` vel Y, `+0x334`/`+0x338` angle, `+0x340` age, `+0x344` homing/
-cadence counter (✅ used by the sweep), `+0x348` damage, `+0x34e` homing-array
-index, `+0x354`/`+0x35c` update/collide callbacks, `+0x360` `.sht`-entry ptr.
+The writer also sets slot `+0x320 = 1.0` (scale), `+0x33c = -999` sentinel,
+`+0x340 = 0` (age), `+0x344 = 0` (homing counter). So the earlier 0x1a-stride
+guess (velocity at +0x0c/+0x10) was wrong: those are the shot’s own hitbox, and
+velocity is derived from the angle/speed pair, not stored.
+
+**Shot-slot fields (✅ from the writer + damage sweep):** `+0x1b8` tint, `+0x1c0`
+flags (`|0x1000` drawn), `+0x1d8` sprite id, `+0x24c/+0x250/+0x254` pos XYZ,
+`+0x318/+0x31c` hitbox W/H, `+0x320` scale (1.0), `+0x324/+0x328` velocity X/Y,
+`+0x334` speed, `+0x338` angle, `+0x33c` -999 sentinel, `+0x340` age, `+0x344`
+homing/cadence counter, `+0x348` damage (i16), `+0x34a` active flag, `+0x34c` type,
+`+0x354/+0x358/+0x35c` update/draw/collide callbacks, `+0x360` `.sht`-entry ptr.
+(`+0x34e` homing-array index is the remaining 🟡.)
 
 **Homing / aim targets (player, ✅ offsets from coop.c §5j):** `+0x2428` homing
 xyz, `+0x2434` aim xyz, `+0x2440` valid flag — filled by the enemy update for P1

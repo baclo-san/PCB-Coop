@@ -52,7 +52,7 @@ well-specified enough to fix + self-verify without the user. **Crashes first.**
   In vanilla you can't damage an Extra/Phantasm boss during a spell — they go invincible
   for its duration. P1 bombs respect this; **P2 bombs don't**, so Extra/Phantasm fights
   get cheesy. (Notes #8.) Make P2's bomb damage path honor the same boss-invincible-
-  during-spell gate P1's does.
+  during-spell gate P1's does. (claude oversimplified it here, ideally P2 bombing should trigger same tranforming mechanism as P1 bomb. if turns out too hard, full boss invul during P2 bomb can do too)
 
 ## P2 — design decision (NOT a bug — confirm intent, then enforce)
 
@@ -61,6 +61,7 @@ well-specified enough to fix + self-verify without the user. **Crashes first.**
   the survivor has no spare extends" + last-life 1up drop). User now wants the EoSD rule:
   you can only revive a partner if you have a life to spend. Before changing, confirm
   this supersedes §5f, then remove the free-revive / guaranteed-last-life-1up paths.
+  (message from me, the user. confirmed! but only about free revives. when player pichuuns on last life, he still should drop 1up)
 
 ## Confirmed working-as-intended (no fix wanted)
 

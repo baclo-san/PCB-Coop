@@ -1744,6 +1744,43 @@ desync still appears (dropped-packet RNG split, not a boundary), the next lever 
 th06 host-driven `Ctrl_Try_Resync` (infra already in `netcode.cpp`, not yet driven):
 host schedules a realign `delay*2+2` frames out and both reset RNG + clear rcv there.
 
+### §8k — Co-op replays
+
+**What's already free.** PCB's replay *record* fn `FUN_00442cd0` stores the full
+**16-bit** `g_InputMenu` word per frame ([PCBdecomp.c:27610]). Our merge writes P1
+(low 9) **and P2 (high 7)** into that exact word, so **every co-op .rpy already
+contains P2's complete per-frame input stream** — vanilla only ever used the low 9
+bits, leaving the high 7 as free space we now populate. In netplay both machines
+record the identical merged stream.
+
+**What was missing → P2 character tag — DONE.** The vanilla header has one player
+slot; P2's *character pick* wasn't stored. `HookedReplayHdrInit` (hook on the header
+builder `FUN_00443040`) now writes a 4-byte magic block `C2 07 <p2sel> <diffchar>`
+into the header's **0x58–0x5d gap**. Proven safe: the loader `FUN_004433b0` validates
+only magic@0x00 + checksum@0x08, and `FUN_00443550` consumes only 0x56 (P1 char),
+0x57 (stage), the 0x14–0x53 stage table, and 0x70–0xa7 — nothing in 0x58–0x5d (and no
+date field lives there). The @0x08 checksum is summed by the *save* after our write,
+so the file stays self-consistent and **vanilla PCB still loads it**. Only written
+when co-op is actually in play (`s_p2Sel>=0 || s_netActive`), so a solo run made with
+the DLL stays a byte-clean vanilla replay.
+
+**Still missing → two-player PLAYBACK (planned, not built).** Watching a co-op replay
+needs three more pieces, all building on the data now in the file: (1) read the
+0x58 block back on load to recover P2's character; (2) recreate the P2 clone at
+stage-start during playback (the menu/char-select is skipped on playback, so drive
+the existing `SpawnP2` auto-spawn from the stored sel); (3) in playback mode source
+P2's input from the replayed word's high bits (`g_InputGameplay`) instead of the
+keyboard/wire — today [coop.c:2255] always reads live input. PCB exposes a
+playback-mode flag (the `DAT_00626274+0x25` / `DAT_00575adc` bit the record/playback
+fns gate on). Determinism is already on our side (live lockstep depends on it).
+Until that lands, a co-op replay played back shows only P1 and (since P2's
+world-effects aren't reproduced) desyncs — so **co-op replays are for archiving now,
+watchable later**. Viewing will require the DLL loaded (vanilla can't render P2).
+
+**Proximity fade** range tightened (§ misc): `PROX_FAR2` 96px→48px, `PROX_NEAR2`
+24px→16px, so the other player only fades once the ~32px sprites actually overlap,
+not from across the screen.
+
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +
 retry all confirmed by the user). Before any risky change, note the last-good

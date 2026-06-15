@@ -1071,6 +1071,50 @@ static int __fastcall HookedGameStart(int self)
 }
 /* ===================== end netplay ===================== */
 
+/* ---- co-op replay tagging (FUN_00443040 — replay header builder) -------------
+ * PCB already records the full 16-bit input word per frame (FUN_00442cd0), and
+ * our merge puts P2 in the high 7 bits — so a co-op .rpy ALREADY carries P2's
+ * whole input stream for free. The one datum the vanilla header lacks is WHICH
+ * character P2 picked. We stash it (so co-op runs save as complete replays now;
+ * actual two-player PLAYBACK is a planned follow-up that will read this back).
+ *
+ * Safe by construction: the loader (FUN_004433b0 validates only magic@0x00 +
+ * the @0x08 checksum; FUN_00443550 consumes only 0x56/0x57, the 0x14-0x53 stage
+ * table, and 0x70-0xa7) never touches the 0x58-0x5d gap, and the header builder
+ * never writes it. We drop a 4-byte magic-tagged block there; the @0x08 checksum
+ * is computed by the save AFTER this runs, so the file stays self-consistent and
+ * vanilla PCB still loads it. Only written when co-op is actually in play, so a
+ * solo run made with the DLL stays a byte-clean vanilla replay. */
+#define ADDR_REPLAY_HDR_INIT ((LPVOID)0x00443040)
+#define RPY_COOP_OFF  0x58                 /* spare header gap 0x58-0x5d           */
+#define RPY_COOP_MAG0 0xC2                 /* co-op block magic / format tag       */
+#define RPY_COOP_MAG1 0x07
+typedef uint32_t (__fastcall *ReplayHdrFn_t)(void *self);
+static ReplayHdrFn_t s_origReplayHdr = NULL;
+static int s_rpyTagLogged = 0;
+
+static uint32_t __fastcall HookedReplayHdrInit(void *self)
+{
+    uint32_t r = s_origReplayHdr(self);
+    /* param_1[1] is the 0xe8-byte header buffer (allocated on the first call). */
+    unsigned char *hdr = (unsigned char *)((void **)self)[1];
+    int coop = (s_p2Sel >= 0) || s_netActive;
+    if (hdr && coop) {
+        int p2sel = (s_p2Sel >= 0) ? s_p2Sel : (int)*ADDR_SEL_ID;  /* mirror -> P1 */
+        hdr[RPY_COOP_OFF + 0] = RPY_COOP_MAG0;
+        hdr[RPY_COOP_OFF + 1] = RPY_COOP_MAG1;
+        hdr[RPY_COOP_OFF + 2] = (unsigned char)p2sel;
+        hdr[RPY_COOP_OFF + 3] = (unsigned char)(s_allowDiffChar ? 1 : 0);
+        if (!s_rpyTagLogged) {
+            int n = (p2sel >= 0 && p2sel <= 5) ? p2sel : 0;
+            Log("replay: tagged co-op header — P2=%s diff=%d (+0x%02x)",
+                ADDR_SEL_NAMES[n], s_allowDiffChar, RPY_COOP_OFF);
+            s_rpyTagLogged = 1;
+        }
+    }
+    return r;
+}
+
 /* Move P2's active shots into free slots of P1's authoritative array, then clear
  * them from P2 (ownership transfer). Runs at the END of P2's update each frame,
  * so P2's array is empty by the time the draw chain runs (no double-draw) and
@@ -1555,8 +1599,12 @@ static void MoveGhost(void *p2)
  * the player update (which rewrites the tint), gated off ghosts/game-over.
  * Off by default; flip coop.ini [coop] proximity_fade=1. Most meaningful under
  * netplay — tune PROX_* + PROX_FLOOR after a look. */
-#define PROX_NEAR2  (24.0f * 24.0f)    /* <= this: floor alpha (most transparent) */
-#define PROX_FAR2   (96.0f * 96.0f)    /* >= this: fully opaque                   */
+/* Range kept tight on purpose: the player sprite is ~32px wide, so fading should
+ * only kick in once the two are actually overlapping ("getting on top" of each
+ * other), not from a screen apart. Fade begins at 48px center-to-center (sprites
+ * just touching) and reaches the floor by 16px (heavily stacked). */
+#define PROX_NEAR2  (16.0f * 16.0f)    /* <= this: floor alpha (most transparent) */
+#define PROX_FAR2   (48.0f * 48.0f)    /* >= this: fully opaque                   */
 #define PROX_FLOOR  0x40u              /* minimum alpha when fully overlapped     */
 
 static void ApplyProximityFade(void *p2)
@@ -2927,6 +2975,7 @@ static int InstallHooks(void)
     if (MH_CreateHook((LPVOID)ADDR_ANGLE_TO_PLAYER, (LPVOID)&HookedAngleToPlayer, (LPVOID*)&s_origAngleToPlayer) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DECL_MAKE,      (LPVOID)&HookedDeclMake,      (LPVOID*)&s_origDeclMake)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DECL_DRAW,      (LPVOID)&HookedDeclDraw,      (LPVOID*)&s_origDeclDraw)      != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_REPLAY_HDR_INIT,(LPVOID)&HookedReplayHdrInit, (LPVOID*)&s_origReplayHdr)     != MH_OK) return 0;
     /* Netplay seams: install ONLY when netplay is enabled in coop.ini. These two
      * addresses are unverified in-game, so with [net] enabled=0 (default) we don't
      * even lay the trampolines — the confirmed-good local build is byte-for-byte
@@ -2951,6 +3000,7 @@ static int InstallHooks(void)
     if (MH_EnableHook((LPVOID)ADDR_ANGLE_TO_PLAYER) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DECL_MAKE)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_REPLAY_HDR_INIT)!= MH_OK) return 0;
     if (s_netEnabled) {
         if (MH_EnableHook(ADDR_SCENE_TICK) != MH_OK) return 0;
         if (MH_EnableHook(ADDR_GAME_START) != MH_OK) return 0;

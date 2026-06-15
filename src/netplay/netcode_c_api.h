@@ -21,6 +21,10 @@ extern "C" {
 typedef unsigned short (*NcReadU16Fn)(void);
 void Nc_SetCallbacks(NcReadU16Fn readLocalInput, NcReadU16Fn readRngSeed);
 
+/* DIAGNOSTIC: register a log sink (e.g. coop.c Log). Enables WIRE SEND/RECV lines. */
+typedef void (*NcLogFn)(const char*);
+void Nc_SetLog(NcLogFn fn);
+
 /* Transport bring-up. family = AF_INET (2) or AF_INET6 (23). Returns 1 on success. */
 int  Nc_StartHost(const char* bindIp, int port, int family);
 int  Nc_StartGuest(const char* hostIp, int hostPort, int localPort, int family);

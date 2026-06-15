@@ -14,6 +14,8 @@ void Nc_SetCallbacks(NcReadU16Fn readLocalInput, NcReadU16Fn readRngSeed)
     Netcode_SetCallbacks(cb);
 }
 
+void Nc_SetLog(NcLogFn fn) { Netcode_SetLog((NetcodeLogFn)fn); }
+
 int Nc_StartHost(const char* bindIp, int port, int family)
 {
     return Netcode_StartHost(bindIp ? bindIp : "", port, family) ? 1 : 0;

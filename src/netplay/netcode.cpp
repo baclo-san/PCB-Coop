@@ -10,6 +10,19 @@
 #include "netcode.hpp"
 #include "netcode_internal.hpp"
 #include <map>
+#include <cstdio>
+#include <cstdarg>
+
+// ---- DIAGNOSTIC log callback (host env supplies; e.g. coop.c's Log) ----
+static NetcodeLogFn g_nclog = 0;
+void Netcode_SetLog(NetcodeLogFn fn) { g_nclog = fn; }
+static void NcLogf(const char* fmt, ...)
+{
+    if (!g_nclog) return;
+    char b[200];
+    va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
+    g_nclog(b);
+}
 
 // ---- transport (one peer per process, as in the reference) ----
 static Host  g_host;
@@ -105,11 +118,21 @@ static bool RcvPacks()
             int frame = pack.ctrl.frame;
             for (int i = 0; i < KeyPackFrameNum; i++)
             {
-                g_ctrl_bits_rcved[frame - i] = pack.ctrl.keys[i];
-                g_ctrl_rng_rcved[frame - i]  = pack.ctrl.rng_seed[i];
-                g_ctrl_rcved[frame - i]      = pack.ctrl.igc_type[i];
-                g_ctrl_rcved_src[frame - i]    = frame;   // DIAGNOSTIC: source pkt frame
-                g_ctrl_rcved_writes[frame - i] += 1;
+                int slot = frame - i;
+                // DIAGNOSTIC: log the first NON-ZERO arrival of each slot — i.e. the
+                // raw byte the wire actually delivered for the peer's input. Compare
+                // to the peer's WIRE SEND line for the same slot: if the host RECVs a
+                // bit the guest never SENT, it was injected in transit/recv, not the
+                // guest buffer.
+                unsigned short kv = 0; WriteToInt(pack.ctrl.keys[i], kv);
+                if (kv != 0 && g_ctrl_rcved_writes.find(slot) == g_ctrl_rcved_writes.end())
+                    NcLogf("WIRE RECV pkt=%d slot=%d val=%04x", frame, slot, kv);
+
+                g_ctrl_bits_rcved[slot] = pack.ctrl.keys[i];
+                g_ctrl_rng_rcved[slot]  = pack.ctrl.rng_seed[i];
+                g_ctrl_rcved[slot]      = pack.ctrl.igc_type[i];
+                g_ctrl_rcved_src[slot]    = frame;   // DIAGNOSTIC: source pkt frame
+                g_ctrl_rcved_writes[slot] += 1;
             }
         }
         else if (pack.ctrl.ctrl_type == Ctrl_Try_Resync)
@@ -153,6 +176,19 @@ static void SendKeys(int frame)
 
         std::map<int, InGameCtrlType>::iterator r3 = g_ctrl_self.find(frame - i);
         pack.ctrl.igc_type[i] = (r3 == g_ctrl_self.end()) ? IGC_NONE : r3->second;
+    }
+
+    // DIAGNOSTIC: log this frame's OWN input (keys[0] = self[frame]) when non-zero,
+    // deduped by (frame,value) so the host's frequent re-pings don't spam. This is
+    // the canonical first transmission of frame F's input; compare to the peer's
+    // WIRE RECV slot=F line to see if the wire preserved it.
+    {
+        unsigned short k0 = 0; WriteToInt(pack.ctrl.keys[0], k0);
+        static int s_lastF = -2; static unsigned short s_lastV = 0xffff;
+        if (k0 != 0 && (frame != s_lastF || k0 != s_lastV)) {
+            NcLogf("WIRE SEND frame=%d key0=%04x", frame, k0);
+            s_lastF = frame; s_lastV = k0;
+        }
     }
 
     if (g_is_host) g_host.SendPack(pack);

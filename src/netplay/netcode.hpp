@@ -17,6 +17,12 @@
 typedef unsigned short (*ReadLocalInputFn)(void);
 typedef unsigned short (*ReadRngSeedFn)(void);
 
+// DIAGNOSTIC: optional log sink (e.g. coop.c's Log). When set, the netcode emits
+// WIRE SEND / WIRE RECV lines for non-zero inputs so a host-vs-guest diff can tell
+// a wire/transit corruption from a buffer fault.
+typedef void (*NetcodeLogFn)(const char*);
+void Netcode_SetLog(NetcodeLogFn fn);
+
 struct NetcodeCallbacks
 {
     ReadLocalInputFn readLocalInput;

@@ -896,6 +896,9 @@ static uint16_t s_p1MenuPrev = 0;          /* P1's menu prev word (netplay edge 
 static unsigned short NetReadLocalInput(void) { return *ADDR_INPUT_MENU; }
 static unsigned short NetReadRngSeed(void)    { return *ADDR_RNG_SEED;   }
 
+/* DIAGNOSTIC: sink for the netcode's WIRE SEND/RECV lines into coop_log.txt. */
+static void NetLogSink(const char *msg) { Log("netplay: %s", msg); }
+
 /* Unpack P2 (merged high bits, NB_*2 = bit<<9) into the low-bit gameplay layout
  * the player update reads (the inverse of merge.cpp's host/guest P2 mapping). */
 static uint16_t UnpackP2(uint16_t m)
@@ -936,6 +939,7 @@ static void StartNet(void)
 {
     if (!s_netEnabled) { Log("netplay: disabled (coop.ini [net] enabled=0) — local P2"); return; }
     Nc_SetCallbacks(NetReadLocalInput, NetReadRngSeed);
+    Nc_SetLog(NetLogSink);
     int ok = s_netIsHost
         ? Nc_StartHost("", s_netPort, 2 /*AF_INET*/)
         : Nc_StartGuest(s_netPeer, s_netPort, s_netLocal, 2 /*AF_INET*/);
@@ -3101,10 +3105,10 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
-        Log("*** DIAGNOSTIC BUILD v4 (det-trace): provenance pinned the guest->host "
-            "drop to the SEND side; now logs SELF-REWRITE / SEND-ZFILL the moment a "
-            "self-buffer mutation or recent-slot zero-fill happens. Demo-disable fix "
-            "in (expect 'demo-play disabled ... 0x00455a9a'). ***");
+        Log("*** DIAGNOSTIC BUILD v5 (det-trace): buffer is clean (v4 detectors "
+            "silent) so now logs the WIRE itself — 'WIRE SEND frame=F key0=V' and "
+            "'WIRE RECV pkt=P slot=S val=V' for non-zero inputs. Diff host vs guest: "
+            "a RECV bit with no matching peer SEND = corruption in transit/recv. ***");
         LoadNetConfig();
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */

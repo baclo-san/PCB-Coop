@@ -1841,6 +1841,23 @@ per logic frame — a second fire would re-`readLocalInput()` the now-merged wor
 re-record the same `s_netFrame`'s self slot with a different value. That is exactly what
 `SELF-REWRITE` is built to catch.)
 
+**Round 5 (v4 detectors) — buffer is CLEAN; the phantom is on the wire.** `SELF-REWRITE`
+and `SEND-ZFILL` both stayed silent, ruling out a buffer rewrite or recent-slot zero-fill.
+Same fault signature: host received `0001` (shoot) for `readFrame 1057` that the guest's
+own `self[]` (and its own sim) read as `0000`. The host got **four consecutive `0001`s**
+(packet 1060's `keys[0..3]` = `self[1057..1060]`), which looks like a genuine 4-frame held
+bit — yet the guest's buffer shows none of it. By code, the guest's `SendKeys` and its own
+`GetKeys` read the *same* `self[]` slot, so they cannot disagree → an assumption is wrong
+somewhere only the wire bytes can settle. Symptom matches the user exactly: P2 "fired" and
+killed a fairy on the host screen, not on the guest ("a fairy died for P2 not P1, neither
+firing"). **v5 logs the wire:** `WIRE SEND frame=F key0=V` (a frame's own input as
+transmitted) and `WIRE RECV pkt=P slot=S val=V` (first non-zero arrival), via a netcode log
+callback (`Nc_SetLog`). **Decision rule next run:** if the guest logs `WIRE SEND
+frame=1057…` then it really recorded+sent the bit and its *own* merge dropped it (a
+read-side bug — instrument `GetKeys` self read); if the guest has NO such SEND but the host
+logs `WIRE RECV …val=0001`, the bit was injected in transit/recv (serialization / a stray
+packet — instrument `RcvPacks` / `ReceiveOnePack`).
+
 **Gameplay bug backlog (separate from this desync):** the user's local-coop Parsec
 sessions surfaced 11 gameplay bugs (2 crashes + resource/bomb/extend issues) — captured
 in `docs/th07_coop_gameplay_bugs.md` for an unattended session. Not transport-related, but

@@ -643,7 +643,10 @@ typedef int (__fastcall *ShtLoadFn_t)(void **out, const char *name); /* 0 = ok *
 #define OFF_SPD_UNF       0x994       /* = sht[+0xc]/2                            */
 #define OFF_SPD_FOC_CUR   0x99c
 #define OFF_SPD_FOC       0x9a0       /* = sht[+0x10]/2                           */
-#define OFF_HITBOX        0x23f8      /* = sht[+0x8]                              */
+#define OFF_DEATH_TIMER   0x23f8      /* int death/deathbomb-window countdown (NOT
+                                       * a hitbox): max while alive, decremented
+                                       * while dying, finalizes death at 0. See
+                                       * docs/th07_player_shot_bomb_system.md §5. */
 static int   s_p2Sel = -1;             /* P2's sel 0-5; -1 = mirror P1. F3 toggles A/B */
 /* Per-CHARACTER starting bomb stock (user/PCB spec): Reimu 3, Marisa 2, Sakuya 4.
  * P2 seeds its own bombs from this (by its character) on a fresh game instead of
@@ -1252,7 +1255,7 @@ static void ApplyP2Selection(void *p2)
         *(float *)(pp + OFF_SPD_UNF_CUR) = *(float *)(p1 + OFF_SPD_UNF_CUR);
         *(float *)(pp + OFF_SPD_FOC) = *(float *)(p1 + OFF_SPD_FOC);
         *(float *)(pp + OFF_SPD_FOC_CUR) = *(float *)(p1 + OFF_SPD_FOC_CUR);
-        *(uint32_t *)(pp + OFF_HITBOX) = *(uint32_t *)(p1 + OFF_HITBOX);
+        *(uint32_t *)(pp + OFF_DEATH_TIMER) = *(uint32_t *)(p1 + OFF_DEATH_TIMER);
         Log("P2 loadout: %s (mirrors P1)", ADDR_SEL_NAMES[sel]);
         return;
     }
@@ -1281,7 +1284,7 @@ static void ApplyP2Selection(void *p2)
         *(float *)(pp + OFF_SPD_UNF_CUR) = *(float *)(pp + OFF_SPD_UNF);
         *(float *)(pp + OFF_SPD_FOC) = *(float *)(sht + 0x10) / 2.0f;
         *(float *)(pp + OFF_SPD_FOC_CUR) = *(float *)(pp + OFF_SPD_FOC);
-        *(uint32_t *)(pp + OFF_HITBOX) = *(uint32_t *)(sht + 8);
+        *(uint32_t *)(pp + OFF_DEATH_TIMER) = *(uint32_t *)(sht + 8);
     }
     Log("P2 loadout: %s (P1 = %s)", ADDR_SEL_NAMES[sel], ADDR_SEL_NAMES[p1sel]);
 }

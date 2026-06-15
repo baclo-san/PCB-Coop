@@ -22,6 +22,8 @@ ver 1.00b (`35467EAF…E80CA`).
 | `+0x414`/`418`/`41c` | float | option-A world pos (set from `+0x9b4/9b8` + camera) | FUN_00441fb0:27267 |
 | `+0x660`/`664`/`668` | float | option-B world pos (from `+0x9c0/9c4`) | 27270 |
 | `+0x930`/`934`/`938` | float | **player world pos X / Y / Z** | coop.c; FUN_004420b0:27260; FUN_00442370 |
+| `+0x948`/`94c`/`954`/`958` | float | **player HIT box edges** L/T/R/B (AABB the bullet/contact test compares against) | FUN_0043e260:25995-25998 |
+| `+0x960`/`964`/`96c`/`970` | float | **player GRAZE box edges** L/T/R/B (= hit box +20px each side) | FUN_0043e3b0:26035-26039; cherry §7c |
 | `+0x9b4`/`9b8`, `+0x9c0`/`9c4` | float | option offsets (relative to player) | 27267-27271 |
 | `+0x16a00` | u32 | invuln-counter target/sentinel (`0xfffffc19` = -999) for FUN_0043958d | FUN_00441330:26891 |
 | `+0x16a04` | int | invuln-counter fractional carry | 26890; FUN_0043958d @26957 |
@@ -114,10 +116,16 @@ param-relative (so P2's shots live in P2's clone — coop.c relies on this).
   reads it.
 
 ## Open / unverified
-- Hitbox/graze radius offsets, focus-mode flag, and the power-shot level field are not
-  yet located (collision uses the leaf primitives FUN_0043e260/6b0 that coop.c detours,
-  which are param-relative — so P2 collision works without knowing the radius offset).
-  The graze box is at `+0x960/+0x964/+0x96c/+0x970` (cherry doc §7c).
+- **Hit/graze boxes LOCATED (2026-06-15):** the player collision is an AABB, not a
+  radius — the bullet/contact leaf `FUN_0043e260` (25995-25998) compares the bullet
+  against hit-box edges `+0x948`(L)/`+0x94c`(T)/`+0x954`(R)/`+0x958`(B); the graze
+  leaf `FUN_0043e3b0` (26035-26039) uses the wider `+0x960/+0x964/+0x96c/+0x970`
+  box (hit box +20px each side). These edges are recomputed each frame from the
+  player center ± the .sht-derived half-extent; the raw half-extent input field is
+  still the open part (coop.c’s old `OFF_HITBOX 0x23f8` was a MISLABEL — that field
+  is the death/deathbomb timer, see `th07_player_shot_bomb_system.md` §5). P2
+  collision works via the param-relative leaves regardless.
+- Focus-mode flag and the power-shot level field are not yet located.
 - ~~Whether `FUN_00441fb0`'s sub-calls pass `ECX = the cloned P2`~~ ✅ **RESOLVED
   (2026-06-12, disasm + in-game):** all sub-calls (incl. movement `FUN_0043ee50`)
   pass ECX = the saved player, so they DO drive the P2 clone (handoff §5d).

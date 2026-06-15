@@ -223,8 +223,10 @@ drawn by `FUN_0042c577` (✅ coop.c, PCBdecomp.c:17267). Face id window
 - Read the actual shot-spawn loop (the body reached from `FUN_0043d990` @26587 /
   the surrounding fire code) to confirm the §6 slot fields and the `.sht`
   power→pattern selection.
-- Find the real player hitbox field the collision leaves (`FUN_0043e260` family)
-  read (now that `0x23f8` is confirmed to be the death timer, §5), and rename
-  coop.c’s `OFF_HITBOX`.
+- ✅ DONE: the real player hitbox is an **AABB** at player `+0x948/+0x94c/+0x954/
+  +0x958` (L/T/R/B), read by `FUN_0043e260` (25995-25998); the graze box is the
+  +20px `+0x960/+0x964/+0x96c/+0x970` (`FUN_0043e3b0`). See
+  `th07_player_struct.md`. coop.c’s `OFF_HITBOX` was renamed → `OFF_DEATH_TIMER`.
+  Still open: the raw half-extent input field these edges are recomputed from.
 - Map `FUN_0048b8a0` (bomb-count source) + where a bomb actually decrements the
   bomb stock — needed for the per-player bomb-count work.

@@ -2759,9 +2759,14 @@ static int InstallHooks(void)
     if (MH_CreateHook((LPVOID)ADDR_ANGLE_TO_PLAYER, (LPVOID)&HookedAngleToPlayer, (LPVOID*)&s_origAngleToPlayer) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DECL_MAKE,      (LPVOID)&HookedDeclMake,      (LPVOID*)&s_origDeclMake)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DECL_DRAW,      (LPVOID)&HookedDeclDraw,      (LPVOID*)&s_origDeclDraw)      != MH_OK) return 0;
-    /* netplay seams (no-op unless coop.ini [net] enabled=1 brought the link up) */
-    if (MH_CreateHook(ADDR_SCENE_TICK,     (LPVOID)&HookedSceneTick,     (LPVOID*)&s_origSceneTick)     != MH_OK) return 0;
-    if (MH_CreateHook(ADDR_GAME_START,     (LPVOID)&HookedGameStart,     (LPVOID*)&s_origGameStart)     != MH_OK) return 0;
+    /* Netplay seams: install ONLY when netplay is enabled in coop.ini. These two
+     * addresses are unverified in-game, so with [net] enabled=0 (default) we don't
+     * even lay the trampolines — the confirmed-good local build is byte-for-byte
+     * the prior main. They're installed+enabled together below under the same gate. */
+    if (s_netEnabled) {
+        if (MH_CreateHook(ADDR_SCENE_TICK, (LPVOID)&HookedSceneTick, (LPVOID*)&s_origSceneTick) != MH_OK) return 0;
+        if (MH_CreateHook(ADDR_GAME_START, (LPVOID)&HookedGameStart, (LPVOID*)&s_origGameStart) != MH_OK) return 0;
+    }
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
@@ -2778,8 +2783,10 @@ static int InstallHooks(void)
     if (MH_EnableHook((LPVOID)ADDR_ANGLE_TO_PLAYER) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DECL_MAKE)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
-    if (MH_EnableHook(ADDR_SCENE_TICK)     != MH_OK) return 0;
-    if (MH_EnableHook(ADDR_GAME_START)     != MH_OK) return 0;
+    if (s_netEnabled) {
+        if (MH_EnableHook(ADDR_SCENE_TICK) != MH_OK) return 0;
+        if (MH_EnableHook(ADDR_GAME_START) != MH_OK) return 0;
+    }
     return 1;
 }
 

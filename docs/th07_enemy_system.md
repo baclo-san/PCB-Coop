@@ -92,8 +92,36 @@ Verified from `FUN_00420620` (12664-13099) unless noted.
   `Unable to decompile 'FUN_00410520'` (PCBdecomp.c:8840) — almost certainly a
   huge computed-goto opcode dispatch it couldn't lift. Mapping it needs either the
   user's fuller Desktop `th07.exe.c` db, a raw disassembly of 0x410520, or the
-  public thtk/ECL format docs (PCB ECL is well-documented in the touhou RE
-  community). Don't burn time trying to read it from PCBdecomp.c.
+  public thtk/ECL format docs. Don't burn time trying to read it from PCBdecomp.c.
+  See §6 for the format + the source trail.
+
+## 6. ECL format & the opcode-table source trail (2026-06-15 research)
+
+The ECL **container format** is shared across the th06–08 era (✅ from PyTouhou's
+`pytouhou/formats/ecl.py`, an EoSD-era reimplementation — same format generation
+as PCB; PCB is "ECL v1.1", a minor evolution of EoSD's):
+- **Main header:** `u16 sub_count; u16 main_count; u32 main_offsets[3]; u32
+  sub_offsets[sub_count]` (header = 16 + 4·sub_count bytes).
+- **Per-instruction header (12 bytes):** `u32 time; u16 opcode; u16 size; u16
+  rank_mask` (difficulty filter); `u16 param_mask`; then `size−12` bytes of args.
+  A sub ends at `time == 0xffffffff` / `opcode == 0xffff`. Args are typed per
+  opcode (i32/f32/u16…); string args are Shift-JIS.
+- So `FUN_00410520` is the per-enemy VM that, each tick, reads the current
+  instruction at this layout, dispatches on `opcode`, advances by `size`, and gates
+  on `rank_mask` vs the difficulty. This matches the §3 flow (the VM tick drives
+  position/bullet/spawn writes into the enemy struct).
+
+**The th07-SPECIFIC opcode→meaning numbers are the missing piece, and the obvious
+sources are blocked/wrong (dead-ends checked so this isn't re-walked):**
+- **touhouwiki "User:Mddass/…/ECL/V1.1"** is the authoritative PCB opcode table —
+  but it 403s automated fetch (WebFetch); pull it in a browser, or via an
+  authenticated/mirror route, into a `th07.eclm`.
+- **thtk / Priw8 `eclmap`** has **no th07 map** ("TH06–TH07 — none at the moment").
+- **PyTouhou's opcode dict is th06 (EoSD), NOT th07** — opcodes change per game, so
+  do not copy th06 numbers onto PCB (positions/bullets/spawns are merely *grouped*
+  similarly: movement ~43–57, bullet attrs ~67–92, spawn ~95, anim ~97–98).
+- The cleanest in-repo route is still a **raw disasm of `0x410520`** (the dispatch
+  jump table maps opcode→handler directly) + cross-ref to a th07 eclmap for names.
 - The 8-byte gap between the first slot (`+0x4f50`) and the stride (`0x4f48`) is
   just header alignment — not re-derived here.
 - Boss-specific fields (spell-card timer, name plate, the `+0x424`/`+0x498`

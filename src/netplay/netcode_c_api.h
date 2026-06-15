@@ -72,6 +72,14 @@ void Nc_GetReadStats(int* readFrame, unsigned short* selfKey,
  * packets wrote it. A stale 0 with srcPktFrame>=0 means the guest SENT a 0 there. */
 void Nc_GetRcvSrc(int* srcPktFrame, int* writes);
 
+/* DIAGNOSTIC: cumulative send-side fault counters + last event. selfRewrites = a
+ * self slot recorded twice with different values; sendZfill = SendKeys zero-filled
+ * a recent slot that should have existed. Either being >0 localizes the guest->host
+ * drop to a buffer mutation (rewrite) vs a missing/erased slot (zfill). */
+void Nc_GetSendDiag(int* selfRewrites, int* rwFrame,
+                    unsigned short* rwOld, unsigned short* rwNew,
+                    int* sendZfill, int* zfFrame, int* zfSlot);
+
 #ifdef __cplusplus
 }
 #endif

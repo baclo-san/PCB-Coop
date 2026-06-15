@@ -1821,11 +1821,31 @@ Round 3 trace (seed-force fixed, oracle now honest) pinned it:
 **Seam map for the netcode internals** (added for this hunt, all in `netcode.cpp` /
 exposed via `netcode_c_api.h`): `Nc_GetReadStats(readFrame, selfKey, rcvKey, rcvStatus)`
 — `readFrame = netFrame - delay`; `rcvStatus` 0=immediate / 1=after-wait / 2=timeout.
-The det-trace CSV carries these per frame. **Open:** how a zero lands in `g_ctrl_bits_rcved[F]`
-for a frame the guest sent non-zero — under the current `SendKeys`/`RcvPacks` logic every
-guest packet covering slot F carries the guest's `self[F]`, so a stale 0 there is
-unexplained. Next instrument: **provenance of each received slot** (which packet wrote it,
-how many times) to tell a guest-side send-zero from a host-side overwrite.
+The det-trace CSV carries these per frame.
+
+**Round 4 (v3, provenance) — drop is on the SEND side, not reception.** Added per-slot
+provenance: `Nc_GetRcvSrc(srcPktFrame, writes)` — which packet (its frame field) last
+wrote the received slot, and how many packets wrote it (CSV cols `rcvSrc,rcvWrites`). The
+trace pinned the drop hard: 7 drops at `readFrame 844–850`, **all `rcvSrc=850`** (a real
+guest packet wrote them, never `-1` ⇒ NOT host-side staleness), yet the values the host
+got (`0000`/`0001`) **disagree with the guest's own `self[]` readback (`0080`, the guest
+held right)**. The host had **no guest packet newer than 850** while racing to netFrame
+854 (host waits on 5751/5785 frames — well ahead), so it burst-read those stale slots.
+⇒ **The guest is transmitting input values that disagree with its own buffer.** Two
+mechanisms remain: the self slot being **rewritten** (same frame recorded twice, different
+value) or **zero-filled** (recent slot missing at send time). v4 adds detectors for both:
+`Nc_GetSendDiag(...)` + coop.c logs `SELF-REWRITE` / `SEND-ZFILL` the instant either fires.
+**Next run decides it.** (Hypothesis to keep in mind: the merged word is written back to
+`g_InputMenu` after `Nc_GetInputNet`, and `HookedSceneTick`/`FUN_00437c70` may fire >1×
+per logic frame — a second fire would re-`readLocalInput()` the now-merged word and
+re-record the same `s_netFrame`'s self slot with a different value. That is exactly what
+`SELF-REWRITE` is built to catch.)
+
+**Gameplay bug backlog (separate from this desync):** the user's local-coop Parsec
+sessions surfaced 11 gameplay bugs (2 crashes + resource/bomb/extend issues) — captured
+in `docs/th07_coop_gameplay_bugs.md` for an unattended session. Not transport-related, but
+note a **crash on one machine reads as `peer lost` on the other**, so the two crashes
+(P1-Sakuya+P2-Reimu on hit; stage-4 death-fairy) are worth fixing regardless.
 
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +

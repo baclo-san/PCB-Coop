@@ -1057,6 +1057,27 @@ static int __fastcall HookedSceneTick(void *self)
 
         NetTrace(s_netFrame, inStage, merged, s_netWaitMs, sync);  /* DIAGNOSTIC */
 
+        /* DIAGNOSTIC: surface the send-side fault detectors the moment they fire.
+         * selfRewrites>0 => a logic frame's input was recorded twice with different
+         * values (the merged word feeding our own buffer is mutating it). sendZfill>0
+         * => SendKeys transmitted a 0 for a recent frame that should have existed.
+         * Either pins the guest->host drop (§8l) to its mechanism. */
+        {
+            static int s_lastRw = 0, s_lastZf = 0;
+            int rw=0, rwf=-1, sz=0, zff=-1, zfs=-1; unsigned short rwo=0, rwn=0;
+            Nc_GetSendDiag(&rw, &rwf, &rwo, &rwn, &sz, &zff, &zfs);
+            if (rw > s_lastRw) {
+                Log("netplay: SELF-REWRITE #%d frame=%d old=0x%04x new=0x%04x (netF=%d)",
+                    rw, rwf, rwo, rwn, s_netFrame);
+                s_lastRw = rw;
+            }
+            if (sz > s_lastZf) {
+                Log("netplay: SEND-ZFILL #%d sendframe=%d missingslot=%d (netF=%d)",
+                    sz, zff, zfs, s_netFrame);
+                s_lastZf = sz;
+            }
+        }
+
         /* DESYNC is only meaningful IN-STAGE. The front-end menus are not RNG-locked
          * (the two machines reach a screen from slightly different states), so a seed
          * mismatch there is expected — reporting it as a "desync" was the misleading
@@ -3080,10 +3101,10 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
-        Log("*** DIAGNOSTIC BUILD v3 (det-trace): seed once/scene; trace CSV adds "
-            "rcvSrc+rcvWrites (provenance of the received P2 slot) to pin the "
-            "guest->host input drop. Demo-disable fix in (expect 'demo-play disabled "
-            "... 0x00455a9a'). ***");
+        Log("*** DIAGNOSTIC BUILD v4 (det-trace): provenance pinned the guest->host "
+            "drop to the SEND side; now logs SELF-REWRITE / SEND-ZFILL the moment a "
+            "self-buffer mutation or recent-slot zero-fill happens. Demo-disable fix "
+            "in (expect 'demo-play disabled ... 0x00455a9a'). ***");
         LoadNetConfig();
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */

@@ -79,3 +79,10 @@ void Netcode_GetReadStats(int& readFrame, unsigned short& selfKey,
 // DIAGNOSTIC: provenance of the received slot read last frame — the frame field of
 // the packet that wrote it (-1 if never written) and how many packets wrote it.
 void Netcode_GetRcvSrc(int& srcPktFrame, int& writes);
+
+// DIAGNOSTIC: cumulative send-side fault counters + last event. selfRewrites = a
+// self slot recorded twice with different values; sendZfill = SendKeys zero-filled
+// a recent slot (within delay+2) that should have existed.
+void Netcode_GetSendDiag(int& selfRewrites, int& rwFrame,
+                         unsigned short& rwOld, unsigned short& rwNew,
+                         int& sendZfill, int& zfFrame, int& zfSlot);

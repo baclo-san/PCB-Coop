@@ -68,6 +68,20 @@ static int            g_stat_rcv_status  = 0;
 static int            g_stat_rcv_src     = -1;  // packet frame that wrote the slot read
 static int            g_stat_rcv_writes  = 0;   // # packets that wrote that slot
 
+// DIAGNOSTIC: two send-side fault detectors for the guest->host drop.
+//  - self_rewrites: g_ctrl_bits_self[frame] written twice with DIFFERENT values
+//    (would mean the same logic frame is sampled/recorded more than once).
+//  - send_zfill: SendKeys had to zero-fill a RECENT slot (frame-i, i<=delay+2)
+//    because it was missing from the buffer (premature erase / never recorded).
+// The last event of each is kept so the host env can log it.
+static int            g_diag_self_rewrites = 0;
+static int            g_diag_rw_frame      = -1;
+static unsigned short g_diag_rw_old        = 0;
+static unsigned short g_diag_rw_new        = 0;
+static int            g_diag_send_zfill    = 0;
+static int            g_diag_zf_frame      = -1;
+static int            g_diag_zf_slot       = -1;
+
 // The merge (MergeKeys) — the single word both machines compute identically — now
 // lives in merge.cpp so it can be unit-tested natively (see merge.hpp).
 
@@ -121,7 +135,16 @@ static void SendKeys(int frame)
     for (int i = 0; i < KeyPackFrameNum; i++)
     {
         std::map<int, Bits<16> >::iterator r = g_ctrl_bits_self.find(frame - i);
-        if (r == g_ctrl_bits_self.end()) ReadFromInt(pack.ctrl.keys[i], 0);
+        if (r == g_ctrl_bits_self.end()) {
+            ReadFromInt(pack.ctrl.keys[i], 0);
+            // DIAGNOSTIC: a RECENT slot is missing → we are transmitting a 0 the
+            // peer will treat as real input. frame-0 is this frame (just recorded);
+            // anything within delay+2 should still exist.
+            if (i <= g_delay + 2 && (frame - i) >= 0) {
+                g_diag_send_zfill++;
+                g_diag_zf_frame = frame; g_diag_zf_slot = frame - i;
+            }
+        }
         else                             pack.ctrl.keys[i] = r->second;
 
         std::map<int, int>::iterator r2 = g_ctrl_rng_self.find(frame - i);
@@ -253,6 +276,19 @@ unsigned short Netcode_GetInput_Net(int frame, bool is_in_UI, int& cur_ctrl)
     unsigned short btn = g_cb.readLocalInput ? g_cb.readLocalInput() : 0;
     Bits<16> cur_btn_bits;
     ReadFromInt(cur_btn_bits, btn);
+    // DIAGNOSTIC: catch a same-frame rewrite with a DIFFERENT value — i.e. this
+    // logic frame's self slot being recorded more than once (the suspected cause of
+    // the guest sending values that disagree with its own later readback).
+    {
+        std::map<int, Bits<16> >::iterator ex = g_ctrl_bits_self.find(frame);
+        if (ex != g_ctrl_bits_self.end()) {
+            unsigned short ov = 0; WriteToInt(ex->second, ov);
+            if (ov != btn) {
+                g_diag_self_rewrites++;
+                g_diag_rw_frame = frame; g_diag_rw_old = ov; g_diag_rw_new = btn;
+            }
+        }
+    }
     g_ctrl_bits_self[frame] = cur_btn_bits;
     g_ctrl_rng_self[frame]  = g_cb.readRngSeed ? g_cb.readRngSeed() : 0;
 
@@ -394,6 +430,8 @@ void Netcode_Reset()
     g_netFrame = 0;
     g_is_sync = true;
     g_resync_trigger = false;
+    // NB: g_diag_* counters are intentionally NOT reset here — they are cumulative
+    // across the whole session so a scene change can't hide a fault.
 }
 
 bool Netcode_IsConnected()        { return g_is_connected; }
@@ -415,6 +453,13 @@ void Netcode_GetReadStats(int& readFrame, unsigned short& selfKey,
 
 void Netcode_GetRcvSrc(int& srcPktFrame, int& writes)
 { srcPktFrame = g_stat_rcv_src; writes = g_stat_rcv_writes; }
+
+void Netcode_GetSendDiag(int& selfRewrites, int& rwFrame,
+                         unsigned short& rwOld, unsigned short& rwNew,
+                         int& sendZfill, int& zfFrame, int& zfSlot)
+{ selfRewrites = g_diag_self_rewrites; rwFrame = g_diag_rw_frame;
+  rwOld = g_diag_rw_old; rwNew = g_diag_rw_new;
+  sendZfill = g_diag_send_zfill; zfFrame = g_diag_zf_frame; zfSlot = g_diag_zf_slot; }
 
 // test-only hooks (defined here, declared in netcode_internal.hpp)
 void Netcode_TestSetHost(bool h)  { g_is_host = h; }

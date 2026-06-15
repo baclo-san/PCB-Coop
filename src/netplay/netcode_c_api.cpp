@@ -87,4 +87,19 @@ void Nc_GetRcvSrc(int* srcPktFrame, int* writes)
     if (writes)      *writes      = w;
 }
 
+void Nc_GetSendDiag(int* selfRewrites, int* rwFrame,
+                    unsigned short* rwOld, unsigned short* rwNew,
+                    int* sendZfill, int* zfFrame, int* zfSlot)
+{
+    int sr = 0, rf = -1, sz = 0, zf = -1, zs = -1; unsigned short ro = 0, rn = 0;
+    Netcode_GetSendDiag(sr, rf, ro, rn, sz, zf, zs);
+    if (selfRewrites) *selfRewrites = sr;
+    if (rwFrame)      *rwFrame      = rf;
+    if (rwOld)        *rwOld        = ro;
+    if (rwNew)        *rwNew        = rn;
+    if (sendZfill)    *sendZfill    = sz;
+    if (zfFrame)      *zfFrame      = zf;
+    if (zfSlot)       *zfSlot       = zs;
+}
+
 } // extern "C"

@@ -67,6 +67,11 @@ void Nc_GetSyncStats(unsigned short* selfRng, unsigned short* rcvRng, int* waitM
 void Nc_GetReadStats(int* readFrame, unsigned short* selfKey,
                      unsigned short* rcvKey, int* rcvStatus);
 
+/* DIAGNOSTIC: provenance of the received slot read last frame — srcPktFrame = the
+ * frame field of the packet that wrote it (-1 if never written); writes = how many
+ * packets wrote it. A stale 0 with srcPktFrame>=0 means the guest SENT a 0 there. */
+void Nc_GetRcvSrc(int* srcPktFrame, int* writes);
+
 #ifdef __cplusplus
 }
 #endif

@@ -79,4 +79,12 @@ void Nc_GetReadStats(int* readFrame, unsigned short* selfKey,
     if (rcvStatus) *rcvStatus = st;
 }
 
+void Nc_GetRcvSrc(int* srcPktFrame, int* writes)
+{
+    int s = -1, w = 0;
+    Netcode_GetRcvSrc(s, w);
+    if (srcPktFrame) *srcPktFrame = s;
+    if (writes)      *writes      = w;
+}
+
 } // extern "C"

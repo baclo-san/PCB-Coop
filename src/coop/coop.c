@@ -968,7 +968,7 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
         s_trace = fopen(p, "w");
         if (!s_trace) return;
         fputs("frame,inStage,merged,p1,p2,seed,counter,waitMs,sync,"
-              "readFrame,selfKey,rcvKey,rcvStatus\n", s_trace);
+              "readFrame,selfKey,rcvKey,rcvStatus,rcvSrc,rcvWrites\n", s_trace);
     }
     /* netcode internals for this frame: the index GetKeys read (readFrame =
      * netFrame-delay) and the raw self/rcv words it merged. Diffing host vs guest
@@ -976,11 +976,13 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
      * same row) from a stale/mis-delivered peer input (selfKey/rcvKey disagree at
      * the same readFrame). rcvStatus: 0=immediate 1=after-wait 2=timeout. */
     int rf = -1, rs = 0; unsigned short sk = 0, rk = 0;
+    int rsrc = -1, rwr = 0;
     Nc_GetReadStats(&rf, &sk, &rk, &rs);
-    fprintf(s_trace, "%d,%d,%04x,%04x,%04x,%04x,%u,%d,%d,%d,%04x,%04x,%d\n",
+    Nc_GetRcvSrc(&rsrc, &rwr);
+    fprintf(s_trace, "%d,%d,%04x,%04x,%04x,%04x,%u,%d,%d,%d,%04x,%04x,%d,%d,%d\n",
             frame, inStage, merged, s_netP1Menu, s_netP2Menu,
             (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR, waitMs, sync,
-            rf, sk, rk, rs);
+            rf, sk, rk, rs, rsrc, rwr);
     fflush(s_trace);                        /* survive the freeze tail */
 }
 
@@ -3078,10 +3080,10 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
-        Log("*** DIAGNOSTIC BUILD v2 (det-trace): seed now forced ONCE/scene (was "
-            "every frame); per-frame trace -> coop_trace_{host,guest}.csv now carries "
-            "netcode read-frame + self/rcv words + rcvStatus. Demo-disable fix in "
-            "(expect 'demo-play disabled ... 0x00455a9a'). ***");
+        Log("*** DIAGNOSTIC BUILD v3 (det-trace): seed once/scene; trace CSV adds "
+            "rcvSrc+rcvWrites (provenance of the received P2 slot) to pin the "
+            "guest->host input drop. Demo-disable fix in (expect 'demo-play disabled "
+            "... 0x00455a9a'). ***");
         LoadNetConfig();
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */

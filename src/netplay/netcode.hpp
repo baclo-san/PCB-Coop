@@ -75,3 +75,7 @@ void Netcode_GetSyncStats(unsigned short& selfRng, unsigned short& rcvRng, int& 
 // was obtained (0=immediate, 1=after a wait, 2=timed out/defaulted).
 void Netcode_GetReadStats(int& readFrame, unsigned short& selfKey,
                           unsigned short& rcvKey, int& rcvStatus);
+
+// DIAGNOSTIC: provenance of the received slot read last frame — the frame field of
+// the packet that wrote it (-1 if never written) and how many packets wrote it.
+void Netcode_GetRcvSrc(int& srcPktFrame, int& writes);

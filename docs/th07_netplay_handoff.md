@@ -1781,6 +1781,52 @@ watchable later**. Viewing will require the DLL loaded (vanilla can't render P2)
 24px→16px, so the other player only fades once the ~32px sprites actually overlap,
 not from across the screen.
 
+### §8l — LAN 2-PC test rounds + desync diagnosis (2026-06-15/16)
+
+First real 2-machine tests (LAN). **The injector + DLL load fine on Linux** (unlike
+the new mahjong game) and the two instances link up cleanly. Three test rounds, each
+with a determinism trace (`det-trace`, `coop_trace_{host,guest}.csv` — one row per
+logic frame; diff by frame/`readFrame` to pinpoint divergence). **Findings, in order:**
+
+**1. STALE BUILD invalidated round 1.** The tester's DLL pre-dated the demo-disable
+fix (`adb34b9`): its log printed `demo-play patch SKIPPED … 0x00455a9c` (the old
+address), so the title attract-demo stayed live and consumed RNG → the menu/difficulty
+desync (one machine on Easy, other on Lunatic). **Lesson: the attach banner now carries
+a build tag; always confirm `demo-play disabled … 0x00455a9a` on both machines first.**
+
+**2. The seed-force was firing EVERY frame (not game-start).** `FUN_00442c60`
+(`HookedGameStart`) turned out to be a *per-frame* function (~15k `SEEDFORCE` lines /
+15k frames), so forcing the seed there pinned the live RNG to `initSeed` every frame.
+That (a) **caused Chen's nonspell to bug out** (all background orbs flew the same way —
+a one-orb-per-frame "random" direction reads the same pinned seed each frame) and
+(b) masked desyncs (both machines snap to `initSeed` ⇒ false SYNC). **Fixed:** force the
+seed **once per scene** (`s_seedForced`, re-armed on each scene change), EoSD's
+force-at-start semantics; ZUN's RNG then evolves naturally and lockstep holds it.
+
+**3. The real desync is a guest→host INPUT-delivery fault (NOT seed/demo/frame-drift).**
+Round 3 trace (seed-force fixed, oracle now honest) pinned it:
+  - `readFrame` is identical on both every frame ⇒ **frame counters are aligned**
+    (the §8j start-barrier works; not a clock-drift bug).
+  - **P1 (host→guest) transports perfectly** for all 7314 frames.
+  - **P2 (guest→host) drops on ~7 frames**: e.g. at `readFrame=1289` the guest sent
+    `selfKey=0040` (left) but the host's `rcvKey=0000`, with `rcvStatus=0` (the host
+    found a value *immediately* and never waited) — so it advanced on a **present-but-
+    wrong** P2 slot. That 3-frame P2 drop seeds the divergence; the RNG counter splits
+    ~40 frames later when the now-different P2 position changes a roll → P1/P2 die in a
+    different order on each screen.
+  - **Timing asymmetry:** host `rcvStatus==1` (waited) on 7110/7313 frames, guest on 0.
+    The host runs a hair ahead and is almost always sub-ms-waiting for the lagging guest;
+    the drops are the rare frames it read a stale slot instead of blocking.
+
+**Seam map for the netcode internals** (added for this hunt, all in `netcode.cpp` /
+exposed via `netcode_c_api.h`): `Nc_GetReadStats(readFrame, selfKey, rcvKey, rcvStatus)`
+— `readFrame = netFrame - delay`; `rcvStatus` 0=immediate / 1=after-wait / 2=timeout.
+The det-trace CSV carries these per frame. **Open:** how a zero lands in `g_ctrl_bits_rcved[F]`
+for a frame the guest sent non-zero — under the current `SendKeys`/`RcvPacks` logic every
+guest packet covering slot F carries the guest's `self[F]`, so a stale 0 there is
+unexplained. Next instrument: **provenance of each received slot** (which packet wrote it,
+how many times) to tell a guest-side send-zero from a host-side overwrite.
+
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +
 retry all confirmed by the user). Before any risky change, note the last-good

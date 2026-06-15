@@ -23,6 +23,13 @@ static std::map<int, int>           g_ctrl_rng_rcved;
 static std::map<int, InGameCtrlType> g_ctrl_self;
 static std::map<int, InGameCtrlType> g_ctrl_rcved;
 
+// DIAGNOSTIC: provenance of each received bits slot — the frame field of the packet
+// that last wrote it, and how many packets wrote it. Tells a guest that SENT a
+// zero/wrong value (src == that frame, writes>=1) from a host-side staleness
+// (slot never written for this frame => src stays -1).
+static std::map<int, int>           g_ctrl_rcved_src;
+static std::map<int, int>           g_ctrl_rcved_writes;
+
 // ---- state ----
 static NetcodeCallbacks g_cb         = { 0, 0 };
 static int   g_delay                 = 1;
@@ -58,6 +65,8 @@ static int            g_stat_read_frame = -1;
 static unsigned short g_stat_self_key   = 0;
 static unsigned short g_stat_rcv_key    = 0;
 static int            g_stat_rcv_status  = 0;
+static int            g_stat_rcv_src     = -1;  // packet frame that wrote the slot read
+static int            g_stat_rcv_writes  = 0;   // # packets that wrote that slot
 
 // The merge (MergeKeys) — the single word both machines compute identically — now
 // lives in merge.cpp so it can be unit-tested natively (see merge.hpp).
@@ -85,6 +94,8 @@ static bool RcvPacks()
                 g_ctrl_bits_rcved[frame - i] = pack.ctrl.keys[i];
                 g_ctrl_rng_rcved[frame - i]  = pack.ctrl.rng_seed[i];
                 g_ctrl_rcved[frame - i]      = pack.ctrl.igc_type[i];
+                g_ctrl_rcved_src[frame - i]    = frame;   // DIAGNOSTIC: source pkt frame
+                g_ctrl_rcved_writes[frame - i] += 1;
             }
         }
         else if (pack.ctrl.ctrl_type == Ctrl_Try_Resync)
@@ -193,6 +204,12 @@ static unsigned short GetKeys(int frame, bool is_in_UI, int& out_ctrl)
     g_stat_self_key   = self_key;
     g_stat_rcv_key    = rcv_key;
     g_stat_rcv_status = has_rcv_data ? (waited ? 1 : 0) : 2;
+    {
+        std::map<int, int>::iterator si = g_ctrl_rcved_src.find(frame - g_delay);
+        g_stat_rcv_src = (si != g_ctrl_rcved_src.end()) ? si->second : -1;
+        std::map<int, int>::iterator wi = g_ctrl_rcved_writes.find(frame - g_delay);
+        g_stat_rcv_writes = (wi != g_ctrl_rcved_writes.end()) ? wi->second : 0;
+    }
 
     if (!has_rcv_data)
     {
@@ -247,6 +264,8 @@ unsigned short Netcode_GetInput_Net(int frame, bool is_in_UI, int& cur_ctrl)
     g_ctrl_rng_self.erase(frame - frame_rem);
     g_ctrl_rcved.erase(frame - frame_rem);
     g_ctrl_self.erase(frame - frame_rem);
+    g_ctrl_rcved_src.erase(frame - frame_rem);
+    g_ctrl_rcved_writes.erase(frame - frame_rem);
 
     HandleControlKeys(frame);
     SendKeys(frame);
@@ -370,6 +389,8 @@ void Netcode_Reset()
     g_ctrl_rng_rcved.clear();
     g_ctrl_self.clear();
     g_ctrl_rcved.clear();
+    g_ctrl_rcved_src.clear();
+    g_ctrl_rcved_writes.clear();
     g_netFrame = 0;
     g_is_sync = true;
     g_resync_trigger = false;
@@ -391,6 +412,9 @@ void Netcode_GetReadStats(int& readFrame, unsigned short& selfKey,
                           unsigned short& rcvKey, int& rcvStatus)
 { readFrame = g_stat_read_frame; selfKey = g_stat_self_key;
   rcvKey = g_stat_rcv_key; rcvStatus = g_stat_rcv_status; }
+
+void Netcode_GetRcvSrc(int& srcPktFrame, int& writes)
+{ srcPktFrame = g_stat_rcv_src; writes = g_stat_rcv_writes; }
 
 // test-only hooks (defined here, declared in netcode_internal.hpp)
 void Netcode_TestSetHost(bool h)  { g_is_host = h; }

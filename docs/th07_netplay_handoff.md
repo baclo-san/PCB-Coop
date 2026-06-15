@@ -1367,6 +1367,37 @@ ramp/floor, and the real per-instance asymmetry needs a two-machine netplay test
 (the single-machine path is the prototype — both screens are identical, so
 fading P2 only "helps see P1" from P1's seat).
 
+### 5m — RE coverage pass: player shot/bomb, hitbox, item spawner (2026-06-15 night)
+
+After the two feature items, spent the rest of the window on zero-risk RE (the
+user's "map more of PCB" directive), all verified against `PCBdecomp.c` this
+session:
+- **New doc `docs/th07_player_shot_bomb_system.md`** — the shot-fire gate
+  (`(g_InputGameplay&1)` + `FUN_0042ad66` bombing predicate @16632 + fire entry
+  `FUN_0043d990` @26584), the `.sht` buffers/baked stats, the per-shot slot struct
+  (offsets confirmed by reading the damage sweep `FUN_0043d9e0`), and the bomb +
+  cherry-border handler `FUN_004409f0` @26652. Honest confidence key throughout.
+- **`player+0x23f8` resolved = death/deathbomb-window timer** (NOT a hitbox), via
+  the dying-state update `FUN_00440cf0` @26730 (at 0 → finalize death: power→0,
+  power-item drop `FUN_004326f0` type 4). Matches `th07_player_struct.md`'s
+  "respawn timer". coop.c's `OFF_HITBOX` renamed → **`OFF_DEATH_TIMER`** (cosmetic,
+  value/behaviour unchanged, builds clean).
+- **Player hit/graze boxes LOCATED** (filled a gap `th07_player_struct.md` flagged
+  "not yet located"): collision is an AABB — hit-box edges `+0x948/+0x94c/+0x954/
+  +0x958` (`FUN_0043e260` @25995), graze box `+0x960/+0x964/+0x96c/+0x970` (+20px,
+  `FUN_0043e3b0` @26035).
+- **Item spawner mapped** (`th07_item_collect_credit.md` §5): `FUN_004326f0` @20244
+  — signature, pool/cursor (stride 0x288), slot-init fields, spawn modes (mode 2
+  scatter uses 2 RNG calls — netplay determinism note), max-power auto-convert.
+- **Corrected `FUN_0048b8a0`**: it is a float→int round intrinsic (x87 ST0, ≈
+  `lroundf`, @81531), NOT a bomb/power counter (an earlier-pass mislabel; fixed in
+  both docs).
+
+Still-open RE threads (low-risk, good next-session fillers): the actual shot-spawn
+loop + `.sht` power→pattern selection (verify the §6 sketch), the raw player
+half-extent input field, the bomb-stock decrement site, and the ECL VM
+`FUN_00410520` (the lone undecompilable fn — needs an external source).
+
 ---
 
 #### Original plan (kept for reference)

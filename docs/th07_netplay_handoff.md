@@ -1674,8 +1674,26 @@ exits. It is a config-and-launch front-end, NOT a live socket — the DLL's head
 handshake still does the actual connecting at the title, which keeps the one UDP
 socket inside the game process. The **host mints a fresh random seed per launch**
 (pushed to the guest), so each run plays differently. `proximity_fade` now defaults
-**ON**. Beta drop = `launcher.exe` + `th07_coop.dll` + `coop.ini` + `README.txt`,
-assembled by `package_release.ps1` into `build/release/PCB-Coop-beta.zip`.
+**ON**. The launcher remembers the `th07.exe` path in `coop.ini [launcher] exe_path`
+(prefilled next run; falls back to one sitting next to itself). Beta drop =
+`launcher.exe` + `th07_coop.dll` + `coop.ini` + `README.txt`, assembled by
+`package_release.ps1` into `build/release/PCB-Coop-beta.zip`.
+
+NOTE on "launch then connect": the launcher launches the game immediately and the
+DLL's headless handshake connects at the title — the live UDP socket must live in the
+game process, so an EoSD-style "wait for connect, then Start Game" launcher can't hand
+the live connection across to the game. Connection state is surfaced in-game (the NET
+overlay) + `coop_log.txt` instead.
+
+**Demo / attract-mode disabled — DONE (§8i).** The title-menu update (~`0x004559xx`)
+counts idle frames in `menuObj+0xd100` and at `900 < idleFrames` loads
+`data/demo/demorpyN.rpy` — which advances state + RNG and, under netplay, would fire
+while a player idles at the title waiting for the peer. `PatchDisableDemo()` (coop.c,
+at attach, gated on `[coop] disable_demo`, default ON) raises the threshold to
+`0x7FFFFFF8`: it byte-patches the `imm32` of `CMP [EAX+0xd100],0x384` at **0x00455a9c**
+(found by scanning th07.exe for the unique `00 d1 00 00 84 03 00 00`), guarded by a
+read-back that the bytes still equal 900 so a wrong build is left untouched. (Same
+approach as EoSD's mod.)
 
 **Live sync telemetry — DONE (§8h).** First 2-PC test desynced (frame-4 "DESYNC"
 flapping, lying "back in sync" at mismatched frames on each side, then 1 fps →

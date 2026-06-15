@@ -878,6 +878,7 @@ static int      s_netStallLogged = 0;      /* throttle: frames since last STALL 
 static int      s_netStatLogged  = 0;      /* throttle: frames since last status log   */
 static int      s_netPeerLost = 0;         /* latched once the lockstep timed out      */
 static int      s_proxFade   = 1;          /* coop.ini [coop] proximity_fade (default ON) */
+static int      s_disableDemo = 1;         /* coop.ini [coop] disable_demo (default ON)    */
 /* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
  * per-player char-select FSM under netplay. Both machines compute the same pair. */
 static uint16_t s_netP1Menu  = 0;
@@ -913,6 +914,7 @@ static void LoadNetConfig(void)
      * proximity_fade defaults ON now — fading the overlapping player is the
      * intended co-op look; set proximity_fade=0 in coop.ini to disable. */
     s_proxFade = (int)GetPrivateProfileIntA("coop", "proximity_fade", 1, ini);
+    s_disableDemo = (int)GetPrivateProfileIntA("coop", "disable_demo", 1, ini);
     s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
     if (!s_netEnabled) return;
     GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);
@@ -2849,6 +2851,33 @@ static int __fastcall HookedMenuDispatch(void *menuv)
     return s_origMenuDispatch(menuv);
 }
 
+/* Disable the title-screen demo (attract mode). The menu update at 0x004559xx
+ * counts idle frames in menuObj+0xd100 and, once `900 < idleFrames`, loads
+ * data/demo/demorpyN.rpy — which advances game state + RNG. That's pure noise
+ * solo, and actively harmful under netplay: a player idling at the title waiting
+ * for their peer would kick off a demo. We raise the 900 threshold to ~INT_MAX so
+ * it never fires (the same fix the EoSD co-op mod uses). The immediate of
+ * `CMP [EAX+0xd100], 0x384` lives at 0x00455a96+6 = 0x00455a9c; we only patch if
+ * it still reads 900, so a wrong build is left untouched. */
+#define ADDR_DEMO_THRESHOLD_IMM ((void *)0x00455a9c)
+static void PatchDisableDemo(void)
+{
+    void *p = ADDR_DEMO_THRESHOLD_IMM;
+    DWORD old;
+    if (!VirtualProtect(p, 4, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("demo-play patch FAILED: VirtualProtect err=%lu", GetLastError());
+        return;
+    }
+    if (*(uint32_t *)p == 0x00000384u) {
+        *(uint32_t *)p = 0x7FFFFFF8u;
+        Log("demo-play disabled (idle threshold 900 -> INT_MAX at 0x00455a9c)");
+    } else {
+        Log("demo-play patch SKIPPED: bytes at 0x00455a9c = 0x%08x, not 900 (wrong build?)",
+            *(uint32_t *)p);
+    }
+    VirtualProtect(p, 4, old, &old);
+}
+
 static int InstallHooks(void)
 {
     if (MH_Initialize() != MH_OK) return 0;
@@ -2915,6 +2944,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
         LoadNetConfig();
+        if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */
         if (!InstallHooks())
             MessageBoxA(NULL, "th07_coop: hook install failed (wrong build/addresses?)",

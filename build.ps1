@@ -166,6 +166,9 @@ if (-not (Test-Path $coopIni)) {
 ; your own character stays clear (host fades P2, guest fades P1; single-machine
 ; fades P2 near P1). Set 0 to disable.
 proximity_fade = 1
+; disable_demo: when 1 (default), suppress the title-screen attract-mode demo
+; replay (it would otherwise start on idle and interfere with netplay waiting).
+disable_demo = 1
 
 [net]
 enabled = 0

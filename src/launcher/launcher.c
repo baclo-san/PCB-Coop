@@ -203,6 +203,9 @@ static void DoLaunch(HWND hWnd, int role)
         }
     }
 
+    /* remember the th07.exe path for next time (QoL) */
+    WritePrivateProfileStringA("launcher", "exe_path", exePath, g_iniPath);
+
     WriteIni(role);
     Status(role == 0 ? "Launching (local co-op)…"
           : role == 1 ? "Launching as HOST — sit at the title until the guest joins…"
@@ -249,10 +252,16 @@ static void Prefill(void)
     sprintf(buf, "%d", delay); SetWindowTextA(g_delay, buf);
     SendMessageA(g_fade, BM_SETCHECK, fade ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    /* th07.exe: prefer one sitting next to the launcher (the intended drop). */
-    snprintf(exe, sizeof(exe), "%s%s", g_dir, EXE_NAME);
-    if (GetFileAttributesA(exe) != INVALID_FILE_ATTRIBUTES)
+    /* th07.exe: prefer the path remembered from a previous run, then one sitting
+     * next to the launcher (the intended drop). */
+    GetPrivateProfileStringA("launcher", "exe_path", "", exe, sizeof(exe), g_iniPath);
+    if (exe[0] && GetFileAttributesA(exe) != INVALID_FILE_ATTRIBUTES) {
         SetWindowTextA(g_exe, exe);
+    } else {
+        snprintf(exe, sizeof(exe), "%s%s", g_dir, EXE_NAME);
+        if (GetFileAttributesA(exe) != INVALID_FILE_ATTRIBUTES)
+            SetWindowTextA(g_exe, exe);
+    }
 }
 
 /* ---- window plumbing ------------------------------------------------------ */

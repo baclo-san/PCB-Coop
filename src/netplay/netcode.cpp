@@ -56,6 +56,19 @@ static int   g_netFrame              = 0;   // replaces g_Supervisor.calcCount
 static bool  g_resync_trigger        = false;
 static int   g_resync_stage_frame    = 0;
 
+// Scene generation. The netcode frame index resets to 0 at every scene boundary
+// (the start barrier re-zeroes it so the two machines realign after the asymmetric
+// menu/stage load). That makes frame numbers REUSED across scenes — so a peer's
+// trailing inputs from the previous scene (e.g. Z held while confirming a character
+// in char-select) carry frame numbers that, after the reset, collide with the next
+// scene's early frames. Those stale packets are still in the peer's send window /
+// in flight, and without a generation tag the receiver writes them into the new
+// scene's identically-numbered rcved slots — injecting phantom inputs the sender
+// never made for that scene (the menu->stage desync: 3 phantom P2 shots at
+// stage-frame == char-select-length). g_epoch++ on each reset; outgoing packets are
+// stamped with it; RcvPacks drops Ctrl_Key packets from an older generation.
+static unsigned int g_epoch          = 0;
+
 // Most recent frame's two raw input words, de-merged to player identity (P1 = the
 // HOST's word, P2 = the GUEST's word) so the front-end can route per-player menu
 // input. Updated in GetKeys every connected frame; same on both machines.
@@ -115,6 +128,23 @@ static bool RcvPacks()
 
         if (pack.ctrl.ctrl_type == Ctrl_Key)
         {
+            // EPOCH GUARD — drop a previous scene-generation's key packet. Frame
+            // indices reset to 0 each scene, so a stale packet's frame numbers alias
+            // this scene's slots; writing it would inject the peer's old-scene inputs
+            // (the menu->stage phantom-shot desync). Newer epochs are accepted (a peer
+            // that crossed the scene boundary a frame ahead of us); our own imminent
+            // reset clears anything it deposits, and the peer re-sends post-reset.
+            if (pack.epoch < g_epoch)
+            {
+                static int s_lastStaleEpoch = -1;
+                if ((int)pack.epoch != s_lastStaleEpoch)
+                {
+                    NcLogf("EPOCH DROP stale key pkt epoch=%u < cur=%u (frame=%d)",
+                           pack.epoch, g_epoch, pack.ctrl.frame);
+                    s_lastStaleEpoch = (int)pack.epoch;
+                }
+                continue;   // drain the next datagram; do NOT write rcved slots
+            }
             int frame = pack.ctrl.frame;
             for (int i = 0; i < KeyPackFrameNum; i++)
             {
@@ -152,6 +182,7 @@ static void SendKeys(int frame)
 {
     Pack pack;
     pack.type = 4;
+    pack.epoch = g_epoch;                 // stamp the current scene generation
     pack.ctrl.ctrl_type = Ctrl_Key;
     pack.ctrl.frame = frame;
 
@@ -385,6 +416,7 @@ static void HsSend(int packType, unsigned int seq)
 {
     Pack p;
     p.type     = packType;
+    p.epoch    = g_epoch;
     p.seq      = seq;
     p.sendTick = GetTickCount64();
     p.echoTick = 0;
@@ -466,6 +498,7 @@ void Netcode_Reset()
     g_netFrame = 0;
     g_is_sync = true;
     g_resync_trigger = false;
+    g_epoch++;   // new scene generation — older packets are now stale (epoch guard)
     // NB: g_diag_* counters are intentionally NOT reset here — they are cumulative
     // across the whole session so a scene change can't hide a fault.
 }

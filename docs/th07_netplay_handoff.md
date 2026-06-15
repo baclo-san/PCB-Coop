@@ -1864,6 +1864,63 @@ in `docs/th07_coop_gameplay_bugs.md` for an unattended session. Not transport-re
 note a **crash on one machine reads as `peer lost` on the other**, so the two crashes
 (P1-Sakuya+P2-Reimu on hit; stage-4 death-fairy) are worth fixing regardless.
 
+### §8m — DESYNC ROOT-CAUSED + FIXED: stale-scene packet contamination (2026-06-16)
+
+**The v5 wire trace settled it. The "present-but-wrong P2 slot" of §8l is NOT a drop —
+it is the previous scene's input bleeding into the stage through a reused frame index.**
+
+Diagnosis from the friend's two-run logs (`coop_trace_{host,guest}.csv` + `coop_log.txt`,
+host=P1 Reimu / guest=P2):
+- Cross-checked, per read-frame `k`, `host.rcved[k]` (what the host thinks the guest sent)
+  vs `guest.self[k]` (what the guest actually recorded). **Whole-stage totals:**
+  - **Run 2: exactly 3 disagreements** — frames **536, 537, 538**, all `host=0001`,
+    `guest=0000`. Host→guest direction 100% clean.
+  - **Run 1: exactly 3 disagreements** — frames **698, 699, 700**, same shape; host→guest
+    clean.
+- **The disagreeing frame == the char-select length.** The single re-align log reads
+  `scene 1 -> 2 — lockstep re-aligned to frame 0 (was 539)` (run 2) / `(was 701)` (run 1).
+  Run 2's contamination is at 536–538, run 1's at 698–700 — i.e. the **last ~3 frames of
+  the menu scene**, replayed into the stage at the **identically-numbered** stage frames.
+- **The phantom value is `0001` = Z held in char-select.** The guest (P2) holds shot to
+  confirm its character; `WIRE SEND key0=0001` runs through the whole menu. The v5 wire
+  logs are CLEAN: guest `WIRE SEND frame=538 key0=0001` and host `WIRE RECV slot=538
+  val=0001` agree. The provenance columns nail it: all three contaminated host slots have
+  `rcvSrc=538` (last written by guest **packet frame 538** — a *menu* packet, since the
+  menu ended at 539) with `writes` 3/2/1 for slots 536/537/538 — the exact trailing-batch
+  signature of `keys[0..2]` of the last menu packet.
+
+**Mechanism.** The §8j start-barrier resets the netcode frame index to 0 at every scene
+boundary (needed so the two machines realign after the asymmetric menu/stage load). That
+makes frame numbers **reused** across scenes. `Nc_Reset()` clears the *local* maps, but it
+cannot un-send the guest's in-flight/last-window menu packets. Those packets carry frames
+≈524–539 with value `0001`; arriving just after the host's reset, they write the **stage**'s
+`rcved[524..539]=0001`. Lower slots get overwritten in time by fresh stage packets, but the
+slots at the menu's very end (the last ~3) are read by the slightly-leading host in the
+narrow race **before** the lagging guest reaches those stage frames and sends the real
+`0000` — so the host injects ~3 phantom P2 shots. Those shots kill a fairy on the host
+screen only, change an item-drop roll, and the **shared RNG counter splits** (host ctr=0 /
+guest ctr=4 at the first diverged frame) — exactly the user's "fairies spawn/drop
+differently" + "a shot fires on one screen not the other." **Run 1 vs run 2 are the SAME
+bug**; it just lands at char-select-length frames in, so a fast select desyncs "from the
+start" and a slow one desyncs "after Letty's first spell."
+
+**FIX (committed): scene-generation (epoch) tag on the wire.** `Pack` gains a `unsigned int
+epoch`; `g_epoch++` in `Netcode_Reset()` (so it bumps with the per-scene re-zero, in
+lockstep on both machines — both reset on the same scene-id change at `self+0x154`).
+`SendKeys`/`HsSend` stamp the current epoch; `RcvPacks` **drops any `Ctrl_Key` packet with
+`epoch < g_epoch`** (a previous generation). Newer epochs are accepted (a peer that crossed
+the boundary a frame ahead) and cleared by our own imminent reset. `MULTI_NET_VER`
+3950→3960 so a mixed-build pair refuses to connect (the handshake already gates on ver).
+A deduped `EPOCH DROP …` line logs each stale generation dropped, for the next test's
+confirmation. Builds clean (all 6 targets, 32-bit); native merge test 0 failures.
+**Needs the 2-PC re-test:** expect the trace to show **0** host↔guest input disagreements
+across the whole stage and the RNG counter to stay locked through Letty and beyond.
+
+> Note (unchanged, separate): the P1-Sakuya+P2-Reimu crash did NOT reproduce in this build
+> (both reached Cirno). It was last seen on the **Phantasm** stage locally, not main-game
+> stage 1 — still tracked in `docs/th07_coop_gameplay_bugs.md`, unrelated to this transport
+> fix.
+
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +
 retry all confirmed by the user). Before any risky change, note the last-good

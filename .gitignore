@@ -9,6 +9,8 @@ build/desync_host.csv
 build/desync_guest.csv
 # netsim driver is a build product, not a shipped artifact
 build/netsim.exe
+# 2-process handshake smoke test binary (source in tests/, build locally)
+build/handshake_test.exe
 
 # host-native test binary produced by build.sh (not a Windows deliverable)
 build/merge_test_native

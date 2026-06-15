@@ -863,6 +863,8 @@ static int      s_netDelay   = 2;
 static uint16_t s_netSeed    = 0x1234;
 
 /* live state */
+static int      s_netStarted = 0;          /* transport up; handshake in progress     */
+static int      s_netVerWarned = 0;        /* logged a peer version mismatch once      */
 static int      s_netActive  = 0;          /* transport up + connected               */
 static int      s_netFrame   = 0;          /* DLL-owned logic-frame index             */
 static uint16_t s_netMerged  = 0;          /* this frame's merged word (P2 reads high) */
@@ -923,15 +925,14 @@ static void StartNet(void)
         : Nc_StartGuest(s_netPeer, s_netPort, s_netLocal, 2 /*AF_INET*/);
     if (!ok) { Log("netplay: transport start FAILED (role=%s) — falling back to local P2",
                    s_netIsHost ? "host" : "guest"); return; }
-    /* A2 stand-in: both configs carry the same delay+seed, so declare the link
-     * connected immediately. A real handshake (host sends rng_seed_init, guest
-     * adopts) is the next step — see fork_a §3/§7. */
-    Nc_SetConnected(1, s_netDelay, s_netSeed);
-    s_netActive = 1;
-    Log("netplay: UP role=%s peer=%s port=%d local=%d delay=%d seed=0x%04x. "
-        "Both inputs from the WIRE; each player picks its OWN character at select.",
-        s_netIsHost ? "host" : "guest", s_netPeer, s_netPort, s_netLocal,
-        s_netDelay, s_netSeed);
+    /* Arm the handshake; the link goes live only once the peer answers (pumped in
+     * HookedSceneTick). The HOST's delay+seed are pushed to the guest over the wire,
+     * so the guest's ini seed= is ignored — no more hand-matching. */
+    Nc_BeginHandshake(s_netDelay, s_netSeed);
+    s_netStarted = 1;          /* pump the handshake each front-end frame             */
+    Log("netplay: transport up role=%s peer=%s port=%d local=%d. Handshaking — "
+        "waiting for the peer to answer (start the other machine)...",
+        s_netIsHost ? "host" : "guest", s_netPeer, s_netPort, s_netLocal);
 }
 
 /* FUN_00437c70 — per-logic-frame scene input task. Owns the netcode frame
@@ -939,6 +940,24 @@ static void StartNet(void)
 static int __fastcall HookedSceneTick(void *self)
 {
     int r = s_origSceneTick(self);          /* ZUN: g_InputMenu = Input_Poll() */
+    if (s_netStarted && !s_netActive) {
+        /* connection handshake at the front-end: keep pinging until the peer answers,
+         * then the link is live (guest has adopted the host's delay+seed). */
+        if (Nc_PumpHandshake()) {
+            s_netActive  = 1;
+            s_netStarted = 0;               /* don't re-handshake on a later drop      */
+            s_netFrame   = 0;
+            Nc_Reset();                     /* fresh lockstep maps from frame 0         */
+            Log("netplay: LINK UP (handshake done). role=%s delay=%d seed=0x%04x. "
+                "Both inputs from the WIRE; each player picks its own character.",
+                Nc_IsHost() ? "host" : "guest", Nc_GetDelay(), Nc_GetInitSeed());
+        } else if (Nc_HandshakeVersionBad() && !s_netVerWarned) {
+            Log("netplay: peer VERSION MISMATCH — both machines must run the same "
+                "build. Staying on local P2.");
+            s_netVerWarned = 1;
+        }
+        return r;                           /* no lockstep until connected             */
+    }
     if (s_netActive) {
         int inStage = (int)((*ADDR_MODE_FLAGS >> 2) & 1);  /* recording active = in a stage */
         int ctrl = 0;

@@ -29,6 +29,14 @@ int  Nc_StartGuest(const char* hostIp, int hostPort, int localPort, int family);
 void Nc_SetConnected(int connected, int delay, unsigned short rngSeedInit);
 void Nc_Reset(void);   /* clear per-frame maps (new game / frame-counter reset) */
 
+/* Connection handshake / auto-sync. BeginHandshake arms it (host passes its delay +
+ * seed; guest's seed is ignored, it adopts the host's). Call PumpHandshake every
+ * front-end frame until it returns 1 (link up). HandshakeVersionBad = peer build
+ * mismatch (don't connect). */
+void Nc_BeginHandshake(int delay, unsigned short seed);
+int  Nc_PumpHandshake(void);
+int  Nc_HandshakeVersionBad(void);
+
 /* Per-frame injection point. Returns the merged 16-bit word both machines agree on
  * for logic-frame `frame`; is_in_UI!=0 -> menu merge (self|rcv), else P1-low/P2-high.
  * out_ctrl receives the resolved in-game control action for this frame. */

@@ -31,6 +31,10 @@ void Nc_SetConnected(int connected, int delay, unsigned short rngSeedInit)
 
 void Nc_Reset(void) { Netcode_Reset(); }
 
+void Nc_BeginHandshake(int delay, unsigned short seed) { Netcode_BeginHandshake(delay, seed); }
+int  Nc_PumpHandshake(void)       { return Netcode_PumpHandshake() ? 1 : 0; }
+int  Nc_HandshakeVersionBad(void) { return Netcode_HandshakeVersionBad() ? 1 : 0; }
+
 unsigned short Nc_GetInputNet(int frame, int is_in_UI, int* out_ctrl)
 {
     int ctrl = 0;

@@ -36,6 +36,14 @@ bool Netcode_StartGuest(const std::string& hostIp, int hostPort, int localPort, 
 void Netcode_SetConnected(bool connected, int delay, unsigned short rngSeedInit);
 void Netcode_Reset();          // clear all per-frame maps (call on new game / calcCount reset)
 
+// ---- connection handshake (auto-sync the link + push the host's seed/delay) ----
+// BeginHandshake arms it (host: its delay+seed; guest: delay fallback, adopts host's).
+// PumpHandshake is called every front-end frame until it returns true (link up); the
+// guest ends with the host's delay+seed. HandshakeVersionBad latches on a build mismatch.
+void Netcode_BeginHandshake(int delay, unsigned short seed);
+bool Netcode_PumpHandshake();
+bool Netcode_HandshakeVersionBad();
+
 // ---- per-frame entry (the injection point) ----
 // Returns the merged 16-bit word BOTH machines agree on for logic-frame `frame`:
 //   gameplay (is_in_UI=false): P1 = host's low-bit input, P2 = guest's input in high bits.

@@ -249,6 +249,88 @@ void Netcode_SetConnected(bool connected, int delay, unsigned short rngSeedInit)
     g_is_sync = true;
 }
 
+// ---- connection handshake (headless port of ConnectionUI's PING/PONG + InitSetting) ----
+// Replaces the optimistic immediate-connect: the link only goes live once the PEER
+// answers, and the HOST's delay+seed are pushed to the guest over the wire (so the
+// players no longer have to hand-match seed= in both inis — the host's wins).
+enum { PK_PING = 2, PK_PONG = 3 };
+static bool               g_hs_active    = false;   // handshake in progress
+static unsigned int       g_hs_seq       = 0;
+static unsigned long long g_hs_last_ping = 0;
+static bool               g_hs_ver_bad   = false;   // peer build/version mismatch (latched)
+
+static void HsSend(int packType, unsigned int seq)
+{
+    Pack p;
+    p.type     = packType;
+    p.seq      = seq;
+    p.sendTick = GetTickCount64();
+    p.echoTick = 0;
+    p.ctrl.ctrl_type = Ctrl_Set_InitSetting;
+    p.ctrl.init_setting.delay         = g_delay;
+    p.ctrl.init_setting.ver           = MULTI_NET_VER;
+    p.ctrl.init_setting.rng_seed_init = g_initSeed;   // host's chosen seed (guest's is ignored)
+    if (g_is_host) g_host.SendPack(p); else g_guest.SendPack(p);
+}
+
+void Netcode_BeginHandshake(int delay, unsigned short seed)
+{
+    if (delay > 0) g_delay = delay;
+    g_initSeed     = seed;       // host: chosen; guest: fallback until it adopts the host's
+    g_is_connected = false;
+    g_is_sync      = true;
+    g_hs_active    = true;
+    g_hs_seq       = 0;
+    g_hs_last_ping = 0;
+    g_hs_ver_bad   = false;
+}
+
+bool Netcode_HandshakeVersionBad() { return g_hs_ver_bad; }
+
+// Call once per front-end frame until it returns true. Drives the PING/PONG so the
+// link comes up on its own; the guest adopts the host's delay+seed. Idempotent once
+// connected. (Host::SendPack no-ops until it has heard from the guest, so the host's
+// pings start landing only after the guest's first ping teaches it the address.)
+bool Netcode_PumpHandshake()
+{
+    if (g_is_connected) return true;
+    if (!g_hs_active)    return false;
+
+    unsigned long long now = GetTickCount64();
+    if (g_hs_last_ping == 0 || now - g_hs_last_ping >= 200) {   // ~5 pings/sec
+        HsSend(PK_PING, g_hs_seq++);
+        g_hs_last_ping = now;
+    }
+
+    for (;;) {
+        Pack p; bool hasData = false;
+        bool ok = g_is_host ? g_host.PollReceive(p, hasData)
+                            : g_guest.PollReceive(p, hasData);
+        if (!ok || !hasData) break;
+
+        if (p.ctrl.ctrl_type == Ctrl_Set_InitSetting &&
+            p.ctrl.init_setting.ver != MULTI_NET_VER) {
+            g_hs_ver_bad = true;            // different build — refuse to connect
+            continue;
+        }
+
+        if (p.type == PK_PING)             // answer the peer's ping with our settings
+            HsSend(PK_PONG, p.seq);
+
+        // The guest adopts the host's delay+seed from any InitSetting it receives
+        // (its only peer IS the host). The host keeps its own and ignores the guest's.
+        if (!g_is_host && p.ctrl.ctrl_type == Ctrl_Set_InitSetting) {
+            if (p.ctrl.init_setting.delay > 0) g_delay = p.ctrl.init_setting.delay;
+            g_initSeed = p.ctrl.init_setting.rng_seed_init;
+        }
+
+        g_is_connected = true;             // a PING or PONG from the peer proves the link
+    }
+
+    if (g_is_connected) g_hs_active = false;
+    return g_is_connected;
+}
+
 void Netcode_Reset()
 {
     g_ctrl_bits_self.clear();

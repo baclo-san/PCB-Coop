@@ -1502,6 +1502,20 @@ P2 selection. Build: 32-bit OK; all 16 netcode self-tests pass. NOT yet 2-PC tes
 Files: `netcode.cpp/.hpp`, `netcode_c_api.{h,cpp}`, `coop.c` (`HookedMenuDispatch`,
 `HookedSceneTick`). See §8e.
 
+### 5o — connection handshake / auto-sync + seed push (2026-06-15)
+The bring-up was optimistic (connect immediately; both inis had to carry the same
+`seed`/`delay`). Ported the EoSD `ConnectionUI` handshake HEADLESSLY into the netcode:
+`Netcode_BeginHandshake(delay,seed)` arms it; `Netcode_PumpHandshake()` (called every
+front-end frame from `HookedSceneTick` while `s_netStarted && !s_netActive`) sends
+PING(`Ctrl_Set_InitSetting`)/answers PONG until the peer responds, then flips the link
+live. The host's `delay`+`seed` ride in `init_setting`; the guest adopts them (its own
+ignored). `MULTI_NET_VER` mismatch is latched + logged. Auto-retries, so launch order
+is free. On a later mid-game drop the pump does NOT restart (stays local — reconnect is
+future work). Verified over real UDP loopback: `tests/handshake_test.cpp` (host+guest
+connect; guest seed 0x9999 → host's 0x1234). All 16 netcode unit tests still pass.
+Files: `netcode.{cpp,hpp}`, `netcode_c_api.{h,cpp}`, `coop.c` (`StartNet`,
+`HookedSceneTick`), `tests/handshake_test.cpp`. See §8e.
+
 ## 8. Goals / TODO (next sessions)
 
 Ordered by the user's priority. Items marked **[autonomous-ok]** can be drafted
@@ -1636,8 +1650,19 @@ Both machines run the identical deterministic FSM → each player picks its own
 char/type. Title/difficulty still navigate together (UI-union). Compile + all 16
 netcode self-tests pass; **needs a two-machine network test** (see NETPLAY_TEST.md).
 
-**Still open:** a real host→guest **seed handshake** (host sends `rng_seed_init` in
-`Ctrl_Set_InitSetting`; guest adopts) to replace the both-sides-config `seed=`.
+**Connection handshake / auto-sync — DONE (§5o).** Replaced the optimistic
+immediate-connect with a headless port of the EoSD `ConnectionUI` PING/PONG +
+`Ctrl_Set_InitSetting` flow: `Netcode_BeginHandshake`/`PumpHandshake` (netcode.cpp),
+exposed as `Nc_BeginHandshake`/`Nc_PumpHandshake`/`Nc_HandshakeVersionBad`.
+`StartNet` now arms the handshake (no immediate connect); `HookedSceneTick` pumps it
+each front-end frame and flips `s_netActive` on only when the peer answers. The HOST
+pushes its `delay`+`seed` over the wire and the guest ADOPTS them (guest's ini values
+ignored) — no more hand-matching, and launch order is free (it retries until the peer
+appears). Version mismatch (`MULTI_NET_VER`) is detected and refused. **Verified over
+real UDP loopback** (`tests/handshake_test.cpp`: host+guest connect, guest's 0x9999
+seed correctly overridden to the host's 0x1234).
+
+**Still open:** the two-machine in-game test; optional host seed randomization per run.
 
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +

@@ -38,11 +38,10 @@ role  = guest
 peer  = 192.168.x.x      ; <-- the HOST's IP
 port  = 47000
 local = 47001
-delay = 2
-seed  = 0x1234
 ```
-`delay` and `seed` **must be identical on both sides.** (`seed` mismatch = instant
-desync; the log will say so.)
+The link **auto-connects** (a handshake), and the **host pushes its `delay` + `seed`
+to the guest** — so on the guest those two are ignored (you can omit them). Only the
+host's `delay`/`seed` matter. No more hand-matching.
 
 ## 3. Allow the host through the firewall
 On the host, Windows Firewall must let **inbound UDP on port 47000** through. Easiest:
@@ -50,22 +49,24 @@ the first time `th07.exe` networks, Windows pops a "allow access?" dialog — cl
 **Allow** (Private networks). If you miss it, add an inbound UDP 47000 rule manually.
 (Guest needs no inbound rule.)
 
-## 4. Launch — host first, then guest
+## 4. Launch (either order — it auto-connects)
 Use the injector (NOT a normal th07 launcher, or the mod won't load). Edit
 `run_coop.bat` so its path points at your `th07.exe`, then double-click it — or run:
 ```
 injector.exe "C:\path\to\th07.exe" "th07_coop.dll"
 ```
-You should see `injected OK`. Launch the **host** first, then the **guest** within a
-few seconds.
+You should see `injected OK`. Launch both machines and leave them at the **title
+screen**; the handshake keeps retrying until the peer appears, so launch order
+doesn't matter. (Sit at the title until connected — see step 5.)
 
 ## 5. Confirm the link
-Open **`coop_log.txt`** (created next to the DLL) on each machine. Near the top you
-want:
+Open **`coop_log.txt`** (created next to the DLL) on each machine. At first you'll see
+`transport up ... Handshaking — waiting for the peer`. Once they find each other:
 ```
-netplay: UP role=host ... each player picks its OWN character at select.
+netplay: LINK UP (handshake done). role=host delay=2 seed=0x1234. ...
 ```
-If instead you see `transport start FAILED` or `DESYNC detected`, see Troubleshooting.
+Both machines should log `LINK UP` with the **same seed** (the host's). If you only
+see `Handshaking...` forever, the peer isn't reachable — see Troubleshooting.
 
 ## 6. Play
 - **Title / difficulty:** the **host (P1)** leads — host navigates and starts.
@@ -81,14 +82,16 @@ If instead you see `transport start FAILED` or `DESYNC detected`, see Troublesho
 | Symptom | Likely cause / fix |
 |---|---|
 | `transport start FAILED` | Port in use or firewall. Try another `port` on both; allow UDP. |
-| Guest can't connect | Wrong `peer` IP, different network, or host firewall blocking UDP 47000. |
-| `DESYNC detected` | `seed` or `delay` differ between the two `coop.ini`s. Make them identical. |
-| Choppy / laggy | Raise `delay` (e.g. 3–4) on both — trades input latency for smoothness. |
+| Stuck on `Handshaking...` | Peer unreachable: wrong `peer` IP, different network, or host firewall blocking UDP 47000. |
+| `peer VERSION MISMATCH` | The two machines have different `th07_coop.dll` builds. Use the same DLL on both. |
+| `DESYNC detected` (in-game) | Seed is auto-synced now, so this means a logic divergence — grab both `coop_log.txt` and report. |
+| Choppy / laggy | Raise the HOST's `delay` (e.g. 3–4) — trades input latency for smoothness (pushed to the guest). |
 | Mod not loaded at all | You launched th07 normally. Must go through `injector.exe` / `run_coop.bat`. |
 | One side crashes | Grab BOTH `coop_log.txt` files + note what was on screen; that's the bug report. |
 
 ## Notes / known limits (this cut)
+- **Auto-connect handshake**: launch order doesn't matter; the host's `delay`+`seed`
+  are pushed to the guest (guest's are ignored).
 - **Per-player character select works** (host=P1 then guest=P2). Title/difficulty
   are host-led.
-- No automatic seed handshake yet: it relies on matching `seed=` in both inis.
 - Local-keyboard co-op is unchanged — set `enabled = 0` to get it back.

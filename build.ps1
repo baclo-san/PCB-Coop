@@ -147,8 +147,9 @@ if (-not (Test-Path $coopIni)) {
 ; confirmed-good local co-op baseline, byte-for-byte unchanged.
 ;
 ; Over the network: set enabled=1 on BOTH machines, role=host on one /
-; role=guest on the other, give the guest the host's IP in peer=, and use the
-; SAME delay and seed on both sides (a real seed handshake is a follow-up).
+; role=guest on the other, give the guest the host's IP in peer=. The link
+; auto-connects (handshake) and the HOST pushes its delay+seed to the guest, so
+; on the guest delay= and seed= are ignored — only the host's matter.
 
 [coop]
 ; proximity_fade: when 1, fade the OTHER player out as they get close so your

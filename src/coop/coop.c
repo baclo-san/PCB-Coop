@@ -847,6 +847,7 @@ static int s_p2InputLogged = 0;
 #define ADDR_GAME_START ((LPVOID)0x00442c60)   /* game/stage-start init (seed snapshot)*/
 #define ADDR_INPUT_MENU ((volatile uint16_t *)0x004b9e4c) /* g_InputMenu (raw poll)    */
 #define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
+#define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
 
 typedef int (__fastcall *SceneTickFn_t)(void *self);
 typedef int (__fastcall *GameStartFn_t)(int self);
@@ -877,6 +878,7 @@ static uint16_t s_netRcvRng   = 0;
 static int      s_netStallLogged = 0;      /* throttle: frames since last STALL log    */
 static int      s_netStatLogged  = 0;      /* throttle: frames since last status log   */
 static int      s_netPeerLost = 0;         /* latched once the lockstep timed out      */
+static FILE    *s_trace = NULL;            /* DIAGNOSTIC: per-frame determinism trace  */
 static int      s_netSceneId  = -1;        /* last top-level scene id (self+0x154); a
                                               change re-zeros the lockstep (start barrier)*/
 static int      s_proxFade   = 1;          /* coop.ini [coop] proximity_fade (default ON) */
@@ -948,6 +950,30 @@ static void StartNet(void)
         s_netIsHost ? "host" : "guest", s_netPeer, s_netPort, s_netLocal);
 }
 
+/* DIAGNOSTIC (det-trace) — one CSV row per logic frame while netplay is active.
+ * Both machines run the SAME frame indices under lockstep, so diffing the host
+ * and guest CSVs by the `frame` column gives the exact frame the sims part ways.
+ * The live RNG counter (0x0049fe24) is monotonic within a stage and is NOT reset
+ * by our seed-force, so it catches divergence the per-frame seed (which the
+ * seed-force pins back to initSeed) would otherwise mask. seed/counter are read
+ * live here at the top of the logic frame (== end of the previous frame's sim),
+ * which is the same relative sample point on both machines. */
+static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sync)
+{
+    if (!s_trace) {
+        char p[MAX_PATH];
+        snprintf(p, sizeof(p), "%scoop_trace_%s.csv", s_dir,
+                 Nc_IsHost() ? "host" : "guest");
+        s_trace = fopen(p, "w");
+        if (!s_trace) return;
+        fputs("frame,inStage,merged,p1,p2,seed,counter,waitMs,sync\n", s_trace);
+    }
+    fprintf(s_trace, "%d,%d,%04x,%04x,%04x,%04x,%u,%d,%d\n",
+            frame, inStage, merged, s_netP1Menu, s_netP2Menu,
+            (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR, waitMs, sync);
+    fflush(s_trace);                        /* survive the freeze tail */
+}
+
 /* FUN_00437c70 — per-logic-frame scene input task. Owns the netcode frame
  * counter and overwrites g_InputMenu with the merged word. */
 static int __fastcall HookedSceneTick(void *self)
@@ -1015,6 +1041,8 @@ static int __fastcall HookedSceneTick(void *self)
         Nc_GetSyncStats(&s_netSelfRng, &s_netRcvRng, &s_netWaitMs);
         s_netSync = sync;
 
+        NetTrace(s_netFrame, inStage, merged, s_netWaitMs, sync);  /* DIAGNOSTIC */
+
         /* DESYNC is only meaningful IN-STAGE. The front-end menus are not RNG-locked
          * (the two machines reach a screen from slightly different states), so a seed
          * mismatch there is expected — reporting it as a "desync" was the misleading
@@ -1024,8 +1052,8 @@ static int __fastcall HookedSceneTick(void *self)
             if (!sync) {
                 s_netSyncRun = 0;
                 if (!s_netDesyncLogged) {
-                    Log("netplay: DESYNC in stage at frame %d (rng self=0x%04x peer=0x%04x)",
-                        s_netFrame, s_netSelfRng, s_netRcvRng);
+                    Log("netplay: DESYNC in stage at frame %d (rng self=0x%04x peer=0x%04x ctr=%u)",
+                        s_netFrame, s_netSelfRng, s_netRcvRng, (unsigned)*ADDR_RNG_CTR);
                     s_netDesyncLogged = 1;
                 }
             } else if (s_netDesyncLogged && ++s_netSyncRun >= 120) {
@@ -1045,9 +1073,10 @@ static int __fastcall HookedSceneTick(void *self)
         }
         /* periodic heartbeat so the log carries a sync timeline even outside stages. */
         if (connected && --s_netStatLogged <= 0) {
-            Log("netplay: F%d %s wait=%dms rng self=0x%04x peer=0x%04x%s",
+            Log("netplay: F%d %s wait=%dms rng self=0x%04x peer=0x%04x ctr=%u%s",
                 s_netFrame, sync ? "SYNC" : "DESYNC", s_netWaitMs,
-                s_netSelfRng, s_netRcvRng, inStage ? " [stage]" : " [menu]");
+                s_netSelfRng, s_netRcvRng, (unsigned)*ADDR_RNG_CTR,
+                inStage ? " [stage]" : " [menu]");
             s_netStatLogged = 120;
         }
 
@@ -1065,8 +1094,16 @@ static int __fastcall HookedSceneTick(void *self)
  * snapshots it (idempotent on the documented mid-stage re-fires). */
 static int __fastcall HookedGameStart(int self)
 {
-    if (s_netActive)
+    if (s_netActive) {
+        /* DIAGNOSTIC: log every fire so a host-vs-guest diff reveals whether
+         * FUN_00442c60 fires at MISMATCHED frames (the suspected desync driver —
+         * a mid-stage re-fire slamming the seed to initSeed at different frames
+         * on each machine). counter is read pre-orig (the orig zeroes it). */
+        uint16_t before = *ADDR_RNG_SEED;
         *ADDR_RNG_SEED = Nc_GetInitSeed();
+        Log("netplay: SEEDFORCE F%d seed 0x%04x -> 0x%04x ctr=%u (FUN_00442c60)",
+            s_netFrame, before, (unsigned)Nc_GetInitSeed(), (unsigned)*ADDR_RNG_CTR);
+    }
     return s_origGameStart(self);
 }
 /* ===================== end netplay ===================== */
@@ -3023,6 +3060,9 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
+        Log("*** DIAGNOSTIC BUILD (det-trace): SEEDFORCE + RNG-counter logging; "
+            "per-frame trace -> coop_trace_{host,guest}.csv while netplay active. "
+            "Demo-disable fix included (expect 'demo-play disabled ... 0x00455a9a'). ***");
         LoadNetConfig();
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */
@@ -3036,6 +3076,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
                 "border-break @0x441bd0, hud-draw @0x42b603)");
         break;
     case DLL_PROCESS_DETACH:
+        if (s_trace) { fclose(s_trace); s_trace = NULL; }
         if (s_log) { Log("detach"); fclose(s_log); }
         MH_Uninitialize();
         break;

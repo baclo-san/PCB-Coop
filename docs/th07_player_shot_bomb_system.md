@@ -155,12 +155,17 @@ if (player+0x240d == 0 || player+0x16a20 != 0 || (DAT_004b9e50 & 2) == 0) {
   `+0x16a3c` (unfocused) / `+0x16a44` (focused) (✅ called at 26683/26686; also
   per-frame at 26712/26715 and in draw at 27253/27256). These pointers are
   installed at player init from a global table (🟡 `PTR_FUN_0049ec50..5c`).
-- Side effects on launch: `FUN_0043b7a0(1)`, `FUN_0042d612(-1)` (clear bullets /
-  sfx), and replay-flag `DAT_004b9e48+0xd6 |= 1`.
+- **Bomb SPEND (✅):** the launch calls `FUN_0042d612(0xffffffff)` @26673 =
+  `FUN_0042d612(this, -1)` — the **bomb-stock accessor** (`FUN_0042d612` @17731:
+  `*(res+0x68) += amount`), so it decrements the bomb count `res+0x68` (=coop.c
+  `RES_BOMBS`) by 1. (The same accessor adds bombs on a bomb-item pickup, §2
+  case 3.) coop.c already field-swaps `res+0x68` around P2's update, so **P2's
+  bomb spend is attributed to P2 automatically** — the decrement runs in P2's
+  window with P2's value swapped in. Other launch side-effects: `FUN_0043b7a0(1)`
+  (sfx), `FUN_0042d5cd` (clear/effect), replay-flag `DAT_004b9e48+0xd6 |= 1`.
 - `FUN_0048b8a0()` is a float→int **round intrinsic** (PCBdecomp.c:81531; reads
   x87 `ST0`, ≈ `lroundf`), NOT a stored count. The `> 0` here rounds whatever
-  float the bomb code left on the FPU stack (a resource gate); the field a bomb
-  actually decrements is the open item below.
+  float the bomb code left on the FPU stack (a resource gate).
 
 ---
 
@@ -250,7 +255,6 @@ drawn by `FUN_0042c577` (✅ coop.c, PCBdecomp.c:17267). Face id window
   +20px `+0x960/+0x964/+0x96c/+0x970` (`FUN_0043e3b0`). See
   `th07_player_struct.md`. coop.c’s `OFF_HITBOX` was renamed → `OFF_DEATH_TIMER`.
   Still open: the raw half-extent input field these edges are recomputed from.
-- Find where a bomb actually decrements the bomb stock (`FUN_0048b8a0` turned out
-  to be a float→int round intrinsic, not the stock field) — needed for per-player
-  bomb-count work. coop.c already tracks bombs via the resource struct
-  (`RES_BOMBS 0x68`); confirm the bomb launch path writes that.
+- ✅ DONE: the bomb spend is `FUN_0042d612(this,-1)` @26673 (accessor @17731,
+  `res+0x68 += amount`); coop.c's `RES_BOMBS 0x68` field-swap already attributes
+  P2's bomb spend correctly. Per-player bombs need no extra work here.

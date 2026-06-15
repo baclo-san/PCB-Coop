@@ -1351,6 +1351,22 @@ detours are installed but their bodies are pure pass-through when `!s_netActive`
    (they navigate together, so this should be automatic once both are connected
    before the menu).
 
+### 5l — proximity transparency prototype (NIGHT_SHIFT #2) — 2026-06-15 (night)
+
+Fade the OTHER player out as the two players overlap, so the local one stays
+readable. `ApplyProximityFade` (coop.c, near `MoveGhost`) writes the remote
+player's tint (`OFF_TINT` 0x1b8) after the player update each frame, alpha ramped
+on the P1↔P2 **squared** distance (no sqrt/math.h): opaque ≥ `PROX_FAR2` (96px),
+floored at `PROX_FLOOR` (0x40) ≤ `PROX_NEAR2` (24px), linear between. ASYMMETRIC
+per the spec: `s_netActive && !Nc_IsHost()` ⇒ guest, fade **P1** (keep P2
+opaque); else (host / single-machine) fade **P2**. Skipped while either player is
+a ghost or the run is over (those own the tint). Gated behind `coop.ini [coop]
+proximity_fade=1`, default OFF. Reuses the exact tint mechanism the ghost
+half-alpha already proves. **Compile-verified; needs a visual look** to tune the
+ramp/floor, and the real per-instance asymmetry needs a two-machine netplay test
+(the single-machine path is the prototype — both screens are identical, so
+fading P2 only "helps see P1" from P1's seat).
+
 ---
 
 #### Original plan (kept for reference)

@@ -149,6 +149,13 @@ if (-not (Test-Path $coopIni)) {
 ; Over the network: set enabled=1 on BOTH machines, role=host on one /
 ; role=guest on the other, give the guest the host's IP in peer=, and use the
 ; SAME delay and seed on both sides (a real seed handshake is a follow-up).
+
+[coop]
+; proximity_fade: when 1, fade the OTHER player out as they get close so your
+; own character stays clear (host fades P2, guest fades P1; single-machine
+; fades P2 near P1). Off by default; most meaningful under netplay.
+proximity_fade = 0
+
 [net]
 enabled = 0
 role  = host

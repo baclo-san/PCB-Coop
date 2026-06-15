@@ -27,6 +27,16 @@ FSM (P2 char/type) over the wire too. Lockstep + the existing record/replay desy
 diff. Keep local-keyboard P2 as a fallback. **Define "whose instance am I" early**
 (host=P1 / guest=P2) — needed for #2.
 
+## ✅ PROTOTYPED 2026-06-15 — proximity transparency (#2 below)
+Implemented as `ApplyProximityFade` in coop.c, gated behind `coop.ini [coop]
+proximity_fade=1` (default off). Asymmetric + per-instance as specified: under
+netplay the host fades P2 and the guest fades P1 (keys off `Nc_IsHost()`);
+single-machine fades P2 near P1 (the prototype). Alpha ramps with the P1↔P2
+squared distance (PROX_NEAR2/PROX_FAR2), floored at PROX_FLOOR so the faded
+player stays trackable; applied after the player update, skipped while either
+player is a ghost / game-over. NEEDS A VISUAL LOOK to tune the ramp + floor, and
+the real asymmetry needs a netplay test (#1). Build + compile verified.
+
 ## 2. Proximity transparency (needs #1 first; only netplay-testable)
 When the two players are close, fade the OTHER player out so you can see your own.
 **Asymmetric, per-instance:** on P1's machine, P2 turns transparent; on P2's machine,

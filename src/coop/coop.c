@@ -129,6 +129,16 @@
  *   F12 = toggle P2 HUD style: sprite ICONS that mirror P1's life/bomb rows
  *         (default, handoff §8a) <-> the legacy ascii "P2xx Ln Bn Pn" text line.
  *
+ * NETPLAY (coop.ini [net] enabled=1): P2's input comes from the WIRE instead of
+ *   the local keyboard — the engine-agnostic netcode core is linked straight in
+ *   (docs/th07_fork_a_integration.md §8). Detours FUN_00437c70 (per-frame input
+ *   merge into g_InputMenu, owns the lockstep frame counter) + FUN_00442c60
+ *   (shared RNG-seed force); P2 reads the merged high bits (UnpackP2). Default
+ *   off => unchanged local-keyboard baseline. host=P1, guest=P2; menus navigate
+ *   together (P2 clones P1's char in this cut). See coop.ini for role/peer/seed.
+ * PROXIMITY FADE (coop.ini [coop] proximity_fade=1, default off): fade the other
+ *   player out as the two overlap (asymmetric: host fades P2, guest fades P1).
+ *
  * !!! ALL ADDRESSES are build-specific to th07.exe ver 1.00b
  * !!! SHA256 35467EAF8DC7FC85F024F16FB2037255F151CEFDA33CF4867BC9122AAA2E80CA
  */
@@ -853,6 +863,7 @@ static int      s_netFrame   = 0;          /* DLL-owned logic-frame index       
 static uint16_t s_netMerged  = 0;          /* this frame's merged word (P2 reads high) */
 static int      s_netSync    = 1;          /* last seen Nc_IsSync()                    */
 static int      s_netDesyncLogged = 0;
+static int      s_proxFade   = 0;          /* coop.ini [coop] proximity_fade (default off) */
 
 /* netcode host-environment callbacks. readLocalInput is called INSIDE
  * Nc_GetInputNet, BEFORE the scene-tick hook overwrites g_InputMenu — so it
@@ -879,6 +890,8 @@ static void LoadNetConfig(void)
 {
     char ini[MAX_PATH], buf[64];
     snprintf(ini, sizeof(ini), "%scoop.ini", s_dir);
+    /* [coop] options apply with or without netplay (read before the [net] gate) */
+    s_proxFade = (int)GetPrivateProfileIntA("coop", "proximity_fade", 0, ini);
     s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
     if (!s_netEnabled) return;
     GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);
@@ -1421,6 +1434,46 @@ static void MoveGhost(void *p2)
     *py += GHOST_SPEED * (float)s_ghostDirY;
     /* semi-transparent ghost; the update rewrites the tint, so re-apply each frame */
     *(uint32_t *)((char *)p2 + OFF_TINT) = GHOST_TINT;
+}
+
+/* ---- proximity transparency (NIGHT_SHIFT #2) ----
+ * When the two players overlap you can lose track of your own character. Fade
+ * the OTHER player out as they get close, so the local one stays clear.
+ * ASYMMETRIC / per-instance: on the host (local = P1) P2 fades; on the guest
+ * (local = P2) P1 fades. Single-machine (no netplay) keys off P1 as "local",
+ * i.e. P2 fades near P1 — a prototype of the real netplay-asymmetric effect.
+ * The fade ramps with the P1<->P2 distance (opaque far, ~transparent near) but
+ * never goes fully invisible (PROX_FLOOR), so the faded player is still
+ * trackable. Distance is compared squared (no sqrt / math.h dep). Applied AFTER
+ * the player update (which rewrites the tint), gated off ghosts/game-over.
+ * Off by default; flip coop.ini [coop] proximity_fade=1. Most meaningful under
+ * netplay — tune PROX_* + PROX_FLOOR after a look. */
+#define PROX_NEAR2  (24.0f * 24.0f)    /* <= this: floor alpha (most transparent) */
+#define PROX_FAR2   (96.0f * 96.0f)    /* >= this: fully opaque                   */
+#define PROX_FLOOR  0x40u              /* minimum alpha when fully overlapped     */
+
+static void ApplyProximityFade(void *p2)
+{
+    float *p1pos = (float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X);
+    float *p2pos = (float *)((char *)p2 + OFF_POS_X);
+    float dx = p1pos[0] - p2pos[0], dy = p1pos[1] - p2pos[1];
+    float d2 = dx * dx + dy * dy;
+    unsigned int a;
+    if      (d2 >= PROX_FAR2)  a = 0xff;
+    else if (d2 <= PROX_NEAR2) a = PROX_FLOOR;
+    else {
+        float t = (d2 - PROX_NEAR2) / (PROX_FAR2 - PROX_NEAR2);   /* 0..1 */
+        a = PROX_FLOOR + (unsigned int)(t * (float)(0xff - PROX_FLOOR));
+    }
+    uint32_t tint = (a << 24) | 0x00ffffffu;
+    if (s_netActive && !Nc_IsHost()) {
+        /* guest: local = P2, so fade the REMOTE P1; keep P2 opaque */
+        *(uint32_t *)((char *)ADDR_PLAYER_BASE + OFF_TINT) = tint;
+        *(uint32_t *)((char *)p2 + OFF_TINT) = 0xffffffffu;
+    } else {
+        /* host / single-machine: local = P1, so fade the REMOTE P2 */
+        *(uint32_t *)((char *)p2 + OFF_TINT) = tint;
+    }
 }
 
 static void Spawn1Up(float *pos3)
@@ -2225,6 +2278,10 @@ static int __fastcall HookedUpdate(void *self)
                 s_p1PrevFocus = (p1in & IN_FOCUS) != 0;
                 s_p2PrevFocus = (p2in & IN_FOCUS) != 0;
             }
+
+            /* proximity transparency: fade the remote player when players overlap */
+            if (s_proxFade && !s_p1Ghost && !s_p2Ghost && !s_runOver)
+                ApplyProximityFade(p2);
 
             if (s_shotXfer && !s_p2Ghost) TransferP2Shots(p2);  /* P2 shots -> P1 array */
         }

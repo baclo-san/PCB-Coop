@@ -77,6 +77,11 @@ co-op DLL: get into a stage, P2 auto-spawns after ~3 s; see the header comment i
 `src/coop/coop.c` for the live hotkeys (IJKL/Space/U/O = P2, F2–F12 = toggles).
 
 ## Status (2026-06-15)
+- 🟡 **Proximity transparency prototype (§5l, NIGHT_SHIFT #2)**: fade the OTHER
+  player out as the two overlap so your own stays clear. Asymmetric/per-instance
+  (host fades P2, guest fades P1; single-machine fades P2 near P1). Behind
+  `coop.ini [coop] proximity_fade=1` (default off). Compile-verified; needs a
+  visual look to tune the ramp + a netplay test for the real asymmetry.
 - 🟡 **Netplay wired into the co-op DLL (§5k, fork A §8)**: the netcode core now
   links into `th07_coop.dll`; P2's input comes from the WIRE (merged high bits)
   instead of the local keyboard, the menu/scene seam (`FUN_00437c70`) locksteps

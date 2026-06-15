@@ -11,7 +11,8 @@ labels in `PCBdecomp.c`; the hex **is** the VA. Line numbers cite `PCBdecomp.c`.
 
 **Confidence key:** ✅ = read + cross-checked this session (or already verified in
 coop.c by the running mod); 🟡 = decomp-derived sketch, plausible but NOT
-independently confirmed — verify before relying. The §6 appendix is entirely 🟡.
+independently confirmed — verify before relying. The §6 appendix is mostly 🟡
+(some items promoted to ✅ after reading the spawn loop `FUN_0043d160`, §3a).
 
 ---
 
@@ -54,14 +55,35 @@ if (((DAT_004b9e50 & 1) != 0) && (FUN_0042ad66() == 0)) {   // shot bit + NOT bo
   `*(mgr+0x1fbac) < 0 && != -2`, else `0`. So shots are suppressed while bombing.
   (Called from many sites: 25355/25411/26667/27057/27632…)
 - `FUN_00404fe0()` — fire-cadence / invuln-ish gate (🟡 exact predicate not read).
-- **`FUN_0043d990` is the fire entry called here** (✅ call site 26587). Its
-  Ghidra body at 25821 is small (resets `+0x169f4/8/c`), so the actual
-  slot-spawn likely tail-calls / inlines into the surrounding fire code — treat
-  `FUN_0043d990` as the *entry*, the spawn loop itself is 🟡 (see §6).
+- `FUN_0043d990` (@26587) is small (resets the homing fields `+0x169f4/8/c`); the
+  **actual per-frame shot-spawn loop is `FUN_0043d160` @ PCBdecomp.c:25599** (✅
+  read — see §3a).
 
-Focus vs unfocus selects which `.sht` buffer (+0xb7e70 vs +0xb7e74) and which
-baked speed; the focus bit is `0x4` and the player tracks a focus state byte
-(coop.c uses player `+0x240b` as the focus/shot-variant selector — 🟡 for shots).
+**Focus select (✅ confirmed at 25611-25616):** `if (player+0x240b == 0)` use the
+**unfocused** `.sht` buffer (`+0xb7e70`), else the **focused** one (`+0xb7e74`).
+So `player+0x240b` is the focus-mode byte for shots (the focus *input* bit is
+`0x4`). This confirms coop.c's use of `+0x240b`.
+
+### 3a. Shot-spawn loop `FUN_0043d160` (✅ read — PCBdecomp.c:25599)
+
+`__fastcall(player, param_2)`. Picks the `.sht` buffer by focus (`+0x240b`), then:
+1. **Power→pattern select:** walks the pattern table at **`sht+0x34`** (array of
+   8-byte `{chain_ptr, threshold}` pairs) until the pair's `threshold` exceeds the
+   current power level (`FUN_0048b8a0`, the x87 round of the power float). The
+   chosen pair's `chain_ptr` (`*local_c`) is the head of this power level's
+   fire-entry chain.
+2. **Per slot (96, base `+0x2444`, stride `0x364`):** for each free slot
+   (`+0x34a==0`), walk the fire-entry chain (`entry += 0x34 bytes`, terminated by
+   `entry[0] < 0`); call the entry's fire callback (`entry+0x24`, or the default
+   `FUN_0043bdc0` when 0). On a `1` return, **activate the slot:** set
+   `+0x1c0 |= 0x1000` (draw), `+0x34a = 1` (active), `+0x360 = entry`, and copy the
+   three per-shot callbacks `+0x354/+0x358/+0x35c` ← `entry+0x28/+0x2c/+0x30`.
+
+So a `.sht` fire-entry record is **0x34 bytes** (NOT 0x1a — the §6-sketch source
+read `short* + 0x1a` as 26 bytes, but it scales ×2 = 52). Its `+0x24` = per-entry
+fire-callback ptr, `+0x28/+0x2c/+0x30` = the update/draw/collide callbacks copied
+into each spawned shot. The remaining entry fields (pos/vel/damage/angle) are
+written by the default fire cb `FUN_0043bdc0` / `FUN_0043bbd0` — still 🟡 (§6).
 
 ---
 
@@ -182,28 +204,25 @@ From an assisted read of `FUN_00442b70` / `FUN_0043bcc0` / the fire path. Treat 
 a starting hypothesis; each needs confirmation (the assist also mislabeled some
 items, since corrected above). **Do not cite as ground truth.**
 
-**`.sht` header** (buffer base): `+0x02` u16 = pattern-index count; `+0x34` =
-array of `{threshold, pattern_index}` pairs selected by power/frame; per-pattern
-chains of fire-entry records reached via 8-byte slots. Baked header fields
-`+0x08`/`+0x0c`/`+0x10` are the only ones coop.c relies on.
+**`.sht` header** (buffer base, ✅ partly from `FUN_0043d160`): `+0x34` = the
+power→pattern table, an array of 8-byte `{chain_ptr, threshold}` pairs (pick the
+pair whose threshold > current power). `+0x08`/`+0x0c`/`+0x10` = hitbox/unfoc-speed/
+foc-speed (coop.c-baked). The `+0x02` count is 🟡.
 
-**`.sht` per-fire-entry record** (stride ~0x1a, `<0` at +0x00 terminates):
+**`.sht` per-fire-entry record — stride `0x34` bytes (✅ corrected; `<0` at +0x00
+terminates ✅).** `+0x24` = per-entry fire callback ptr (0 ⇒ default `FUN_0043bdc0`),
+`+0x28`/`+0x2c`/`+0x30` = the shot update/draw/collide callbacks copied to the slot
+(✅). The geometry fields below are 🟡 (written by the fire cb, not yet read — and
+the old offsets came from a misread 0x1a stride, so treat as ESPECIALLY suspect):
 
-| Off | Type | Guess |
+| Off | Type | Guess (🟡 needs a fresh read of `FUN_0043bdc0`/`FUN_0043bbd0`) |
 |---|---|---|
-| +0x00 | i16 | fire timing modulo (`frame % e[0] == e[1]`, 25071) |
-| +0x02 | i16 | frame offset within pattern |
-| +0x04 | f32 | spawn offset X |
-| +0x08 | f32 | spawn offset Y |
-| +0x0c | f32 | velocity X |
-| +0x10 | f32 | velocity Y |
+| +0x00 | i16 | fire-timing / terminator (`<0` ends the chain ✅) |
+| +0x04..+0x10 | f32 | spawn offset + velocity (offsets unconfirmed) |
 | +0x14 | f32 | angle → slot +0x334 |
-| +0x18 | f32 | speed magnitude |
 | +0x1c | i16 | damage → slot +0x348 |
-| +0x1e | i8  | spawn source (0 base / 1 unfoc-rel / 2 foc-rel) |
-| +0x1f | i8  | shot type/script → slot +0x34c |
-| +0x20 | i16 | sprite/anim id |
-| +0x22 | i16 | sound id (-1 none) |
+| +0x24 | ptr | per-entry fire callback (✅) |
+| +0x28/+0x2c/+0x30 | ptr | slot update/draw/collide callbacks (✅) |
 
 **Extra shot-slot fields (🟡):** `+0x1d8` sprite id, `+0x254` z/scale, `+0x324`
 vel X, `+0x328` vel Y, `+0x334`/`+0x338` angle, `+0x340` age, `+0x344` homing/
@@ -222,9 +241,10 @@ drawn by `FUN_0042c577` (✅ coop.c, PCBdecomp.c:17267). Face id window
 ---
 
 ## 7. Next RE steps
-- Read the actual shot-spawn loop (the body reached from `FUN_0043d990` @26587 /
-  the surrounding fire code) to confirm the §6 slot fields and the `.sht`
-  power→pattern selection.
+- ✅ DONE: the shot-spawn loop is `FUN_0043d160` (§3a) — confirmed the focus
+  select, the `sht+0x34` power→pattern table, the `0x34`-byte entry stride, and the
+  slot activation/callback copy. STILL open: read the default fire cb
+  `FUN_0043bdc0`/`FUN_0043bbd0` to confirm the entry geometry fields (§6 table).
 - ✅ DONE: the real player hitbox is an **AABB** at player `+0x948/+0x94c/+0x954/
   +0x958` (L/T/R/B), read by `FUN_0043e260` (25995-25998); the graze box is the
   +20px `+0x960/+0x964/+0x96c/+0x970` (`FUN_0043e3b0`). See

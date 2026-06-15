@@ -4,8 +4,8 @@
 // Winsock + the Pack/CtrlPack structs below, so it ports to th07 verbatim.
 // Link with -lws2_32 (the MSVC #pragma comment(lib) is ignored by mingw ld).
 #pragma once
-#define MULTI_NET_VER 3950
-#define MULTI_NET_VER_S "3.9.5"
+#define MULTI_NET_VER 3960
+#define MULTI_NET_VER_S "3.9.6"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -138,6 +138,12 @@ struct Pack
     unsigned int seq;
     ULONGLONG sendTick;
     ULONGLONG echoTick;
+    // Scene generation. Bumped on every Netcode_Reset() (each scene boundary).
+    // The netcode frame index resets to 0 per scene, so frame numbers are REUSED
+    // across scenes; this tags which generation a packet belongs to so the receiver
+    // can drop a previous scene's trailing inputs that would otherwise land in the
+    // next scene's identically-numbered slots (the menu->stage phantom-input desync).
+    unsigned int epoch;
     CtrlPack ctrl;
 
     Pack():ctrl()
@@ -146,6 +152,7 @@ struct Pack
         seq = 0;
         sendTick = 0;
         echoTick = 0;
+        epoch = 0;
     }
 };
 #pragma pack(pop)

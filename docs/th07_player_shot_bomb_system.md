@@ -103,7 +103,7 @@ if (player+0x240d == 0 || player+0x16a20 != 0 || (DAT_004b9e50 & 2) == 0) {
     if (player+0x23fc != 0)  player+0x23fc -= 1;      // post-bomb cooldown ticks down
     if (player+0x16a20 == 0) {                          // not already bombing
         if (FUN_00404fe0()==0 && FUN_0042ad66()==0 &&  // gates + not-bombing
-            player+0x23f8 != 0 && FUN_0048b8a0()>0 &&   // (power/stock) + bomb-count>0
+            player+0x23f8 != 0 && FUN_0048b8a0()>0 &&   // deathbomb window + round(ST0)>0
             player+0x23fc == 0 && (DAT_004b9e50 & 2)) { // cooldown clear + bomb bit
             ... launch ...
         }
@@ -135,8 +135,10 @@ if (player+0x240d == 0 || player+0x16a20 != 0 || (DAT_004b9e50 & 2) == 0) {
   installed at player init from a global table (🟡 `PTR_FUN_0049ec50..5c`).
 - Side effects on launch: `FUN_0043b7a0(1)`, `FUN_0042d612(-1)` (clear bullets /
   sfx), and replay-flag `DAT_004b9e48+0xd6 |= 1`.
-- `FUN_0048b8a0()` returns the available **bomb count** (the resource a bomb
-  actually spends — separate from `+0x23f8`); `> 0` is required to bomb.
+- `FUN_0048b8a0()` is a float→int **round intrinsic** (PCBdecomp.c:81531; reads
+  x87 `ST0`, ≈ `lroundf`), NOT a stored count. The `> 0` here rounds whatever
+  float the bomb code left on the FPU stack (a resource gate); the field a bomb
+  actually decrements is the open item below.
 
 ---
 
@@ -228,5 +230,7 @@ drawn by `FUN_0042c577` (✅ coop.c, PCBdecomp.c:17267). Face id window
   +20px `+0x960/+0x964/+0x96c/+0x970` (`FUN_0043e3b0`). See
   `th07_player_struct.md`. coop.c’s `OFF_HITBOX` was renamed → `OFF_DEATH_TIMER`.
   Still open: the raw half-extent input field these edges are recomputed from.
-- Map `FUN_0048b8a0` (bomb-count source) + where a bomb actually decrements the
-  bomb stock — needed for the per-player bomb-count work.
+- Find where a bomb actually decrements the bomb stock (`FUN_0048b8a0` turned out
+  to be a float→int round intrinsic, not the stock field) — needed for per-player
+  bomb-count work. coop.c already tracks bombs via the resource struct
+  (`RES_BOMBS 0x68`); confirm the bomb launch path writes that.

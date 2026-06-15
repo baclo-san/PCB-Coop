@@ -113,3 +113,55 @@ required (coop.c's existing pattern).
 > power writes. The user confirmed in-game: **P2's power is separate, grows only from
 > P2's own pickups, and P2's shot-type levels up off its own power** — no anti-tamper
 > crash. Bombs/lives ride the same swap. (Cherry/points stay shared.)
+
+## 5. The item SPAWNER — `FUN_004326f0` (RE 2026-06-15, complements §1-2)
+
+The other half of the item system: where items are CREATED (enemy deaths, the
+death power-drop, the mod's 1up). `__thiscall`, PCBdecomp.c:20244,
+VA `0x004326f0`:
+
+```
+FUN_004326f0(ECX=item_mgr, EDX, float pos[3], int type, int mode)
+```
+(coop.c models it `__fastcall`, so its `ADDR_ITEM_SPAWN(mgr, NULL/*EDX*/, pos3,
+type, mode)` call is correct — `type` is the `+0x27c` value from the §2 table:
+0/2 power, 1 point, 3 bomb, 4 full-power, **5 1-up**, 6 star, 7 cherry, 8 sfx.)
+
+**Pool + cursor:** items live in the manager at `mgr + cursor*0x288`, cursor at
+`mgr+0xae2e8`, scanned for a free slot (`+0x27d == 0`) up to 1100 slots, stride
+**`0x288`** (matches §1). Cursor wraps; slots past index `0x44c` use the overflow
+region at `mgr+0xae060` (a second pool — exact split not chased).
+
+**Slot init (the fields the spawner writes):**
+
+| Offset | Set to | Meaning |
+|---|---|---|
+| `+0x24c/+0x250/+0x254` | `pos[0..2]` | spawn world X/Y/Z |
+| `+0x25c` | `0xc00ccccd` (-2.2f) | initial upward pop velocity |
+| `+0x264/+0x268/+0x26c` | RNG (mode 2) | scatter TARGET x∈[48,336), y∈[-64,128) |
+| `+0x270` | `0xfffffc19` (-999) | counter sentinel |
+| `+0x27c` | `type` | **item type** (§2 switch reads this) |
+| `+0x27d` | `1` | active flag |
+| `+0x27e` | `1` | alive |
+| `+0x27f` | `mode` (3→1, 4→0) | spawn/motion mode |
+| `+0x1d8` | `type + 0x2c4` | sprite/anm id (script from `DAT_004b9e44+0x28ef0 + (type+0x2c4)*4`) |
+| `+0x1b8` | `0xffffffff` | tint (opaque) |
+
+**Modes (`param_4`):** `0` = plain pop-and-fall; `2` = **scatter** (random target
+via two `FUN_00431900` (Rng_NextFloat) calls, then homes there — used by the
+on-death power drop `FUN_00440cf0` and big enemy clears); `3`/`4` just preset the
+`+0x27f` motion byte. The mod uses **mode 0** for its 1up (`Spawn1Up`).
+
+**Max-power auto-convert (20255):** if `FUN_0048b8a0() > 0x7f` and `type ∈ {0,2}`
+(power items), the type is rewritten to **7** (cherry/point item) — so power
+pickups past max (power caps at 128) turn into points. **`FUN_0048b8a0` is a
+float→int ROUND intrinsic** (PCBdecomp.c:81531, `ulonglong(void)` reading the x87
+`ST0` register, ≈ `lroundf`), NOT a stored counter — the caller leaves the current
+power float on the FPU stack first, so here it rounds power. That it reads as
+`(void)` is the decompiler hiding the implicit x87 argument.
+
+> **⚠️ Determinism (netplay):** mode-2 spawns consume **2 shared-RNG calls** each
+> (the two `Rng_NextFloat` for the scatter target), advancing the counter
+> `0x0049fe24`. The on-death power drop is mode 2, so deaths perturb the RNG
+> stream — fine under lockstep (both machines run the identical sim) but a place
+> to watch with the counter oracle once the netcode is live.

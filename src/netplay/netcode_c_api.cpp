@@ -68,4 +68,15 @@ void Nc_GetSyncStats(unsigned short* selfRng, unsigned short* rcvRng, int* waitM
     if (waitMs)  *waitMs  = w;
 }
 
+void Nc_GetReadStats(int* readFrame, unsigned short* selfKey,
+                     unsigned short* rcvKey, int* rcvStatus)
+{
+    int rf = -1, st = 0; unsigned short sk = 0, rk = 0;
+    Netcode_GetReadStats(rf, sk, rk, st);
+    if (readFrame) *readFrame = rf;
+    if (selfKey)   *selfKey   = sk;
+    if (rcvKey)    *rcvKey    = rk;
+    if (rcvStatus) *rcvStatus = st;
+}
+
 } // extern "C"

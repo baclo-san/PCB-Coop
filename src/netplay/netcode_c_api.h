@@ -61,6 +61,12 @@ void Nc_GetLastSplit(unsigned short* p1, unsigned short* p2);
 int  Nc_GetNetFrame(void);
 void Nc_GetSyncStats(unsigned short* selfRng, unsigned short* rcvRng, int* waitMs);
 
+/* DIAGNOSTIC: last frame's GetKeys internals — readFrame = the index it read
+ * (netcode frame - delay); selfKey/rcvKey = the raw words merged; rcvStatus =
+ * how the peer's input was obtained (0=immediate, 1=after a wait, 2=timeout). */
+void Nc_GetReadStats(int* readFrame, unsigned short* selfKey,
+                     unsigned short* rcvKey, int* rcvStatus);
+
 #ifdef __cplusplus
 }
 #endif

@@ -879,6 +879,7 @@ static int      s_netStallLogged = 0;      /* throttle: frames since last STALL 
 static int      s_netStatLogged  = 0;      /* throttle: frames since last status log   */
 static int      s_netPeerLost = 0;         /* latched once the lockstep timed out      */
 static FILE    *s_trace = NULL;            /* DIAGNOSTIC: per-frame determinism trace  */
+static int      s_seedForced = 0;          /* seed forced once for the current scene   */
 static int      s_netSceneId  = -1;        /* last top-level scene id (self+0x154); a
                                               change re-zeros the lockstep (start barrier)*/
 static int      s_proxFade   = 1;          /* coop.ini [coop] proximity_fade (default ON) */
@@ -966,11 +967,20 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
                  Nc_IsHost() ? "host" : "guest");
         s_trace = fopen(p, "w");
         if (!s_trace) return;
-        fputs("frame,inStage,merged,p1,p2,seed,counter,waitMs,sync\n", s_trace);
+        fputs("frame,inStage,merged,p1,p2,seed,counter,waitMs,sync,"
+              "readFrame,selfKey,rcvKey,rcvStatus\n", s_trace);
     }
-    fprintf(s_trace, "%d,%d,%04x,%04x,%04x,%04x,%u,%d,%d\n",
+    /* netcode internals for this frame: the index GetKeys read (readFrame =
+     * netFrame-delay) and the raw self/rcv words it merged. Diffing host vs guest
+     * by readFrame separates a frame-index misalignment (readFrame differs at the
+     * same row) from a stale/mis-delivered peer input (selfKey/rcvKey disagree at
+     * the same readFrame). rcvStatus: 0=immediate 1=after-wait 2=timeout. */
+    int rf = -1, rs = 0; unsigned short sk = 0, rk = 0;
+    Nc_GetReadStats(&rf, &sk, &rk, &rs);
+    fprintf(s_trace, "%d,%d,%04x,%04x,%04x,%04x,%u,%d,%d,%d,%04x,%04x,%d\n",
             frame, inStage, merged, s_netP1Menu, s_netP2Menu,
-            (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR, waitMs, sync);
+            (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR, waitMs, sync,
+            rf, sk, rk, rs);
     fflush(s_trace);                        /* survive the freeze tail */
 }
 
@@ -991,6 +1001,7 @@ static int __fastcall HookedSceneTick(void *self)
             s_netSceneId = *(int *)((char *)self + 0x154);
             s_netDesyncLogged = 0; s_netSyncRun = 0; s_netPeerLost = 0;
             s_netStallLogged = 0;  s_netStatLogged = 0;
+            s_seedForced = 0;               /* force the shared seed at the first stage */
             Nc_Reset();                     /* fresh lockstep maps from frame 0         */
             Log("netplay: LINK UP (handshake done). role=%s delay=%d seed=0x%04x. "
                 "Both inputs from the WIRE; each player picks its own character.",
@@ -1021,6 +1032,7 @@ static int __fastcall HookedSceneTick(void *self)
                 s_netSceneId, sceneId, s_netFrame);
             s_netSceneId = sceneId;
             s_netFrame   = 0;
+            s_seedForced = 0;           /* re-force the shared seed at the new scene  */
             Nc_Reset();                 /* clear peer buffer + frame index (th06 reset) */
             s_netDesyncLogged = 0; s_netSyncRun = 0;
             s_netStallLogged  = 0; s_netStatLogged = 0;
@@ -1094,14 +1106,20 @@ static int __fastcall HookedSceneTick(void *self)
  * snapshots it (idempotent on the documented mid-stage re-fires). */
 static int __fastcall HookedGameStart(int self)
 {
-    if (s_netActive) {
-        /* DIAGNOSTIC: log every fire so a host-vs-guest diff reveals whether
-         * FUN_00442c60 fires at MISMATCHED frames (the suspected desync driver —
-         * a mid-stage re-fire slamming the seed to initSeed at different frames
-         * on each machine). counter is read pre-orig (the orig zeroes it). */
+    /* FUN_00442c60 turned out to fire EVERY logic frame (the det-trace showed
+     * ~15k SEEDFORCE lines over ~15k frames), NOT just at game start — so the old
+     * "force the seed on every fire" pinned the live RNG to initSeed every frame.
+     * That (a) makes RNG non-random across frames (Chen's nonspell orbs all flew
+     * the same way) and (b) masked real desyncs (both snap to initSeed => false
+     * SYNC). Force ONCE per scene instead (EoSD's force-at-start semantics): align
+     * the seed at stage start, then let ZUN's RNG evolve naturally — lockstep keeps
+     * both machines identical as long as inputs match. s_seedForced re-arms on each
+     * scene change (HookedSceneTick). */
+    if (s_netActive && !s_seedForced) {
         uint16_t before = *ADDR_RNG_SEED;
         *ADDR_RNG_SEED = Nc_GetInitSeed();
-        Log("netplay: SEEDFORCE F%d seed 0x%04x -> 0x%04x ctr=%u (FUN_00442c60)",
+        s_seedForced = 1;
+        Log("netplay: SEEDFORCE F%d seed 0x%04x -> 0x%04x ctr=%u (once/scene)",
             s_netFrame, before, (unsigned)Nc_GetInitSeed(), (unsigned)*ADDR_RNG_CTR);
     }
     return s_origGameStart(self);
@@ -3060,9 +3078,10 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
-        Log("*** DIAGNOSTIC BUILD (det-trace): SEEDFORCE + RNG-counter logging; "
-            "per-frame trace -> coop_trace_{host,guest}.csv while netplay active. "
-            "Demo-disable fix included (expect 'demo-play disabled ... 0x00455a9a'). ***");
+        Log("*** DIAGNOSTIC BUILD v2 (det-trace): seed now forced ONCE/scene (was "
+            "every frame); per-frame trace -> coop_trace_{host,guest}.csv now carries "
+            "netcode read-frame + self/rcv words + rcvStatus. Demo-disable fix in "
+            "(expect 'demo-play disabled ... 0x00455a9a'). ***");
         LoadNetConfig();
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */

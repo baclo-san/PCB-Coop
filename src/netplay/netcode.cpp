@@ -49,6 +49,16 @@ static unsigned short g_stat_self_rng = 0;
 static unsigned short g_stat_rcv_rng  = 0;
 static int            g_stat_wait_ms   = 0;
 
+// DIAGNOSTIC: the exact frame index GetKeys read this tick and the raw self/rcv
+// words it merged, plus how the peer's input was obtained (0=present immediately,
+// 1=arrived after a wait, 2=timed out / defaulted to 0). A host-vs-guest diff of
+// (read_frame, self_key, rcv_key) tells a frame-index misalignment apart from a
+// stale / mis-delivered peer input.
+static int            g_stat_read_frame = -1;
+static unsigned short g_stat_self_key   = 0;
+static unsigned short g_stat_rcv_key    = 0;
+static int            g_stat_rcv_status  = 0;
+
 // The merge (MergeKeys) — the single word both machines compute identically — now
 // lives in merge.cpp so it can be unit-tested natively (see merge.hpp).
 
@@ -135,6 +145,7 @@ static unsigned short GetKeys(int frame, bool is_in_UI, int& out_ctrl)
 
     unsigned short rcv_key = 0;
     bool has_rcv_data = false;
+    bool waited = false;
 
     static bool inited = false;
     static LARGE_INTEGER freq;
@@ -161,6 +172,7 @@ static unsigned short GetKeys(int frame, bool is_in_UI, int& out_ctrl)
         }
         else
         {
+            waited = true;
             while (cur.QuadPart < max_wait_to_time.QuadPart)
             {
                 if (RcvPacks()) { Sleep(1); break; }
@@ -176,6 +188,11 @@ static unsigned short GetKeys(int frame, bool is_in_UI, int& out_ctrl)
     } while (cur.QuadPart < max_wait_to_time.QuadPart);
 
     g_stat_wait_ms = (int)((cur.QuadPart - wait_start.QuadPart) * 1000 / freq.QuadPart);
+
+    g_stat_read_frame = frame - g_delay;
+    g_stat_self_key   = self_key;
+    g_stat_rcv_key    = rcv_key;
+    g_stat_rcv_status = has_rcv_data ? (waited ? 1 : 0) : 2;
 
     if (!has_rcv_data)
     {
@@ -369,6 +386,11 @@ void Netcode_GetLastSplit(unsigned short& p1, unsigned short& p2)
 int Netcode_GetNetFrame() { return g_netFrame; }
 void Netcode_GetSyncStats(unsigned short& selfRng, unsigned short& rcvRng, int& waitMs)
 { selfRng = g_stat_self_rng; rcvRng = g_stat_rcv_rng; waitMs = g_stat_wait_ms; }
+
+void Netcode_GetReadStats(int& readFrame, unsigned short& selfKey,
+                          unsigned short& rcvKey, int& rcvStatus)
+{ readFrame = g_stat_read_frame; selfKey = g_stat_self_key;
+  rcvKey = g_stat_rcv_key; rcvStatus = g_stat_rcv_status; }
 
 // test-only hooks (defined here, declared in netcode_internal.hpp)
 void Netcode_TestSetHost(bool h)  { g_is_host = h; }

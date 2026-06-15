@@ -57,4 +57,15 @@ void Nc_GetLastSplit(unsigned short* p1, unsigned short* p2)
     if (p2) *p2 = b;
 }
 
+int Nc_GetNetFrame(void) { return Netcode_GetNetFrame(); }
+
+void Nc_GetSyncStats(unsigned short* selfRng, unsigned short* rcvRng, int* waitMs)
+{
+    unsigned short s = 0, r = 0; int w = 0;
+    Netcode_GetSyncStats(s, r, w);
+    if (selfRng) *selfRng = s;
+    if (rcvRng)  *rcvRng  = r;
+    if (waitMs)  *waitMs  = w;
+}
+
 } // extern "C"

@@ -1664,6 +1664,38 @@ seed correctly overridden to the host's 0x1234).
 
 **Still open:** the two-machine in-game test; optional host seed randomization per run.
 
+**Launcher + beta drop — DONE (§8g).** `src/launcher/launcher.c` is a small Win32
+GUI (modelled on EoSD's `ConnectionUI`) that replaces hand-editing `coop.ini` +
+`injector.exe` for end users: fields for Host IP / Port / Listen port / input delay
++ a fade checkbox, and three buttons — **Host Game / Connect / Local Co-op**. Each
+writes the matching `coop.ini` next to the DLL, then injects `th07_coop.dll` into
+`th07.exe` (same suspended-launch + remote-`LoadLibrary` recipe as `injector.c`) and
+exits. It is a config-and-launch front-end, NOT a live socket — the DLL's headless
+handshake still does the actual connecting at the title, which keeps the one UDP
+socket inside the game process. The **host mints a fresh random seed per launch**
+(pushed to the guest), so each run plays differently. `proximity_fade` now defaults
+**ON**. Beta drop = `launcher.exe` + `th07_coop.dll` + `coop.ini` + `README.txt`,
+assembled by `package_release.ps1` into `build/release/PCB-Coop-beta.zip`.
+
+**Live sync telemetry — DONE (§8h).** First 2-PC test desynced (frame-4 "DESYNC"
+flapping, lying "back in sync" at mismatched frames on each side, then 1 fps →
+`peer lost` at the menu→stage transition). Added instrumentation:
+`Nc_GetSyncStats(selfRng, rcvRng, waitMs)` + `Nc_GetNetFrame` expose the RNG pair the
+oracle compares and the per-frame lockstep wait (the direct read on a stall).
+`HookedSceneTick` now (a) only judges desync **in-stage** (menus aren't RNG-locked —
+that was the false frame-4 alarm), (b) requires a sustained 120-frame run before
+declaring recovery (no more lying resyncs), (c) logs a throttled `STALL` line when a
+frame blocks ≥250 ms and a ~2s heartbeat with the seed pair, (d) draws an EoSD-style
+`NET H F#### d# SYNC / WAIT###ms / LOST` line top-right via `DrawCoopHud`.
+
+**Root cause of the desync (diagnosed, fix not yet written).** Lockstep goes live the
+instant the transport connects — a *different menu moment* on each PC — so "frame 0"
+is not a shared state and the front-end RNG diverges at once; the stall at stage start
+is the two machines never having a common start state (one side's load hitch then
+blows the 5 s lockstep timeout). **The fix is a real start barrier**: both machines
+begin lockstep frame 0 from the *same* screen (as EoSD's "Start Game" button does),
+instead of connecting mid-menu. The telemetry above is there to confirm it.
+
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +
 retry all confirmed by the user). Before any risky change, note the last-good

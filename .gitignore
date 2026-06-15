@@ -12,6 +12,10 @@ build/netsim.exe
 # 2-process handshake smoke test binary (source in tests/, build locally)
 build/handshake_test.exe
 
+# Assembled beta drop (staging folder + zip) from package_release.ps1.
+# Built from committed sources (src/launcher, release/*); not a tracked artifact.
+build/release/
+
 # host-native test binary produced by build.sh (not a Windows deliverable)
 build/merge_test_native
 

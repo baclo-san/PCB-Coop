@@ -869,8 +869,15 @@ static int      s_netActive  = 0;          /* transport up + connected          
 static int      s_netFrame   = 0;          /* DLL-owned logic-frame index             */
 static uint16_t s_netMerged  = 0;          /* this frame's merged word (P2 reads high) */
 static int      s_netSync    = 1;          /* last seen Nc_IsSync()                    */
-static int      s_netDesyncLogged = 0;
-static int      s_proxFade   = 0;          /* coop.ini [coop] proximity_fade (default off) */
+static int      s_netDesyncLogged = 0;     /* nonzero = inside a desync episode        */
+static int      s_netSyncRun  = 0;         /* consecutive in-sync gameplay frames      */
+static int      s_netWaitMs   = 0;         /* last frame's lockstep wait (ms)          */
+static uint16_t s_netSelfRng  = 0;         /* our RNG seed vs the peer's, last compared*/
+static uint16_t s_netRcvRng   = 0;
+static int      s_netStallLogged = 0;      /* throttle: frames since last STALL log    */
+static int      s_netStatLogged  = 0;      /* throttle: frames since last status log   */
+static int      s_netPeerLost = 0;         /* latched once the lockstep timed out      */
+static int      s_proxFade   = 1;          /* coop.ini [coop] proximity_fade (default ON) */
 /* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
  * per-player char-select FSM under netplay. Both machines compute the same pair. */
 static uint16_t s_netP1Menu  = 0;
@@ -902,8 +909,10 @@ static void LoadNetConfig(void)
 {
     char ini[MAX_PATH], buf[64];
     snprintf(ini, sizeof(ini), "%scoop.ini", s_dir);
-    /* [coop] options apply with or without netplay (read before the [net] gate) */
-    s_proxFade = (int)GetPrivateProfileIntA("coop", "proximity_fade", 0, ini);
+    /* [coop] options apply with or without netplay (read before the [net] gate).
+     * proximity_fade defaults ON now — fading the overlapping player is the
+     * intended co-op look; set proximity_fade=0 in coop.ini to disable. */
+    s_proxFade = (int)GetPrivateProfileIntA("coop", "proximity_fade", 1, ini);
     s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
     if (!s_netEnabled) return;
     GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);
@@ -947,6 +956,8 @@ static int __fastcall HookedSceneTick(void *self)
             s_netActive  = 1;
             s_netStarted = 0;               /* don't re-handshake on a later drop      */
             s_netFrame   = 0;
+            s_netDesyncLogged = 0; s_netSyncRun = 0; s_netPeerLost = 0;
+            s_netStallLogged = 0;  s_netStatLogged = 0;
             Nc_Reset();                     /* fresh lockstep maps from frame 0         */
             Log("netplay: LINK UP (handshake done). role=%s delay=%d seed=0x%04x. "
                 "Both inputs from the WIRE; each player picks its own character.",
@@ -967,18 +978,54 @@ static int __fastcall HookedSceneTick(void *self)
          * the menu-bit layout, so these are P1's / P2's raw menu words). */
         Nc_GetLastSplit(&s_netP1Menu, &s_netP2Menu);
         *ADDR_INPUT_MENU = merged;          /* menus together; in-stage -> g_InputGameplay */
-        int sync = Nc_IsConnected() ? Nc_IsSync() : 1;
-        if (sync != s_netSync) {
-            s_netSync = sync;
-            if (!sync && !s_netDesyncLogged) {
-                Log("netplay: DESYNC detected (seed mismatch) at frame %d", s_netFrame);
-                s_netDesyncLogged = 1;
-            } else if (sync) {
-                Log("netplay: back in sync at frame %d", s_netFrame);
+
+        /* live telemetry for the overlay + log: the RNG pair we compare and how long
+         * this frame blocked on the peer (the direct read on a lockstep stall). */
+        int connected = Nc_IsConnected();
+        int sync = connected ? Nc_IsSync() : 1;
+        Nc_GetSyncStats(&s_netSelfRng, &s_netRcvRng, &s_netWaitMs);
+        s_netSync = sync;
+
+        /* DESYNC is only meaningful IN-STAGE. The front-end menus are not RNG-locked
+         * (the two machines reach a screen from slightly different states), so a seed
+         * mismatch there is expected — reporting it as a "desync" was the misleading
+         * frame-4 flapping. Only judge sync while a stage is actually running, and
+         * require a sustained run before declaring recovery (no more lying resyncs). */
+        if (inStage && connected) {
+            if (!sync) {
+                s_netSyncRun = 0;
+                if (!s_netDesyncLogged) {
+                    Log("netplay: DESYNC in stage at frame %d (rng self=0x%04x peer=0x%04x)",
+                        s_netFrame, s_netSelfRng, s_netRcvRng);
+                    s_netDesyncLogged = 1;
+                }
+            } else if (s_netDesyncLogged && ++s_netSyncRun >= 120) {
+                Log("netplay: back in sync at frame %d (held 120 frames)", s_netFrame);
+                s_netDesyncLogged = 0;
+                s_netSyncRun = 0;
             }
         }
-        if (!Nc_IsConnected() && s_netActive) {
-            Log("netplay: peer lost (lockstep timeout) — frame %d", s_netFrame);
+
+        /* STALL warning: the lockstep blocked noticeably this frame. At a stage load
+         * this can spike legitimately; a sustained spike is the peer falling behind or
+         * the 5s timeout approaching. Throttle to ~1/sec so the log stays readable. */
+        if (connected && s_netWaitMs >= 250 && --s_netStallLogged <= 0) {
+            Log("netplay: STALL — waited %dms for the peer at frame %d "
+                "(stage-load hitch, or the peer fell behind)", s_netWaitMs, s_netFrame);
+            s_netStallLogged = 60;
+        }
+        /* periodic heartbeat so the log carries a sync timeline even outside stages. */
+        if (connected && --s_netStatLogged <= 0) {
+            Log("netplay: F%d %s wait=%dms rng self=0x%04x peer=0x%04x%s",
+                s_netFrame, sync ? "SYNC" : "DESYNC", s_netWaitMs,
+                s_netSelfRng, s_netRcvRng, inStage ? " [stage]" : " [menu]");
+            s_netStatLogged = 120;
+        }
+
+        if (!connected && s_netActive) {
+            Log("netplay: peer lost (lockstep timeout) — frame %d. Dropping to "
+                "local-keyboard P2.", s_netFrame);
+            s_netPeerLost = 1;
             s_netActive = 0;               /* drop to local-keyboard P2 fallback */
         }
     }
@@ -2327,6 +2374,22 @@ static void DrawCoopHud(void *p2)
 {
     float pos[3];
     pos[0] = 448.f; pos[2] = 0.f;
+
+    /* live netplay status (EoSD-style connection readout): role, our logic frame,
+     * delay, sync state, and the per-frame lockstep wait. A climbing wait= with a
+     * near-frozen frame number is exactly what a stall looks like. */
+    if (s_netActive || s_netPeerLost) {
+        pos[1] = 280.f;
+        if (s_netPeerLost)
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET LOST");
+        else if (s_netWaitMs >= 100)
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d WAIT%dms",
+                             Nc_IsHost() ? 'H' : 'G', s_netFrame, s_netWaitMs);
+        else
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d d%d %s",
+                             Nc_IsHost() ? 'H' : 'G', s_netFrame, Nc_GetDelay(),
+                             s_netSync ? "SYNC" : "DSYN");
+    }
 
     pos[1] = 296.f;
     if (s_p2Ghost)

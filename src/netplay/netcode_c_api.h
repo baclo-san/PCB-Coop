@@ -54,6 +54,13 @@ unsigned short Nc_GetInitSeed(void);
  * compute the same pair. Valid after Nc_GetInputNet() each frame. */
 void Nc_GetLastSplit(unsigned short* p1, unsigned short* p2);
 
+/* Live sync telemetry for the in-game status overlay. Nc_GetNetFrame = the
+ * netcode's logic-frame index. Nc_GetSyncStats = the RNG-seed pair last compared
+ * (equal => in sync) + ms this frame spent blocked waiting on the peer (climbs as
+ * the lockstep stalls; ~0 when healthy). */
+int  Nc_GetNetFrame(void);
+void Nc_GetSyncStats(unsigned short* selfRng, unsigned short* rcvRng, int* waitMs);
+
 #ifdef __cplusplus
 }
 #endif

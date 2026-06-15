@@ -62,3 +62,10 @@ unsigned short Netcode_GetInitSeed();
 // host's word, P2 = the guest's word). For per-player front-end (menu) routing;
 // both machines compute the same pair. Valid after Netcode_GetInput_Net() each frame.
 void Netcode_GetLastSplit(unsigned short& p1, unsigned short& p2);
+
+// Live sync telemetry for the in-game status overlay. GetNetFrame = the netcode's
+// own logic-frame index. GetSyncStats = the RNG-seed pair last compared for the
+// desync oracle, plus the ms this frame spent blocked waiting for the peer's input
+// (climbs toward the 5s timeout when the lockstep is stalling).
+int  Netcode_GetNetFrame();
+void Netcode_GetSyncStats(unsigned short& selfRng, unsigned short& rcvRng, int& waitMs);

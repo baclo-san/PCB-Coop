@@ -42,6 +42,13 @@ static int   g_resync_stage_frame    = 0;
 static unsigned short g_last_p1      = 0;
 static unsigned short g_last_p2      = 0;
 
+// Live sync telemetry (for the in-game status overlay). Updated each connected
+// frame in GetKeys: the RNG-seed pair we last compared, and how long this frame
+// blocked waiting for the peer's input — the direct read on a lockstep stall.
+static unsigned short g_stat_self_rng = 0;
+static unsigned short g_stat_rcv_rng  = 0;
+static int            g_stat_wait_ms   = 0;
+
 // The merge (MergeKeys) — the single word both machines compute identically — now
 // lives in merge.cpp so it can be unit-tested natively (see merge.hpp).
 
@@ -134,6 +141,7 @@ static unsigned short GetKeys(int frame, bool is_in_UI, int& out_ctrl)
     LARGE_INTEGER cur, ping_key_time, max_wait_to_time;
     if (!inited) { inited = true; QueryPerformanceFrequency(&freq); }
     QueryPerformanceCounter(&cur);
+    LARGE_INTEGER wait_start = cur;
     max_wait_to_time.QuadPart = cur.QuadPart + (LONGLONG)(freq.QuadPart * 5.0);   // 5s lockstep stall
     ping_key_time.QuadPart    = cur.QuadPart + (LONGLONG)(freq.QuadPart * 0.1);
 
@@ -142,7 +150,11 @@ static unsigned short GetKeys(int frame, bool is_in_UI, int& out_ctrl)
         if (res != g_ctrl_bits_rcved.end())
         {
             WriteToInt(res->second, rcv_key);
-            g_is_sync = (g_ctrl_rng_rcved[frame - g_delay] == g_ctrl_rng_self[frame - g_delay]);
+            unsigned short sr = (unsigned short)g_ctrl_rng_self[frame - g_delay];
+            unsigned short rr = (unsigned short)g_ctrl_rng_rcved[frame - g_delay];
+            g_is_sync = (rr == sr);
+            g_stat_self_rng = sr;
+            g_stat_rcv_rng  = rr;
             rcv_ctrl = g_ctrl_rcved[frame - g_delay];
             has_rcv_data = true;
             break;
@@ -162,6 +174,8 @@ static unsigned short GetKeys(int frame, bool is_in_UI, int& out_ctrl)
             }
         }
     } while (cur.QuadPart < max_wait_to_time.QuadPart);
+
+    g_stat_wait_ms = (int)((cur.QuadPart - wait_start.QuadPart) * 1000 / freq.QuadPart);
 
     if (!has_rcv_data)
     {
@@ -351,6 +365,10 @@ int  Netcode_GetDelay()           { return g_delay; }
 unsigned short Netcode_GetInitSeed() { return g_initSeed; }
 void Netcode_GetLastSplit(unsigned short& p1, unsigned short& p2)
 { p1 = g_last_p1; p2 = g_last_p2; }
+
+int Netcode_GetNetFrame() { return g_netFrame; }
+void Netcode_GetSyncStats(unsigned short& selfRng, unsigned short& rcvRng, int& waitMs)
+{ selfRng = g_stat_self_rng; rcvRng = g_stat_rcv_rng; waitMs = g_stat_wait_ms; }
 
 // test-only hooks (defined here, declared in netcode_internal.hpp)
 void Netcode_TestSetHost(bool h)  { g_is_host = h; }

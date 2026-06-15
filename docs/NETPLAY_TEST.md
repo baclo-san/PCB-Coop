@@ -1,97 +1,93 @@
 # Two-player netplay test — quick guide
 
 First real over-the-network test of the co-op mod. **Two PCs, two people.** One is
-the **host**, the other the **guest**. Plan for ~10 min of setup.
+the **host**, the other **connects**. Plan for ~10 min of setup.
 
-> Status: netcode is unit- + lockstep-tested but never run machine-to-machine.
-> Expect to find bugs — that's the point. Capture `coop_log.txt` from both sides.
+> Status: links and plays, but long online sessions can still desync (see
+> **Known issue** at the bottom). Capture `coop_log.txt` from BOTH sides — with the
+> new sync telemetry it now carries a frame-by-frame timeline of any divergence.
 
 ## 0. Both machines need (must match!)
 - **The same `th07.exe`, version 1.00b.** The mod is hard-coded to that exact build
-  (SHA256 `35467EAF…E80CA`). A different version will crash or misbehave.
-- The `build/` folder from this repo: **`injector.exe`, `th07_coop.dll`, `coop.ini`**
-  (keep the three together in one folder).
-- Be on the **same network** (same Wi-Fi/LAN) for the first test — far simpler than
-  going over the internet.
+  (SHA256 `35467EAF…E80CA`). A different version will refuse to load.
+- **`launcher.exe` + `th07_coop.dll`** dropped into the PCB game folder (next to
+  `th07.exe`). That's the whole beta drop (`build/release/PCB-Coop-beta.zip`).
+- Same network (LAN) for the first test — far simpler than going over the internet.
 
 ## 1. Find the host's IP
-On the **host** PC, open Command Prompt and run `ipconfig`. Note the **IPv4 Address**
-(looks like `192.168.x.x`). The guest needs this.
+On the **host** PC: `ipconfig` → note the **IPv4 Address** (`192.168.x.x`). For an
+internet test, use the public IP and forward the **Port (UDP, default 47000)**.
 
-## 2. Edit `coop.ini` (next to the DLL)
+## 2. Launch with `launcher.exe` (NOT th07.exe directly)
+Run `launcher.exe` on both PCs. It finds `th07.exe` in its own folder (Browse… to
+override) and writes `coop.ini` for you — no hand-editing.
 
-**Host** machine:
-```ini
-[net]
-enabled = 1
-role  = host
-port  = 47000
-delay = 2
-seed  = 0x1234
+- **Host:** leave Port at `47000` (or pick one), set input delay (2 to start),
+  click **Host Game**.
+- **Guest:** type the host's IP in **Host IP**, the **same Port**, click **Connect**.
+
+The host's delay + a freshly-minted RNG seed are pushed to the guest automatically,
+so the guest doesn't match anything by hand.
+
+For a single-PC sanity check, click **Local Co-op** (P2 = IJKL/Space/U/O keyboard).
+
+## 3. Firewall
+The host must allow **inbound UDP on the Port**. The first time, Windows pops an
+"allow access?" dialog — click **Allow** (Private). Guest needs no inbound rule.
+
+## 4. Confirm the link
+Both sit at the **title screen**; the handshake retries until the peer appears
+(launch order doesn't matter). `coop_log.txt` (next to the DLL) shows:
 ```
-
-**Guest** machine (set `peer` to the host's IPv4 from step 1):
-```ini
-[net]
-enabled = 1
-role  = guest
-peer  = 192.168.x.x      ; <-- the HOST's IP
-port  = 47000
-local = 47001
+netplay: transport up role=host ... Handshaking — waiting for the peer ...
+netplay: LINK UP (handshake done). role=host delay=2 seed=0x....
 ```
-The link **auto-connects** (a handshake), and the **host pushes its `delay` + `seed`
-to the guest** — so on the guest those two are ignored (you can omit them). Only the
-host's `delay`/`seed` matter. No more hand-matching.
+Both should log `LINK UP` with the **same seed**. Then a **NET status line** appears
+top-right in-game (see below).
 
-## 3. Allow the host through the firewall
-On the host, Windows Firewall must let **inbound UDP on port 47000** through. Easiest:
-the first time `th07.exe` networks, Windows pops a "allow access?" dialog — click
-**Allow** (Private networks). If you miss it, add an inbound UDP 47000 rule manually.
-(Guest needs no inbound rule.)
+## 5. Play
+- **Title / difficulty:** the **host (P1)** drives.
+- **Character select (per-player):** host picks P1's character + shot, confirms;
+  the screen shows **"P2 SELECT"**, then the **guest (P2)** picks their own. They can
+  differ. Game starts once both have chosen.
+- In the stage, each person controls their own ship over the net.
 
-## 4. Launch (either order — it auto-connects)
-Use the injector (NOT a normal th07 launcher, or the mod won't load). Edit
-`run_coop.bat` so its path points at your `th07.exe`, then double-click it — or run:
-```
-injector.exe "C:\path\to\th07.exe" "th07_coop.dll"
-```
-You should see `injected OK`. Launch both machines and leave them at the **title
-screen**; the handshake keeps retrying until the peer appears, so launch order
-doesn't matter. (Sit at the title until connected — see step 5.)
+## The NET status line + sync log (new)
+Top-right during play, e.g. `NET H F1234 d2 SYNC`:
+- `H`/`G` = host/guest, `F####` = logic frame, `d#` = delay.
+- `SYNC` / `DSYN` = in sync / a seed mismatch was seen this frame.
+- `WAIT###ms` = this frame blocked that long waiting for the peer's input. **A
+  climbing WAIT with a near-frozen frame number IS a stall** (the other PC fell
+  behind or hit a loading hitch).
+- `NET LOST` = the link timed out; you dropped back to local P2.
 
-## 5. Confirm the link
-Open **`coop_log.txt`** (created next to the DLL) on each machine. At first you'll see
-`transport up ... Handshaking — waiting for the peer`. Once they find each other:
-```
-netplay: LINK UP (handshake done). role=host delay=2 seed=0x1234. ...
-```
-Both machines should log `LINK UP` with the **same seed** (the host's). If you only
-see `Handshaking...` forever, the peer isn't reachable — see Troubleshooting.
-
-## 6. Play
-- **Title / difficulty:** the **host (P1)** leads — host navigates and starts.
-  (Both can nudge the title cursor; let the host drive to avoid fighting.)
-- **Character select (per-player!):** the host picks **P1's** character + shot type
-  and confirms. The screen then shows **"P2 SELECT CHARACTER"** — now the **guest
-  (P2)** picks their OWN character + shot with their controls and confirms. The game
-  starts once both have chosen, each as their own character (they can differ!).
-- In the stage, each person controls their own ship over the network. Watch for:
-  desync (the two screens drift apart), input lag (raise/lower `delay`), or stalls.
+`coop_log.txt` mirrors this: a heartbeat every ~2s (`F#### SYNC wait=…ms rng
+self=… peer=…`), a one-line `STALL` warning when a frame blocks ≥250 ms, and a
+single `DESYNC in stage …` with the mismatched RNG seeds. **This is the bug report.**
 
 ## Troubleshooting
 | Symptom | Likely cause / fix |
 |---|---|
-| `transport start FAILED` | Port in use or firewall. Try another `port` on both; allow UDP. |
-| Stuck on `Handshaking...` | Peer unreachable: wrong `peer` IP, different network, or host firewall blocking UDP 47000. |
-| `peer VERSION MISMATCH` | The two machines have different `th07_coop.dll` builds. Use the same DLL on both. |
-| `DESYNC detected` (in-game) | Seed is auto-synced now, so this means a logic divergence — grab both `coop_log.txt` and report. |
-| Choppy / laggy | Raise the HOST's `delay` (e.g. 3–4) — trades input latency for smoothness (pushed to the guest). |
-| Mod not loaded at all | You launched th07 normally. Must go through `injector.exe` / `run_coop.bat`. |
-| One side crashes | Grab BOTH `coop_log.txt` files + note what was on screen; that's the bug report. |
+| `transport start FAILED` | Port in use / firewall. Try another Port on both. |
+| Stuck `Handshaking…` | Wrong Host IP/Port, different network, or host firewall/port-forward blocking UDP. |
+| `peer VERSION MISMATCH` | Different `th07_coop.dll` builds. Use the same DLL on both. |
+| `STALL` / `WAIT` climbing then `NET LOST` | One PC stalled (load hitch / slow frame) past the 5s lockstep timeout. |
+| `DESYNC in stage` | Logic divergence — grab both `coop_log.txt` and report (see Known issue). |
+| Mod not loaded | You launched th07 directly. Use `launcher.exe`. |
+
+## Known issue — menu-start desync (under investigation)
+The lockstep currently goes live the instant the transport connects, which happens
+at a **different menu moment on each PC**. So "frame 0" is not the same game state on
+both, and the front-end RNG diverges immediately. That alone is cosmetic (menus
+aren't RNG-locked, and the stage seed is forced at stage start), but the bigger
+symptom — a stall/slowdown at the menu→stage transition then `peer lost` — points at
+the two machines never sharing a common start state. **The fix is a real start
+barrier** (both machines begin lockstep frame 0 from the *same* screen, the way
+EoSD's "Start Game" button works), rather than connecting mid-menu. The new sync
+telemetry above is the instrumentation to confirm that before/after.
 
 ## Notes / known limits (this cut)
-- **Auto-connect handshake**: launch order doesn't matter; the host's `delay`+`seed`
-  are pushed to the guest (guest's are ignored).
-- **Per-player character select works** (host=P1 then guest=P2). Title/difficulty
-  are host-led.
-- Local-keyboard co-op is unchanged — set `enabled = 0` to get it back.
+- **Launcher** replaces hand-editing `coop.ini`. Auto-connect; host pushes delay+seed.
+- **Per-player character select** works (host=P1 then guest=P2). Title/difficulty host-led.
+- **Proximity fade** is ON by default (set `[coop] proximity_fade=0` to disable).
+- Local-keyboard co-op is unchanged — click **Local Co-op** (or `[net] enabled=0`).

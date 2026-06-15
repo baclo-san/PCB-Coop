@@ -111,6 +111,16 @@ Write-Host "  LD  injector.exe"
 & $CC @cflags $injSrc -o $injExe -static -lkernel32
 if ($LASTEXITCODE) { throw "link failed: injector.exe" }
 
+# ---- 3a. launcher EXE (the end-user front door: GUI config + inject + launch) ----
+# Win32 GUI (-mwindows = no console window). Writes coop.ini from the dialog then
+# injects th07_coop.dll into th07.exe — supersedes hand-editing the ini + injector.
+$lncSrc = Join-Path $root "src\launcher\launcher.c"
+$lncExe = Join-Path $build "launcher.exe"
+Write-Host "  LD  launcher.exe"
+& $CC @cflags "-mwindows" $lncSrc -o $lncExe `
+      -static -lkernel32 -luser32 -lgdi32 -lcomdlg32 -lcomctl32
+if ($LASTEXITCODE) { throw "link failed: launcher.exe" }
+
 # ---- 3b. netcode self-test (C++: validates STL + Winsock toolchain) ----
 $netSrcs = @(
     (Join-Path $root "tests\netloop_test.cpp"),
@@ -152,10 +162,10 @@ if (-not (Test-Path $coopIni)) {
 ; on the guest delay= and seed= are ignored — only the host's matter.
 
 [coop]
-; proximity_fade: when 1, fade the OTHER player out as they get close so your
-; own character stays clear (host fades P2, guest fades P1; single-machine
-; fades P2 near P1). Off by default; most meaningful under netplay.
-proximity_fade = 0
+; proximity_fade: when 1 (default), fade the OTHER player out as they get close so
+; your own character stays clear (host fades P2, guest fades P1; single-machine
+; fades P2 near P1). Set 0 to disable.
+proximity_fade = 1
 
 [net]
 enabled = 0
@@ -178,9 +188,9 @@ function Get-PEMachine([string]$path) {
 }
 Write-Host ""
 Write-Host "Built:" -ForegroundColor Green
-foreach ($f in $harnessDll,$coopDll,$injExe) {
+foreach ($f in $harnessDll,$coopDll,$injExe,$lncExe) {
     "  {0,-22} {1,8:N0} bytes  {2}" -f (Split-Path $f -Leaf), (Get-Item $f).Length, (Get-PEMachine $f)
 }
 Write-Host ""
-Write-Host "Next: copy build\th07_harness.dll + injector.exe + harness.ini together, then:" -ForegroundColor Yellow
-Write-Host '  injector.exe "D:\Touhou 7 - Perfect Cherry Blossom\th07.exe"'
+Write-Host "Beta drop: copy build\launcher.exe + th07_coop.dll into the PCB game folder" -ForegroundColor Yellow
+Write-Host "(next to th07.exe), then run launcher.exe."

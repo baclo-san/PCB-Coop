@@ -1290,6 +1290,67 @@ in-game look — implemented per the decomp, no live host this session):
     the untried next approach (don't load a second whole anm; load at menu-select into
     the engine's own face slot 0x19, or snapshot the texture/sequence globals) in §8b.
 
+### 5k — netcode wired INTO coop.c (single-DLL netplay, fork A §8) — 2026-06-15 (night)
+
+The PRIMARY night-shift goal: P2's input now comes from the WIRE, not the local
+keyboard, by linking the engine-agnostic netcode core straight into
+`th07_coop.dll` (was a separate `th07_coop_net.dll`). Implements
+`docs/th07_fork_a_integration.md §8`. **Compile- + native-merge-test verified;
+NOT yet network-tested** (no two live game instances available this session).
+
+**What shipped (all gated behind `coop.ini [net] enabled=1`, default OFF):**
+- `coop.c` now `#include "netcode_c_api.h"` and the build links the netcode TUs
+  (`netcode/Connection/merge/netcode_c_api.cpp`) + `-lws2_32` into
+  `th07_coop.dll`. Because `coop.c` is C and the core is C++, the build compiles
+  `coop.c` to an object with the C compiler then links with `g++`/`clang++`
+  (libstdc++). `th07_coop.dll` stays a 32-bit PE (637 KB, machine 0x14c).
+  `build.sh` + `build.ps1` both updated; both emit a `coop.ini` template.
+- **One seam owns the frame counter + both input globals** (the §8 design):
+  - `HookedSceneTick` detours **`FUN_00437c70`** (0x00437c70), the per-logic-frame
+    scene-input task that runs in BOTH menus and gameplay (th07's
+    `Supervisor::OnUpdate`). After ZUN polls (`g_InputMenu = Input_Poll()`), it
+    calls `Nc_GetInputNet(s_netFrame++, is_in_UI, &ctrl)` and overwrites
+    `g_InputMenu` with the lockstep-merged word. `is_in_UI = !((DAT_0062f648>>2)&1)`
+    (recording-active bit = in a stage). In a stage the engine's own
+    `FUN_00442cd0` then copies `g_InputMenu → g_InputGameplay` for free, so P1
+    (low 9 bits) becomes the merged P1.
+  - `HookedGameStart` detours **`FUN_00442c60`** (0x00442c60) and forces
+    `g_RngState.seed = Nc_GetInitSeed()` before ZUN snapshots it (idempotent on
+    the documented mid-stage re-fires).
+- **P2's gameplay input** (the existing input-swap in `HookedUpdate`) now sources
+  its word from `UnpackP2(s_netMerged)` (merged high bits → low-bit layout) under
+  netplay, else `ReadP2InputLocal()`. `UnpackP2` is the exact inverse of
+  `merge.cpp`'s NB_*2 (bit<<9) mapping.
+- **Resilience:** if the lockstep peer is lost (the 5 s stall expires →
+  `Nc_IsConnected()` goes false), `s_netActive` drops to 0 and P2 reverts to the
+  local keyboard; seed-mismatch (`!Nc_IsSync()`) is logged once.
+
+**Known limitation (this cut = A2 + menus-together):** under netplay the two-pass
+per-player char-select FSM is BYPASSED (`HookedMenuDispatch` early-returns when
+`s_netActive`). Both machines navigate the menu together off the merged UI word
+(deterministic identical char/difficulty pick) and **P2 clones P1's character**.
+Per-player char/type over the wire (drive the menu FSM from the remote word) is
+the next step — see §8e. The seed is still config-supplied on both sides (A2
+stand-in); a real host→guest seed handshake is also a follow-up.
+
+**Safety:** with `enabled=0` (default) `StartNet()` returns immediately,
+`s_netActive` stays 0, and every netplay branch is skipped — the confirmed-good
+local-keyboard co-op baseline is byte-for-byte unchanged. The two new MinHook
+detours are installed but their bodies are pure pass-through when `!s_netActive`.
+
+**To network-test (next session, needs two machines / two th07 instances):**
+1. Build, copy `th07_coop.dll` + `coop.ini` + injector to BOTH machines.
+2. Machine A: `coop.ini` `enabled=1 role=host port=47000 delay=2 seed=0x1234`.
+   Machine B: `enabled=1 role=guest peer=<A's IP> port=47000 local=47001
+   delay=2 seed=0x1234`.
+3. Inject on both, start a game from the same menu choices. Verify: (a) both see
+   the same two players; (b) the guest's stick drives P2 on the host and vice
+   versa; (c) `coop_log.txt` shows "netplay: UP …" and no DESYNC spam; (d) the
+   5 s stall only appears if one side pauses. `seed`/`delay` MUST match on both.
+4. If menus desync, that's the known A2 limitation — both must pick identically
+   (they navigate together, so this should be automatic once both are connected
+   before the menu).
+
 ---
 
 #### Original plan (kept for reference)
@@ -1495,13 +1556,26 @@ ascii text queue (the same `ADDR_ASCII_PRINT` the coop HUD uses) while
 `P2 SELECT CHARACTER` / `P2 SELECT SHOT` at `MENU_PROMPT_X/Y`; verify the
 position looks right (and isn't behind menu art) and tune the #defines.
 
-### 8e — Netcode → coop.c wiring  **[bigger, separate effort]**
-The original long-term goal. The input seam is already in place: P2's gameplay
-input is read via `ReadP2InputLocal()` (and menu input via `ReadP2MenuInput()`)
-— the netcode replaces these with the remote word. Menu selection would sync
-P2's char/type over the wire (drive the menu FSM from the remote input). Defer
-until the local co-op game side is fully solid (per memory: defer netplay
-testing).
+### 8e — Netcode → coop.c wiring  **[GAMEPLAY DONE 2026-06-15 (§5k); menu char-over-wire still open]**
+The original long-term goal. **Gameplay lockstep is now wired** (§5k): the netcode
+core links into `th07_coop.dll`, `FUN_00437c70` injects the merged word into
+`g_InputMenu` every logic frame, P2's input comes from the merged high bits, and
+`FUN_00442c60` syncs the seed. Behind `coop.ini [net] enabled=1`, default off.
+Compile + native-merge-test verified; **needs a two-machine network test** (see
+§5k checklist).
+
+**Still open (the follow-up):** per-player char/type **over the wire**. Today the
+two-pass menu FSM is bypassed under netplay (menus navigate together, P2 = P1's
+char). To let P2 pick its own char remotely: keep `HookedMenuDispatch`'s FSM but
+feed P2's menu pass from the remote word's high bits (unpack like `UnpackP2` but
+in the MENU bit layout) instead of `ReadP2MenuInput()` — i.e. route
+`Nc_GetInputNet(...,is_in_UI=1,...)`'s P2 contribution into the menu during
+`CM_P2_CHAR`/`CM_P2_SHOT`. The seam (`ReadP2MenuInput` swap) is already isolated;
+the work is unpacking P2 from the merged UI word and keeping both machines' FSM
+state in lockstep (both run the identical merged word, so the FSM transitions
+deterministically). Also do a real host→guest **seed handshake** (host sends
+`rng_seed_init` in `Ctrl_Set_InitSetting`; guest adopts) to replace the
+both-sides-config seed.
 
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +

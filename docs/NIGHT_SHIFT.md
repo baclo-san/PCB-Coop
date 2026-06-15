@@ -6,6 +6,15 @@ Canonical context: `docs/th07_netplay_handoff.md`. Build: relink coop.dll direct
 incrementally, clear messages, keep tree clean. Co-op game side is the confirmed-good
 baseline; do NOT regress it.
 
+## ✅ DONE 2026-06-15 — netplay gameplay lockstep wired (see handoff §5k)
+The PRIMARY task below is now implemented for GAMEPLAY: the netcode C API is
+linked into `th07_coop.dll`, P2's input comes from the wire, the `FUN_00437c70`
+seam locksteps input + `FUN_00442c60` syncs the seed, all behind
+`coop.ini [net] enabled=1` (default off, baseline preserved). Compile +
+native-merge-test verified; needs a two-machine network test. STILL OPEN:
+per-player char/type over the wire (menu FSM bypassed under netplay → P2 clones
+P1's char) and a real host→guest seed handshake. See handoff §8e.
+
 ## 1. Start proper netplay integration (PRIMARY)
 The input seam is already in place: P2 gameplay input via `ReadP2InputLocal()`, menu
 input via `ReadP2MenuInput()` — the netcode replaces these with the remote word

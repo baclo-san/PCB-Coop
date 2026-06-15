@@ -83,11 +83,18 @@ echo "  LD  th07_harness.dll"
     "$ROOT/src/harness/harness.c" "${MH_OBJS[@]}" \
     -o "$BUILD/th07_harness.dll" -static -lkernel32 -luser32
 
-# ---- 2b. co-op DLL (P2 entity graft) ----
+# ---- 2b. co-op DLL (P2 entity graft + netcode integration, fork A §8) ----
+# coop.c is C; the netcode core is C++. Compile coop.c to an object with the C
+# compiler, then link it with the netcode TUs (compiled by g++) so libstdc++ +
+# winsock come in. The netcode path is gated behind coop.ini [net] enabled=1;
+# default-off keeps the local-keyboard co-op baseline unchanged.
+echo "  CC  coop.c"
+"$CC" "${CFLAGS[@]}" -I"$MH/include" -I"$ROOT/src/netplay" \
+    -c "$ROOT/src/coop/coop.c" -o "$OBJ/coop.o"
 echo "  LD  th07_coop.dll"
-"$CC" "${CFLAGS[@]}" -I"$MH/include" -shared \
-    "$ROOT/src/coop/coop.c" "${MH_OBJS[@]}" \
-    -o "$BUILD/th07_coop.dll" -static -lkernel32 -luser32
+"$CXX" "${CFLAGS[@]}" -std=c++17 -I"$ROOT/src/netplay" -shared \
+    "$OBJ/coop.o" "${NETCODE_SRCS[@]}" "${MH_OBJS[@]}" \
+    -o "$BUILD/th07_coop.dll" -static -lkernel32 -luser32 -lws2_32
 
 # ---- 2c. netcode integration DLL (Fork A: wires the netcode into th07) ----
 # C++ (links netcode + Connection + MinHook). NOT yet game-tested — see
@@ -154,6 +161,34 @@ delay = 2
 seed  = 0x1234
 EOF
     echo "  GEN coop_net.ini"
+fi
+
+COOPINI="$BUILD/coop.ini"
+if [ ! -f "$COOPINI" ]; then
+    cat > "$COOPINI" <<'EOF'
+; th07_coop.dll config. The [net] section drives the built-in netplay (fork A
+; §8). With enabled=0 (default) P2 is the local keyboard (IJKL/Space/U/O) — the
+; confirmed-good local co-op baseline, byte-for-byte unchanged.
+;
+; To play over the network: set enabled=1 on BOTH machines, role=host on one and
+; role=guest on the other, give the guest the host's IP in peer=, and use the
+; SAME delay and seed on both sides (a real seed handshake is a follow-up).
+[net]
+enabled = 0
+; role  = host (listens) | guest (connects to host)
+role  = host
+; guest only: host's IP to connect to
+peer  = 127.0.0.1
+; host: port to listen on / guest: host's port
+port  = 47000
+; guest only: local UDP bind port
+local = 47001
+; input delay in frames — BOTH sides must use the same value
+delay = 2
+; shared start RNG seed (host authoritative). BOTH sides must match for now.
+seed  = 0x1234
+EOF
+    echo "  GEN coop.ini"
 fi
 
 # ---- 5. verify 32-bit (PE machine field at e_lfanew+4 must be 0x14c) ----

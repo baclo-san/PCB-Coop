@@ -232,6 +232,14 @@ All hook addresses verified present in PCBdecomp.c at the lines cited above.
 
 ## 8. Wiring the netcode INTO coop.c (the single-DLL integration)
 
+> **STATUS — IMPLEMENTED 2026-06-15 (handoff §5k).** The recipe below is shipped
+> in `src/coop/coop.c` behind `coop.ini [net] enabled=1` (default off). Hooks:
+> `HookedSceneTick` (FUN_00437c70, owns the frame counter + writes `g_InputMenu`),
+> `HookedGameStart` (FUN_00442c60, seed force), and P2 input via `UnpackP2` of the
+> merged high bits. The two-pass menu FSM is bypassed under netplay for now (menus
+> navigate together; P2 = P1's char) — per-player char-over-wire is the follow-up
+> (handoff §8e). Compile + native-merge verified; needs a two-machine net test.
+
 (From the 2026-06-12 overnight session.) Goal: replace `coop.c`'s
 `ReadP2InputLocal()` (keyboard) with the netcode's merged P2 bits, so the existing,
 already-working P2 entity is driven over UDP — one DLL instead of the separate

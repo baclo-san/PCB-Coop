@@ -79,14 +79,29 @@ Write-Host "  LD  th07_harness.dll"
       -static -lkernel32 -luser32
 if ($LASTEXITCODE) { throw "link failed: th07_harness.dll" }
 
-# ---- 2b. coop DLL (P2 entity graft) ----
+# ---- 2b. coop DLL (P2 entity graft + netcode integration, fork A §8) ----
+# coop.c is C; the netcode core is C++. Compile coop.c to an object with the C
+# compiler, then link it with the netcode TUs (via g++/clang++) so libstdc++ +
+# winsock come in. Netplay is gated behind coop.ini [net] enabled=1; default-off
+# leaves the local-keyboard co-op baseline unchanged.
+$netcodeSrcs = @(
+    (Join-Path $root "src\netplay\netcode.cpp"),
+    (Join-Path $root "src\netplay\Connection.cpp"),
+    (Join-Path $root "src\netplay\merge.cpp"),
+    (Join-Path $root "src\netplay\netcode_c_api.cpp")
+)
+$netInc = "-I$(Join-Path $root 'src\netplay')"
 $coopSrc = Join-Path $root "src\coop\coop.c"
+$coopObj = Join-Path $obj  "coop.o"
 $coopDll = Join-Path $build "th07_coop.dll"
+Write-Host "  CC  coop.c"
+& $CC @cflags "-I$(Join-Path $mh 'include')" $netInc -c $coopSrc -o $coopObj
+if ($LASTEXITCODE) { throw "compile failed: coop.c" }
 Write-Host "  LD  th07_coop.dll"
-& $CC @cflags "-I$(Join-Path $mh 'include')" -shared `
-      $coopSrc @mhObjs `
+& $CXX @cflags "-std=c++17" $netInc -shared `
+      $coopObj @netcodeSrcs @mhObjs `
       -o $coopDll `
-      -static -lkernel32 -luser32
+      -static -lkernel32 -luser32 -lws2_32
 if ($LASTEXITCODE) { throw "link failed: th07_coop.dll" }
 
 # ---- 3. injector EXE ----
@@ -124,6 +139,28 @@ seed = 0x1234
     Write-Host "  GEN harness.ini"
 }
 
+$coopIni = Join-Path $build "coop.ini"
+if (-not (Test-Path $coopIni)) {
+@"
+; th07_coop.dll config. [net] drives the built-in netplay (fork A §8). With
+; enabled=0 (default) P2 is the local keyboard (IJKL/Space/U/O) — the
+; confirmed-good local co-op baseline, byte-for-byte unchanged.
+;
+; Over the network: set enabled=1 on BOTH machines, role=host on one /
+; role=guest on the other, give the guest the host's IP in peer=, and use the
+; SAME delay and seed on both sides (a real seed handshake is a follow-up).
+[net]
+enabled = 0
+role  = host
+peer  = 127.0.0.1
+port  = 47000
+local = 47001
+delay = 2
+seed  = 0x1234
+"@ | Set-Content -Encoding ASCII $coopIni
+    Write-Host "  GEN coop.ini"
+}
+
 # ---- 5. verify 32-bit ----
 function Get-PEMachine([string]$path) {
     $b = [IO.File]::ReadAllBytes($path)
@@ -133,7 +170,7 @@ function Get-PEMachine([string]$path) {
 }
 Write-Host ""
 Write-Host "Built:" -ForegroundColor Green
-foreach ($f in $harnessDll,$injExe) {
+foreach ($f in $harnessDll,$coopDll,$injExe) {
     "  {0,-22} {1,8:N0} bytes  {2}" -f (Split-Path $f -Leaf), (Get-Item $f).Length, (Get-PEMachine $f)
 }
 Write-Host ""

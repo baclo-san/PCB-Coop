@@ -791,6 +791,166 @@ static uint16_t ReadP2InputLocal(void)
 }
 static int s_p2InputLogged = 0;
 
+/* ======================================================================== *
+ *  NETPLAY (fork A, single-DLL integration — docs/th07_fork_a_integration.md §8)
+ *
+ *  Wires the engine-agnostic netcode core (src/netplay/, exposed through the
+ *  C-linkage shim netcode_c_api.h) straight into this DLL, so P2's input comes
+ *  from the WIRE instead of the local keyboard. One UDP peer per process:
+ *  host = P1's machine, guest = P2's machine. Delay-based lockstep, one 16-bit
+ *  word carries both players (P1 = low 9 bits native, P2 = high 7 bits) kept in
+ *  sync by an RNG-seed compare every frame (netcode.cpp / merge.cpp, already
+ *  unit- + lockstep-tested by tests/).
+ *
+ *  DESIGN (the §8 "one seam owns the frame counter + both input globals"):
+ *   - Detour FUN_00437c70 (HookedSceneTick) — the per-logic-frame scene-input
+ *     task that runs in BOTH menus and gameplay (the th07 analog of th06's
+ *     Supervisor::OnUpdate). It owns the single DLL frame counter. After ZUN
+ *     polls (g_InputMenu = Input_Poll()), we replace g_InputMenu with the
+ *     lockstep-MERGED word. In a stage the engine's own FUN_00442cd0 then copies
+ *     g_InputMenu -> g_InputGameplay for free, so P1 (low bits) becomes the
+ *     merged P1; P2's piggyback update reads the high bits (UnpackP2).
+ *   - Detour FUN_00442c60 (HookedGameStart) — force the shared RNG seed before
+ *     ZUN snapshots it (mirrors ZUN's own replay seed-restore; idempotent on the
+ *     mid-stage re-fires noted in fork_a §3).
+ *
+ *  SAFETY: everything here is gated on s_netActive, which is ONLY set when
+ *  coop.ini's [net] enabled=1 AND the transport came up. With netplay OFF
+ *  (the default) NOTHING below runs — the confirmed-good local-keyboard co-op
+ *  baseline is byte-for-byte unchanged.
+ *
+ *  LIMITATION (this cut, A2 + menu-together): under netplay the two-pass
+ *  per-player char-select FSM is bypassed — both players navigate the menu
+ *  TOGETHER (merged UI word) and P2 clones P1's character, the th06 baseline.
+ *  Per-player char/type over the wire is a follow-up (drive the menu FSM from
+ *  the remote word). NOT YET NETWORK-TESTED — compile + netcode-unit verified
+ *  only; see the handoff for the in-game test checklist.
+ * ======================================================================== */
+#include "netcode_c_api.h"
+
+#define ADDR_SCENE_TICK ((LPVOID)0x00437c70)   /* per-frame scene input task (A1 seam) */
+#define ADDR_GAME_START ((LPVOID)0x00442c60)   /* game/stage-start init (seed snapshot)*/
+#define ADDR_INPUT_MENU ((volatile uint16_t *)0x004b9e4c) /* g_InputMenu (raw poll)    */
+#define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
+
+typedef int (__fastcall *SceneTickFn_t)(void *self);
+typedef int (__fastcall *GameStartFn_t)(int self);
+static SceneTickFn_t s_origSceneTick = NULL;
+static GameStartFn_t s_origGameStart = NULL;
+
+/* config (coop.ini [net], read once at attach) */
+static int      s_netEnabled = 0;          /* feature flag (default OFF)              */
+static int      s_netIsHost  = 1;
+static char     s_netPeer[64]= "127.0.0.1";
+static int      s_netPort    = 47000;
+static int      s_netLocal   = 47001;
+static int      s_netDelay   = 2;
+static uint16_t s_netSeed    = 0x1234;
+
+/* live state */
+static int      s_netActive  = 0;          /* transport up + connected               */
+static int      s_netFrame   = 0;          /* DLL-owned logic-frame index             */
+static uint16_t s_netMerged  = 0;          /* this frame's merged word (P2 reads high) */
+static int      s_netSync    = 1;          /* last seen Nc_IsSync()                    */
+static int      s_netDesyncLogged = 0;
+
+/* netcode host-environment callbacks. readLocalInput is called INSIDE
+ * Nc_GetInputNet, BEFORE the scene-tick hook overwrites g_InputMenu — so it
+ * still sees this frame's raw local poll. readRngSeed = the desync oracle. */
+static unsigned short NetReadLocalInput(void) { return *ADDR_INPUT_MENU; }
+static unsigned short NetReadRngSeed(void)    { return *ADDR_RNG_SEED;   }
+
+/* Unpack P2 (merged high bits, NB_*2 = bit<<9) into the low-bit gameplay layout
+ * the player update reads (the inverse of merge.cpp's host/guest P2 mapping). */
+static uint16_t UnpackP2(uint16_t m)
+{
+    uint16_t w = 0;
+    if (m & (1u << 9))  w |= IN_SHOOT;   /* NB_SHOOT2 */
+    if (m & (1u << 10)) w |= IN_BOMB;    /* NB_BOMB2  */
+    if (m & (1u << 11)) w |= IN_FOCUS;   /* NB_FOCUS2 */
+    if (m & (1u << 12)) w |= IN_UP;      /* NB_UP2    */
+    if (m & (1u << 13)) w |= IN_DOWN;    /* NB_DOWN2  */
+    if (m & (1u << 14)) w |= IN_LEFT;    /* NB_LEFT2  */
+    if (m & (1u << 15)) w |= IN_RIGHT;   /* NB_RIGHT2 */
+    return w;
+}
+
+static void LoadNetConfig(void)
+{
+    char ini[MAX_PATH], buf[64];
+    snprintf(ini, sizeof(ini), "%scoop.ini", s_dir);
+    s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
+    if (!s_netEnabled) return;
+    GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);
+    s_netIsHost = (_stricmp(buf, "guest") != 0);
+    GetPrivateProfileStringA("net", "peer", "127.0.0.1", s_netPeer, sizeof(s_netPeer), ini);
+    s_netPort  = (int)GetPrivateProfileIntA("net", "port",  47000, ini);
+    s_netLocal = (int)GetPrivateProfileIntA("net", "local", 47001, ini);
+    s_netDelay = (int)GetPrivateProfileIntA("net", "delay", 2, ini);
+    GetPrivateProfileStringA("net", "seed", "0x1234", buf, sizeof(buf), ini);
+    s_netSeed = (uint16_t)strtoul(buf, NULL, 0);
+}
+
+static void StartNet(void)
+{
+    if (!s_netEnabled) { Log("netplay: disabled (coop.ini [net] enabled=0) — local P2"); return; }
+    Nc_SetCallbacks(NetReadLocalInput, NetReadRngSeed);
+    int ok = s_netIsHost
+        ? Nc_StartHost("", s_netPort, 2 /*AF_INET*/)
+        : Nc_StartGuest(s_netPeer, s_netPort, s_netLocal, 2 /*AF_INET*/);
+    if (!ok) { Log("netplay: transport start FAILED (role=%s) — falling back to local P2",
+                   s_netIsHost ? "host" : "guest"); return; }
+    /* A2 stand-in: both configs carry the same delay+seed, so declare the link
+     * connected immediately. A real handshake (host sends rng_seed_init, guest
+     * adopts) is the next step — see fork_a §3/§7. */
+    Nc_SetConnected(1, s_netDelay, s_netSeed);
+    s_netActive = 1;
+    Log("netplay: UP role=%s peer=%s port=%d local=%d delay=%d seed=0x%04x. "
+        "P2 input now from the WIRE; menus navigate together; P2 = P1's char "
+        "(per-player char-over-wire is a follow-up).",
+        s_netIsHost ? "host" : "guest", s_netPeer, s_netPort, s_netLocal,
+        s_netDelay, s_netSeed);
+}
+
+/* FUN_00437c70 — per-logic-frame scene input task. Owns the netcode frame
+ * counter and overwrites g_InputMenu with the merged word. */
+static int __fastcall HookedSceneTick(void *self)
+{
+    int r = s_origSceneTick(self);          /* ZUN: g_InputMenu = Input_Poll() */
+    if (s_netActive) {
+        int inStage = (int)((*ADDR_MODE_FLAGS >> 2) & 1);  /* recording active = in a stage */
+        int ctrl = 0;
+        unsigned short merged = Nc_GetInputNet(s_netFrame++, inStage ? 0 : 1, &ctrl);
+        s_netMerged = merged;
+        *ADDR_INPUT_MENU = merged;          /* menus together; in-stage -> g_InputGameplay */
+        int sync = Nc_IsConnected() ? Nc_IsSync() : 1;
+        if (sync != s_netSync) {
+            s_netSync = sync;
+            if (!sync && !s_netDesyncLogged) {
+                Log("netplay: DESYNC detected (seed mismatch) at frame %d", s_netFrame);
+                s_netDesyncLogged = 1;
+            } else if (sync) {
+                Log("netplay: back in sync at frame %d", s_netFrame);
+            }
+        }
+        if (!Nc_IsConnected() && s_netActive) {
+            Log("netplay: peer lost (lockstep timeout) — frame %d", s_netFrame);
+            s_netActive = 0;               /* drop to local-keyboard P2 fallback */
+        }
+    }
+    return r;
+}
+
+/* FUN_00442c60 — game/stage-start init. Force the shared seed before ZUN
+ * snapshots it (idempotent on the documented mid-stage re-fires). */
+static int __fastcall HookedGameStart(int self)
+{
+    if (s_netActive)
+        *ADDR_RNG_SEED = Nc_GetInitSeed();
+    return s_origGameStart(self);
+}
+/* ===================== end netplay ===================== */
+
 /* Move P2's active shots into free slots of P1's authoritative array, then clear
  * them from P2 (ownership transfer). Runs at the END of P2's update each frame,
  * so P2's array is empty by the time the draw chain runs (no double-draw) and
@@ -1930,7 +2090,9 @@ static int __fastcall HookedUpdate(void *self)
             /* INPUT SWAP: P2's update reads g_InputGameplay; point it at P2's
              * own word for the duration, then restore so P1 is unaffected.
              * This is the precise seam the netcode will feed (P2 = high bits). */
-            uint16_t p2in  = ReadP2InputLocal();
+            /* P2's word: from the WIRE under netplay (merged high bits), else
+             * the local keyboard. The swap below is unchanged either way. */
+            uint16_t p2in  = s_netActive ? UnpackP2(s_netMerged) : ReadP2InputLocal();
             uint16_t saved = *ADDR_INPUT_GAMEPLAY;
             if (p2in && !s_p2InputLogged) { Log("P2 input read OK: 0x%03x (key path works)", p2in); s_p2InputLogged = 1; }
             if (s_p2Ghost) p2in = 0;    /* ghost: no input at all — MoveGhost drives it */
@@ -2422,7 +2584,10 @@ static int __fastcall HookedMenuDispatch(void *menuv)
     if (s_p2 || s_p2AnmSlot >= 0)
         ResetCoopSession();
 
-    if (!s_menuSelect) return s_origMenuDispatch(menuv);
+    /* Under netplay the two-pass per-player select is bypassed: menus navigate
+     * TOGETHER off the merged g_InputMenu (HookedSceneTick), so both machines
+     * pick the same char/difficulty deterministically and P2 clones P1. */
+    if (!s_menuSelect || s_netActive) return s_origMenuDispatch(menuv);
 
     /* left the char/shot-select flow (back to title/difficulty, or post-game):
      * reset the FSM so the next game starts a fresh P2 selection. */
@@ -2534,6 +2699,9 @@ static int InstallHooks(void)
     if (MH_CreateHook((LPVOID)ADDR_ANGLE_TO_PLAYER, (LPVOID)&HookedAngleToPlayer, (LPVOID*)&s_origAngleToPlayer) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DECL_MAKE,      (LPVOID)&HookedDeclMake,      (LPVOID*)&s_origDeclMake)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DECL_DRAW,      (LPVOID)&HookedDeclDraw,      (LPVOID*)&s_origDeclDraw)      != MH_OK) return 0;
+    /* netplay seams (no-op unless coop.ini [net] enabled=1 brought the link up) */
+    if (MH_CreateHook(ADDR_SCENE_TICK,     (LPVOID)&HookedSceneTick,     (LPVOID*)&s_origSceneTick)     != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_GAME_START,     (LPVOID)&HookedGameStart,     (LPVOID*)&s_origGameStart)     != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLIDE_BULLET) != MH_OK) return 0;
@@ -2550,6 +2718,8 @@ static int InstallHooks(void)
     if (MH_EnableHook((LPVOID)ADDR_ANGLE_TO_PLAYER) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DECL_MAKE)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_SCENE_TICK)     != MH_OK) return 0;
+    if (MH_EnableHook(ADDR_GAME_START)     != MH_OK) return 0;
     return 1;
 }
 
@@ -2568,6 +2738,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
+        LoadNetConfig();
+        StartNet();        /* no-op unless coop.ini [net] enabled=1 */
         if (!InstallHooks())
             MessageBoxA(NULL, "th07_coop: hook install failed (wrong build/addresses?)",
                         "th07_coop", MB_ICONERROR);

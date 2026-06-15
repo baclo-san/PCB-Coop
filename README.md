@@ -76,6 +76,17 @@ harness uses `harness.ini`, the netcode integration DLL uses `coop_net.ini`. For
 co-op DLL: get into a stage, P2 auto-spawns after ~3 s; see the header comment in
 `src/coop/coop.c` for the live hotkeys (IJKL/Space/U/O = P2, F2–F12 = toggles).
 
+## Status (2026-06-15)
+- 🟡 **Netplay wired into the co-op DLL (§5k, fork A §8)**: the netcode core now
+  links into `th07_coop.dll`; P2's input comes from the WIRE (merged high bits)
+  instead of the local keyboard, the menu/scene seam (`FUN_00437c70`) locksteps
+  input + the seed-sync seam (`FUN_00442c60`) forces a shared RNG seed. Gated
+  behind `coop.ini [net] enabled=1` (default OFF → unchanged local-keyboard
+  baseline). Compile + native-merge-test verified; **needs a two-machine network
+  test** (checklist in handoff §5k). Known limitation: under netplay the two-pass
+  per-player char-select is bypassed (menus navigate together, P2 clones P1's
+  char) — per-player char-over-wire is the follow-up (§8e).
+
 ## Status (2026-06-14)
 - ✅ **EoSD-style menu character select**: P1 picks, then P2 picks its own char+type,
   then the game starts (handoff §5g). Different-char P2 works (body/shots/bomb/lasers).

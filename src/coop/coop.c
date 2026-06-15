@@ -2883,10 +2883,13 @@ static int __fastcall HookedMenuDispatch(void *menuv)
  * data/demo/demorpyN.rpy — which advances game state + RNG. That's pure noise
  * solo, and actively harmful under netplay: a player idling at the title waiting
  * for their peer would kick off a demo. We raise the 900 threshold to ~INT_MAX so
- * it never fires (the same fix the EoSD co-op mod uses). The immediate of
- * `CMP [EAX+0xd100], 0x384` lives at 0x00455a96+6 = 0x00455a9c; we only patch if
- * it still reads 900, so a wrong build is left untouched. */
-#define ADDR_DEMO_THRESHOLD_IMM ((void *)0x00455a9c)
+ * it never fires (the same fix the EoSD co-op mod uses). The instruction
+ * `CMP [EAX+0xd100], 0x384` (81 b8 00 d1 00 00 84 03 00 00) is at 0x00455a94, so
+ * its imm32 lives at 0x00455a94+6 = 0x00455a9a (NOT ...9c — that lands on the high
+ * half of the imm + the following 0f 8e JLE, which is why the first cut read back
+ * 0x8e0f0000 and skipped). We only patch if it still reads 900, so a wrong build is
+ * left untouched. */
+#define ADDR_DEMO_THRESHOLD_IMM ((void *)0x00455a9a)
 static void PatchDisableDemo(void)
 {
     void *p = ADDR_DEMO_THRESHOLD_IMM;
@@ -2897,9 +2900,9 @@ static void PatchDisableDemo(void)
     }
     if (*(uint32_t *)p == 0x00000384u) {
         *(uint32_t *)p = 0x7FFFFFF8u;
-        Log("demo-play disabled (idle threshold 900 -> INT_MAX at 0x00455a9c)");
+        Log("demo-play disabled (idle threshold 900 -> INT_MAX at 0x00455a9a)");
     } else {
-        Log("demo-play patch SKIPPED: bytes at 0x00455a9c = 0x%08x, not 900 (wrong build?)",
+        Log("demo-play patch SKIPPED: bytes at 0x00455a9a = 0x%08x, not 900 (wrong build?)",
             *(uint32_t *)p);
     }
     VirtualProtect(p, 4, old, &old);

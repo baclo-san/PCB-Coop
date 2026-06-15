@@ -1690,10 +1690,16 @@ counts idle frames in `menuObj+0xd100` and at `900 < idleFrames` loads
 `data/demo/demorpyN.rpy` — which advances state + RNG and, under netplay, would fire
 while a player idles at the title waiting for the peer. `PatchDisableDemo()` (coop.c,
 at attach, gated on `[coop] disable_demo`, default ON) raises the threshold to
-`0x7FFFFFF8`: it byte-patches the `imm32` of `CMP [EAX+0xd100],0x384` at **0x00455a9c**
-(found by scanning th07.exe for the unique `00 d1 00 00 84 03 00 00`), guarded by a
-read-back that the bytes still equal 900 so a wrong build is left untouched. (Same
-approach as EoSD's mod.)
+`0x7FFFFFF8`: it byte-patches the `imm32` of `CMP [EAX+0xd100],0x384`
+(`81 b8 00 d1 00 00 84 03 00 00` at **0x00455a94**), so the imm32 is at
+**0x00455a9a** (0x00455a94+6), guarded by a read-back that the bytes still equal 900
+so a wrong build is left untouched. (Same approach as EoSD's mod.)
+
+> **Fix 2026-06-15:** the first cut used `0x00455a9c`, which is +2 past the imm32 —
+> it lands on the imm's high half plus the following `0f 8e` JLE, so the guard read
+> back `0x8e0f0000` and (correctly) skipped, leaving the demo live. Corrected to
+> `0x00455a9a` after re-scanning th07.exe: the CMP starts at `0x00455a94`, not `…96`
+> (the `00 d1…` the scan matched is the disp32, two bytes into the instruction).
 
 **Live sync telemetry — DONE (§8h).** First 2-PC test desynced (frame-4 "DESYNC"
 flapping, lying "back in sync" at mismatched frames on each side, then 1 fps →

@@ -63,15 +63,17 @@ few seconds.
 Open **`coop_log.txt`** (created next to the DLL) on each machine. Near the top you
 want:
 ```
-netplay: UP role=host ... P2 input now from the WIRE ...
+netplay: UP role=host ... each player picks its OWN character at select.
 ```
 If instead you see `transport start FAILED` or `DESYNC detected`, see Troubleshooting.
 
 ## 6. Play
-- From the title, **one person navigates the menu** (in this cut menu input is
-  merged, so both control the cursor — don't fight over it). Pick a character and
-  start. **P2 plays the same character as P1** for now (per-player char over the wire
-  is the next milestone).
+- **Title / difficulty:** the **host (P1)** leads — host navigates and starts.
+  (Both can nudge the title cursor; let the host drive to avoid fighting.)
+- **Character select (per-player!):** the host picks **P1's** character + shot type
+  and confirms. The screen then shows **"P2 SELECT CHARACTER"** — now the **guest
+  (P2)** picks their OWN character + shot with their controls and confirms. The game
+  starts once both have chosen, each as their own character (they can differ!).
 - In the stage, each person controls their own ship over the network. Watch for:
   desync (the two screens drift apart), input lag (raise/lower `delay`), or stalls.
 
@@ -86,6 +88,7 @@ If instead you see `transport start FAILED` or `DESYNC detected`, see Troublesho
 | One side crashes | Grab BOTH `coop_log.txt` files + note what was on screen; that's the bug report. |
 
 ## Notes / known limits (this cut)
-- Menus navigate **together**; **P2 = P1's character** (A2 cut — handoff §8e).
+- **Per-player character select works** (host=P1 then guest=P2). Title/difficulty
+  are host-led.
 - No automatic seed handshake yet: it relies on matching `seed=` in both inis.
 - Local-keyboard co-op is unchanged — set `enabled = 0` to get it back.

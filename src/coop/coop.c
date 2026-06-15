@@ -134,8 +134,9 @@
  *   (docs/th07_fork_a_integration.md §8). Detours FUN_00437c70 (per-frame input
  *   merge into g_InputMenu, owns the lockstep frame counter) + FUN_00442c60
  *   (shared RNG-seed force); P2 reads the merged high bits (UnpackP2). Default
- *   off => unchanged local-keyboard baseline. host=P1, guest=P2; menus navigate
- *   together (P2 clones P1's char in this cut). See coop.ini for role/peer/seed.
+ *   off => unchanged local-keyboard baseline. host=P1, guest=P2; each player
+ *   picks its OWN character at the select screen (the two-pass FSM is driven by
+ *   the de-merged per-player wire words). See coop.ini for role/peer/seed.
  * PROXIMITY FADE (coop.ini [coop] proximity_fade=1, default off): fade the other
  *   player out as the two overlap (asymmetric: host fades P2, guest fades P1).
  *
@@ -832,11 +833,12 @@ static int s_p2InputLogged = 0;
  *  (the default) NOTHING below runs — the confirmed-good local-keyboard co-op
  *  baseline is byte-for-byte unchanged.
  *
- *  LIMITATION (this cut, A2 + menu-together): under netplay the two-pass
- *  per-player char-select FSM is bypassed — both players navigate the menu
- *  TOGETHER (merged UI word) and P2 clones P1's character, the th06 baseline.
- *  Per-player char/type over the wire is a follow-up (drive the menu FSM from
- *  the remote word). NOT YET NETWORK-TESTED — compile + netcode-unit verified
+ *  PER-PLAYER SELECT (over the wire): the two-pass char-select FSM RUNS under
+ *  netplay — P1's pass is driven by s_netP1Menu and P2's by s_netP2Menu (the
+ *  de-merged per-player words from Nc_GetLastSplit), so each player picks its own
+ *  character+shot deterministically on both machines. P1 leads the front-end until
+ *  it locks its shot, then P2 picks. (Title/difficulty still navigate together via
+ *  the UI-union word.) NOT YET NETWORK-TESTED — compile + netcode-unit verified
  *  only; see the handoff for the in-game test checklist.
  * ======================================================================== */
 #include "netcode_c_api.h"
@@ -867,6 +869,11 @@ static uint16_t s_netMerged  = 0;          /* this frame's merged word (P2 reads
 static int      s_netSync    = 1;          /* last seen Nc_IsSync()                    */
 static int      s_netDesyncLogged = 0;
 static int      s_proxFade   = 0;          /* coop.ini [coop] proximity_fade (default off) */
+/* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
+ * per-player char-select FSM under netplay. Both machines compute the same pair. */
+static uint16_t s_netP1Menu  = 0;
+static uint16_t s_netP2Menu  = 0;
+static uint16_t s_p1MenuPrev = 0;          /* P1's menu prev word (netplay edge detect)*/
 
 /* netcode host-environment callbacks. readLocalInput is called INSIDE
  * Nc_GetInputNet, BEFORE the scene-tick hook overwrites g_InputMenu — so it
@@ -922,8 +929,7 @@ static void StartNet(void)
     Nc_SetConnected(1, s_netDelay, s_netSeed);
     s_netActive = 1;
     Log("netplay: UP role=%s peer=%s port=%d local=%d delay=%d seed=0x%04x. "
-        "P2 input now from the WIRE; menus navigate together; P2 = P1's char "
-        "(per-player char-over-wire is a follow-up).",
+        "Both inputs from the WIRE; each player picks its OWN character at select.",
         s_netIsHost ? "host" : "guest", s_netPeer, s_netPort, s_netLocal,
         s_netDelay, s_netSeed);
 }
@@ -938,6 +944,9 @@ static int __fastcall HookedSceneTick(void *self)
         int ctrl = 0;
         unsigned short merged = Nc_GetInputNet(s_netFrame++, inStage ? 0 : 1, &ctrl);
         s_netMerged = merged;
+        /* de-merged per-player words for the menu FSM (in menus the local poll is
+         * the menu-bit layout, so these are P1's / P2's raw menu words). */
+        Nc_GetLastSplit(&s_netP1Menu, &s_netP2Menu);
         *ADDR_INPUT_MENU = merged;          /* menus together; in-stage -> g_InputGameplay */
         int sync = Nc_IsConnected() ? Nc_IsSync() : 1;
         if (sync != s_netSync) {
@@ -2644,10 +2653,12 @@ static int __fastcall HookedMenuDispatch(void *menuv)
     if (s_p2 || s_p2AnmSlot >= 0)
         ResetCoopSession();
 
-    /* Under netplay the two-pass per-player select is bypassed: menus navigate
-     * TOGETHER off the merged g_InputMenu (HookedSceneTick), so both machines
-     * pick the same char/difficulty deterministically and P2 clones P1. */
-    if (!s_menuSelect || s_netActive) return s_origMenuDispatch(menuv);
+    /* Under netplay the SAME two-pass FSM runs, but each pass is driven by that
+     * player's DE-MERGED wire word (s_netP1Menu / s_netP2Menu from Nc_GetLastSplit)
+     * instead of the local keyboard — deterministic on both machines, so P2 picks
+     * its OWN character. Local play uses the keyboard path exactly as before. */
+    if (!s_menuSelect) return s_origMenuDispatch(menuv);
+    int net = s_netActive;
 
     /* left the char/shot-select flow (back to title/difficulty, or post-game):
      * reset the FSM so the next game starts a fresh P2 selection. */
@@ -2661,6 +2672,13 @@ static int __fastcall HookedMenuDispatch(void *menuv)
 
     /* ---- P1's pass: intercept the shot-type COMMIT, divert to P2 ---- */
     if (s_coopMenu == CM_IDLE) {
+        /* netplay: isolate P1's pass to P1's own wire word — else P2's bits, OR'd
+         * into g_InputMenu by HookedSceneTick, would also move P1's cursor. */
+        uint16_t saveCur = 0, savePrev = 0;
+        if (net) {
+            saveCur = *ADDR_MENU_IN_CUR; savePrev = *ADDR_MENU_IN_PREV;
+            *ADDR_MENU_IN_CUR = s_netP1Menu; *ADDR_MENU_IN_PREV = s_p1MenuPrev;
+        }
         if (MenuIsShotState(state)) {
             int substate    = *(int *)(menu + MENU_OFF_SUBSTATE);
             uint16_t cur     = *ADDR_MENU_IN_CUR, prev = *ADDR_MENU_IN_PREV;
@@ -2677,14 +2695,20 @@ static int __fastcall HookedMenuDispatch(void *menuv)
                 s_allowDiffChar = 0;
                 MenuGotoState(menu, state - 1);            /* 6->5, 0xe->0xd          */
                 s_coopMenu = CM_P2_CHAR;
-                /* seed prev with currently-held keys so a held confirm (P1's Z, or
-                 * a held Space) reads as already-down, not a fresh edge */
-                s_menuPrev = (uint16_t)(*ADDR_MENU_IN_CUR | ReadP2MenuInput());
-                Log("coop-menu: P1 locked %s -> P2 character select",
-                    ADDR_SEL_NAMES[s_p1Char * 2 + s_p1Type]);
+                /* seed P2's prev with currently-held input so a held confirm reads
+                 * as already-down on P2's first pass, not a fresh edge */
+                s_menuPrev = net ? s_netP2Menu
+                                 : (uint16_t)(*ADDR_MENU_IN_CUR | ReadP2MenuInput());
+                Log("coop-menu%s: P1 locked %s -> P2 character select",
+                    net ? "(net)" : "", ADDR_SEL_NAMES[s_p1Char * 2 + s_p1Type]);
             }
         }
-        return s_origMenuDispatch(menuv);
+        r = s_origMenuDispatch(menuv);
+        if (net) {
+            *ADDR_MENU_IN_CUR = saveCur; *ADDR_MENU_IN_PREV = savePrev;
+            s_p1MenuPrev = s_netP1Menu;
+        }
+        return r;
     }
 
     /* ---- P2's pass: route P2 (and P1, as a helper) input into the menu ---- */
@@ -2699,7 +2723,10 @@ static int __fastcall HookedMenuDispatch(void *menuv)
 
         uint16_t realCur  = *ADDR_MENU_IN_CUR;
         uint16_t realPrev = *ADDR_MENU_IN_PREV;
-        uint16_t combined = (uint16_t)(realCur | ReadP2MenuInput()); /* either player */
+        /* netplay: P2's OWN de-merged wire word (isolated). Local: P1's keyboard
+         * OR P2's keys, so either player can drive P2's pick on one keyboard. */
+        uint16_t combined = net ? s_netP2Menu
+                                : (uint16_t)(realCur | ReadP2MenuInput());
 
         *ADDR_MENU_IN_PREV = s_menuPrev;
         *ADDR_MENU_IN_CUR  = combined;

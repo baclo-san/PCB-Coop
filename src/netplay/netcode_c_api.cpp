@@ -45,4 +45,12 @@ int Nc_IsHost(void)      { return Netcode_IsHost()      ? 1 : 0; }
 int Nc_GetDelay(void)    { return Netcode_GetDelay(); }
 unsigned short Nc_GetInitSeed(void) { return Netcode_GetInitSeed(); }
 
+void Nc_GetLastSplit(unsigned short* p1, unsigned short* p2)
+{
+    unsigned short a = 0, b = 0;
+    Netcode_GetLastSplit(a, b);
+    if (p1) *p1 = a;
+    if (p2) *p2 = b;
+}
+
 } // extern "C"

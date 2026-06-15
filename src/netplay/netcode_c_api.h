@@ -41,6 +41,11 @@ int  Nc_IsHost(void);
 int  Nc_GetDelay(void);
 unsigned short Nc_GetInitSeed(void);
 
+/* Most recent frame's two raw input words de-merged to player identity (P1 = the
+ * host's word, P2 = the guest's word) — for per-player menu routing. Both machines
+ * compute the same pair. Valid after Nc_GetInputNet() each frame. */
+void Nc_GetLastSplit(unsigned short* p1, unsigned short* p2);
+
 #ifdef __cplusplus
 }
 #endif

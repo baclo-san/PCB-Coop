@@ -49,3 +49,8 @@ bool Netcode_IsSync();          // false the frame a seed mismatch was detected
 bool Netcode_IsHost();
 int  Netcode_GetDelay();
 unsigned short Netcode_GetInitSeed();
+
+// Most recent frame's two raw input words de-merged to player identity (P1 = the
+// host's word, P2 = the guest's word). For per-player front-end (menu) routing;
+// both machines compute the same pair. Valid after Netcode_GetInput_Net() each frame.
+void Netcode_GetLastSplit(unsigned short& p1, unsigned short& p2);

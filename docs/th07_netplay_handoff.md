@@ -1487,6 +1487,21 @@ bit6 boss], multi-hitbox +0x4f30/+0x4f34, per-frame shot-damage via
 FUN_0043d9e0 @12822 — see `docs/th07_boss_hp_scaling.md`; full enemy struct map
 is a good next RE target, only entry points pinned so far).
 
+### 5n — per-player character select OVER THE WIRE (2026-06-15)
+Made P2 pick its OWN character under netplay (was: clones P1). Root issue: the UI
+merge fuses both players (`MergeKeys` UI mode returns `self|rcv`), so the menu FSM
+couldn't tell P1 from P2. Added `Nc_GetLastSplit(&p1,&p2)` to the netcode: `GetKeys`
+now stashes the frame's two raw words de-merged to identity (`g_last_p1` = host's,
+`g_last_p2` = guest's — same on both machines). `HookedSceneTick` caches them into
+`s_netP1Menu/s_netP2Menu`; `HookedMenuDispatch` no longer bypasses under netplay —
+P1's pass drives the menu with `s_netP1Menu` (isolated), P2's pass with
+`s_netP2Menu`, so the existing two-pass FSM runs deterministically on both sides.
+Title/difficulty still use the UI-union (host-led). The in-stage different-char
+machinery (anm overlay, target block, etc.) is unchanged — it just now gets a real
+P2 selection. Build: 32-bit OK; all 16 netcode self-tests pass. NOT yet 2-PC tested.
+Files: `netcode.cpp/.hpp`, `netcode_c_api.{h,cpp}`, `coop.c` (`HookedMenuDispatch`,
+`HookedSceneTick`). See §8e.
+
 ## 8. Goals / TODO (next sessions)
 
 Ordered by the user's priority. Items marked **[autonomous-ok]** can be drafted
@@ -1603,26 +1618,26 @@ ascii text queue (the same `ADDR_ASCII_PRINT` the coop HUD uses) while
 `P2 SELECT CHARACTER` / `P2 SELECT SHOT` at `MENU_PROMPT_X/Y`; verify the
 position looks right (and isn't behind menu art) and tune the #defines.
 
-### 8e — Netcode → coop.c wiring  **[GAMEPLAY DONE 2026-06-15 (§5k); menu char-over-wire still open]**
-The original long-term goal. **Gameplay lockstep is now wired** (§5k): the netcode
+### 8e — Netcode → coop.c wiring  **[GAMEPLAY + PER-PLAYER SELECT DONE 2026-06-15; needs 2-PC test]**
+The original long-term goal. **Gameplay lockstep is wired** (§5k): the netcode
 core links into `th07_coop.dll`, `FUN_00437c70` injects the merged word into
 `g_InputMenu` every logic frame, P2's input comes from the merged high bits, and
 `FUN_00442c60` syncs the seed. Behind `coop.ini [net] enabled=1`, default off.
-Compile + native-merge-test verified; **needs a two-machine network test** (see
-§5k checklist).
 
-**Still open (the follow-up):** per-player char/type **over the wire**. Today the
-two-pass menu FSM is bypassed under netplay (menus navigate together, P2 = P1's
-char). To let P2 pick its own char remotely: keep `HookedMenuDispatch`'s FSM but
-feed P2's menu pass from the remote word's high bits (unpack like `UnpackP2` but
-in the MENU bit layout) instead of `ReadP2MenuInput()` — i.e. route
-`Nc_GetInputNet(...,is_in_UI=1,...)`'s P2 contribution into the menu during
-`CM_P2_CHAR`/`CM_P2_SHOT`. The seam (`ReadP2MenuInput` swap) is already isolated;
-the work is unpacking P2 from the merged UI word and keeping both machines' FSM
-state in lockstep (both run the identical merged word, so the FSM transitions
-deterministically). Also do a real host→guest **seed handshake** (host sends
-`rng_seed_init` in `Ctrl_Set_InitSetting`; guest adopts) to replace the
-both-sides-config seed.
+**Per-player character select over the wire — DONE (§5n).** The UI merge fuses both
+players into one word (`MergeKeys` UI mode = `self|rcv`), which is why the first cut
+cloned P1. Fix: the netcode now stashes the frame's two RAW words de-merged to
+player identity (P1 = host's, P2 = guest's) and exposes them via
+`Nc_GetLastSplit(&p1,&p2)` (`netcode.cpp` `g_last_p1/p2`, set in `GetKeys`; same on
+both machines). `HookedSceneTick` stashes them into `s_netP1Menu/s_netP2Menu`, and
+`HookedMenuDispatch` now RUNS the two-pass FSM under netplay: P1's pass overrides
+`g_InputMenu` with `s_netP1Menu` (isolated from P2), P2's pass with `s_netP2Menu`.
+Both machines run the identical deterministic FSM → each player picks its own
+char/type. Title/difficulty still navigate together (UI-union). Compile + all 16
+netcode self-tests pass; **needs a two-machine network test** (see NETPLAY_TEST.md).
+
+**Still open:** a real host→guest **seed handshake** (host sends `rng_seed_init` in
+`Ctrl_Set_InitSetting`; guest adopts) to replace the both-sides-config `seed=`.
 
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +

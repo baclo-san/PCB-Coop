@@ -36,6 +36,12 @@ static int   g_netFrame              = 0;   // replaces g_Supervisor.calcCount
 static bool  g_resync_trigger        = false;
 static int   g_resync_stage_frame    = 0;
 
+// Most recent frame's two raw input words, de-merged to player identity (P1 = the
+// HOST's word, P2 = the GUEST's word) so the front-end can route per-player menu
+// input. Updated in GetKeys every connected frame; same on both machines.
+static unsigned short g_last_p1      = 0;
+static unsigned short g_last_p2      = 0;
+
 // The merge (MergeKeys) — the single word both machines compute identically — now
 // lives in merge.cpp so it can be unit-tested natively (see merge.hpp).
 
@@ -170,6 +176,10 @@ static unsigned short GetKeys(int frame, bool is_in_UI, int& out_ctrl)
     else
         out_ctrl = (self_ctrl == IGC_NONE) ? rcv_ctrl : self_ctrl;
 
+    // de-merge to player identity for per-player menu routing (P1 = host's word).
+    g_last_p1 = g_is_host ? self_key : rcv_key;
+    g_last_p2 = g_is_host ? rcv_key  : self_key;
+
     return MergeKeys(g_is_host, is_in_UI, self_key, rcv_key);
 }
 
@@ -257,6 +267,8 @@ bool Netcode_IsSync()             { return g_is_sync; }
 bool Netcode_IsHost()             { return g_is_host; }
 int  Netcode_GetDelay()           { return g_delay; }
 unsigned short Netcode_GetInitSeed() { return g_initSeed; }
+void Netcode_GetLastSplit(unsigned short& p1, unsigned short& p2)
+{ p1 = g_last_p1; p2 = g_last_p2; }
 
 // test-only hooks (defined here, declared in netcode_internal.hpp)
 void Netcode_TestSetHost(bool h)  { g_is_host = h; }

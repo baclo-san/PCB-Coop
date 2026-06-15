@@ -31,6 +31,10 @@ by an RNG-seed comparison every frame.
   rides.
 - **`docs/th07_enemy_system.md`** — the enemy manager/array, per-enemy struct,
   the ECL VM tick + death flow, and the shot-damage sweep co-op scales.
+- **`docs/th07_player_shot_bomb_system.md`** — the player shot-fire gate, the
+  `.sht` buffers + baked stats, the per-shot slot struct (offsets confirmed via
+  the damage sweep), and the bomb / cherry-border dispatch `FUN_004409f0` (with a
+  confidence key; the deeper `.sht` format is a flagged sketch).
 
 ## Layout
 | Path | What |

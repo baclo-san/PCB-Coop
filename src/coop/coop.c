@@ -877,6 +877,8 @@ static uint16_t s_netRcvRng   = 0;
 static int      s_netStallLogged = 0;      /* throttle: frames since last STALL log    */
 static int      s_netStatLogged  = 0;      /* throttle: frames since last status log   */
 static int      s_netPeerLost = 0;         /* latched once the lockstep timed out      */
+static int      s_netSceneId  = -1;        /* last top-level scene id (self+0x154); a
+                                              change re-zeros the lockstep (start barrier)*/
 static int      s_proxFade   = 1;          /* coop.ini [coop] proximity_fade (default ON) */
 static int      s_disableDemo = 1;         /* coop.ini [coop] disable_demo (default ON)    */
 /* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
@@ -958,6 +960,9 @@ static int __fastcall HookedSceneTick(void *self)
             s_netActive  = 1;
             s_netStarted = 0;               /* don't re-handshake on a later drop      */
             s_netFrame   = 0;
+            /* anchor the scene-boundary detector to wherever we linked up (usually the
+             * title menu) so the first active frame doesn't fire a spurious re-zero. */
+            s_netSceneId = *(int *)((char *)self + 0x154);
             s_netDesyncLogged = 0; s_netSyncRun = 0; s_netPeerLost = 0;
             s_netStallLogged = 0;  s_netStatLogged = 0;
             Nc_Reset();                     /* fresh lockstep maps from frame 0         */
@@ -972,6 +977,28 @@ static int __fastcall HookedSceneTick(void *self)
         return r;                           /* no lockstep until connected             */
     }
     if (s_netActive) {
+        /* START BARRIER / scene-reset — the th06 Supervisor::OnUpdate "last_frame_a >
+         * frame_a" realign (Supervisor.cpp), driven here by PCB's top-level scene id
+         * at self+0x154. th06's lockstep clock is the game's per-scene calcCount, which
+         * the engine RESETS at every scene boundary; our port used a free-running
+         * counter with no such reset, so the menu->stage load — where each machine
+         * burns a DIFFERENT number of front-end ticks loading — drifted the two clocks
+         * apart for good (the host-330 / guest-468 gap in the desync logs, then the 5s
+         * stall + peer-loss). Detect the scene change and re-zero: clear the peer's
+         * stale per-frame inputs and restart the new scene at logic-frame 0 on BOTH
+         * machines, so every scene (and the stage) begins lockstep from the same point.
+         * Both commit the menu->stage transition on the same input-driven logic-frame,
+         * so the re-zero lands together; the seed is forced by HookedGameStart. */
+        int sceneId = *(int *)((char *)self + 0x154);
+        if (sceneId != s_netSceneId) {
+            Log("netplay: scene %d -> %d — lockstep re-aligned to frame 0 (was %d)",
+                s_netSceneId, sceneId, s_netFrame);
+            s_netSceneId = sceneId;
+            s_netFrame   = 0;
+            Nc_Reset();                 /* clear peer buffer + frame index (th06 reset) */
+            s_netDesyncLogged = 0; s_netSyncRun = 0;
+            s_netStallLogged  = 0; s_netStatLogged = 0;
+        }
         int inStage = (int)((*ADDR_MODE_FLAGS >> 2) & 1);  /* recording active = in a stage */
         int ctrl = 0;
         unsigned short merged = Nc_GetInputNet(s_netFrame++, inStage ? 0 : 1, &ctrl);

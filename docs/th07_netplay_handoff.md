@@ -1706,13 +1706,37 @@ declaring recovery (no more lying resyncs), (c) logs a throttled `STALL` line wh
 frame blocks ≥250 ms and a ~2s heartbeat with the seed pair, (d) draws an EoSD-style
 `NET H F#### d# SYNC / WAIT###ms / LOST` line top-right via `DrawCoopHud`.
 
-**Root cause of the desync (diagnosed, fix not yet written).** Lockstep goes live the
-instant the transport connects — a *different menu moment* on each PC — so "frame 0"
-is not a shared state and the front-end RNG diverges at once; the stall at stage start
-is the two machines never having a common start state (one side's load hitch then
-blows the 5 s lockstep timeout). **The fix is a real start barrier**: both machines
-begin lockstep frame 0 from the *same* screen (as EoSD's "Start Game" button does),
-instead of connecting mid-menu. The telemetry above is there to confirm it.
+**Root cause of the desync (diagnosed).** Two facts from the logs: the menus held
+together (both reached stage select) but the per-frame seeds never matched ("DESYNC
+at frame 4" onward), and at the **menu→stage transition** the link hit 1 fps then
+`peer lost` at *different* frames on each side (host 330 vs guest 468 — a 138-frame
+gap). A 138-frame split is impossible while both sides keep calling the blocking
+lockstep (it pins them within `delay` of each other), so the clocks had **drifted
+apart at the stage load**: our port used a **free-running** frame index that, unlike
+the reference, *never reset at a scene boundary*. Each machine burns a different
+number of front-end ticks loading the stage, so the two `s_netFrame` counters came
+out of the load permanently offset → each waits for a frame the other already passed
+→ 5 s timeout → drop. (The seed mismatch in the *menus* is cosmetic; menus aren't
+RNG-locked.)
+
+**Start barrier — DONE (§8j).** The th06 reference's lockstep clock is the game's own
+per-scene `calcCount`, which the engine **resets at every scene boundary**, and
+`Supervisor::OnUpdate` clears the peer buffer there (the `last_frame_a > frame_a`
+block). Ported faithfully: `HookedSceneTick` reads PCB's top-level scene id at
+`self+0x154` (the field the engine's own `"scene %d -> %d"` log prints) and, when it
+changes, re-zeros `s_netFrame` and calls `Nc_Reset()` (clears the peer's stale
+per-frame inputs + frame index — exactly th06's reset, no new netcode needed). So
+**every scene — and crucially the stage — begins lockstep frame 0 on both machines**,
+discarding the per-scene load-tick asymmetry. Both commit the menu→stage transition
+on the same input-driven logic-frame (input drives control flow; only RNG was out of
+step), so the re-zero lands together; the shared seed is forced by `HookedGameStart`
+as the stage inits. The link-up path anchors `s_netSceneId` to the connect screen so
+the first active frame doesn't fire a spurious re-zero. The `NET _ F####` overlay
+frame now restarts per scene — in-stage, two machines showing close F numbers ⇒
+aligned; a large split ⇒ desync. **Needs the 2-PC test to confirm.** If a *mid-stage*
+desync still appears (dropped-packet RNG split, not a boundary), the next lever is the
+th06 host-driven `Ctrl_Try_Resync` (infra already in `netcode.cpp`, not yet driven):
+host schedules a realign `delay*2+2` frames out and both reset RNG + clear rcv there.
 
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +

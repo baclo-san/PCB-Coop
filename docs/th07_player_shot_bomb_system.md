@@ -140,18 +140,37 @@ if (player+0x240d == 0 || player+0x16a20 != 0 || (DAT_004b9e50 & 2) == 0) {
 
 ---
 
-## 5. Caveat: player `+0x23f8` (⚠️ unresolved conflict)
+## 5. player `+0x23f8` is the death / deathbomb-window timer (✅ corrected this session)
 
-`coop.c` defines `OFF_HITBOX = 0x23f8` (“= sht[+0x8]”) and uses it as the player
-hitbox; the `.sht` bake at init writes `player+0x23f8 = sht[+0x8]`. BUT the bomb
-handler (§4) treats `+0x23f8` as an **int**, requires it `!= 0` to bomb, and does
-`+= 6` capped at `*(DAT_00575948+8)` on launch — which reads like a **power**
-field (PCB power caps at 128; `DAT_00575948+8` is likely the config power cap),
-not a collision hitbox. So either (a) `0x23f8` is the POWER field and coop.c’s
-“hitbox” label is a misnomer (the offset is still used correctly elsewhere), or
-(b) two distinct meanings overlap. **Resolve before trusting `0x23f8` as
-“hitbox”.** The bomb spends `FUN_0048b8a0()`’s count, NOT `0x23f8`, so the bomb
-`+= 6` to `0x23f8` is a power adjustment, supporting interpretation (a).
+`coop.c` labels `OFF_HITBOX = 0x23f8` (“= sht[+0x8]”), but reading the dying-state
+update **`FUN_00440cf0` @ PCBdecomp.c:26730** shows `+0x23f8` is an **int
+countdown**, NOT a float hitbox, and NOT the power counter (power is a float in the
+resource struct at `res+0x7c` = coop.c `RES_POWER`, range 0..128):
+
+- It is set to a **config max `*(DAT_00575948+8)`** at player init / respawn
+  (26856/26984/27425). (So coop.c’s “= sht[+0x8]” is the wrong *source* too — the
+  max comes from the `DAT_00575948` global config, not the per-player `.sht`.)
+- While the player is DYING, `FUN_00440cf0` does `+0x23f8 -= 1` each frame (26778).
+  When it hits 0 it **finalizes the death** (26779+): drops power to 0
+  (`*(DAT_00626278+0x7c) = 0`), runs the heal canary `FUN_004012b0`, and spawns
+  power items at the death spot via `FUN_004326f0(player+0x930, type 4, 2)` — i.e.
+  this is the **partial-power-drop-on-death** the co-op phantom-spare path relies on.
+- The bomb handler’s precondition `+0x23f8 != 0` (26668) is therefore the
+  **deathbomb gate**: you may bomb while the window timer is still running; the
+  `+= 6` on launch (26692, capped at the same config max) tops the window up. While
+  alive the timer sits at max, so the gate is trivially satisfied.
+
+**This agrees with `docs/th07_player_struct.md`**, which already lists `+0x23f8` as
+the “respawn timer — set on death, decremented each frame; hits 0 → respawn (drop
+power items)” citing the same 26778–26779. So the repo’s own ground truth already
+had it right; only coop.c’s `OFF_HITBOX` *name* is misleading.
+
+**Action for coop.c (cosmetic):** rename `OFF_HITBOX` → `OFF_DEATH_TIMER`. Its
+*usage* is fine — `SpawnP2` sets P2’s `+0x23f8` to `sht[+8]` / copies P1’s
+(26-1255/1284), i.e. max-inits a live P2’s death-window timer, which is correct.
+The mod’s real player hitbox is a separate `.sht`-derived field read by the
+collision leaves (`FUN_0043e260` family); confirm which offset before reusing
+`0x23f8` for collision.
 
 ---
 
@@ -204,8 +223,8 @@ drawn by `FUN_0042c577` (✅ coop.c, PCBdecomp.c:17267). Face id window
 - Read the actual shot-spawn loop (the body reached from `FUN_0043d990` @26587 /
   the surrounding fire code) to confirm the §6 slot fields and the `.sht`
   power→pattern selection.
-- Resolve the `+0x23f8` power-vs-hitbox question (§5) — quick: trace every
-  read/write of `0x23f8` and check the player collision test (`FUN_0043e260`
-  family) for which offset it reads as the hit radius.
+- Find the real player hitbox field the collision leaves (`FUN_0043e260` family)
+  read (now that `0x23f8` is confirmed to be the death timer, §5), and rename
+  coop.c’s `OFF_HITBOX`.
 - Map `FUN_0048b8a0` (bomb-count source) + where a bomb actually decrements the
   bomb stock — needed for the per-player bomb-count work.

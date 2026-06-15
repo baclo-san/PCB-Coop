@@ -26,8 +26,9 @@ mostly ✅ after reading the writer `FUN_0043bbd0`; a few header details remain 
 | `.sht` loader | `FUN_00442b70` | ECX = `&player+0xb7e70`; loads a `.sht` into a buffer |
 | Unfocused `.sht` buffer ptr | player `+0xb7e70` | `void*` |
 | Focused `.sht` buffer ptr | player `+0xb7e74` | `void*` |
-| Baked unfocused speed | player `+0x994` | `= sht[+0xc] / 2` |
-| Baked focused speed | player `+0x9a0` | `= sht[+0x10] / 2` |
+| ⚠️ hit-box half-Y | player `+0x994` | coop.c calls this `OFF_SPD_UNF` (`sht[+0xc]/2`) but the box-build (`player_struct.md`) proves it's the **hit half-Y**; real speed field unconfirmed |
+| ⚠️ graze half-extent | player `+0x9a0` | coop.c `OFF_SPD_FOC` — actually the **graze half-extent** (`cfg[0x10]/2`) |
+| hit/graze half-X | player `+0x990` / `+0x99c` | hit-box half-X / graze (the `+0x948..`/`+0x960..` edges = center ∓ these) |
 | Baked hitbox/“power cap” field | player `+0x23f8` | `= sht[+0x8]` — **see §5 caveat** |
 | Shot array first slot | player `+0x2444` | |
 | Shot slot stride | `0x364` (868 B) | |
@@ -270,7 +271,10 @@ drawn by `FUN_0042c577` (✅ coop.c, PCBdecomp.c:17267). Face id window
   +0x958` (L/T/R/B), read by `FUN_0043e260` (25995-25998); the graze box is the
   +20px `+0x960/+0x964/+0x96c/+0x970` (`FUN_0043e3b0`). See
   `th07_player_struct.md`. coop.c’s `OFF_HITBOX` was renamed → `OFF_DEATH_TIMER`.
-  Still open: the raw half-extent input field these edges are recomputed from.
+  ✅ ALSO DONE: the raw half-extents are `+0x990/+0x994/+0x998` (hit X/Y/Z) and
+  `+0x99c/+0x9a0` (graze), recomputed into the edges @26365-26375 — and these are
+  what coop.c mislabels as `OFF_SPD_UNF/OFF_SPD_FOC` (the real movement-speed field
+  is the new open item).
 - ✅ DONE: the bomb spend is `FUN_0042d612(this,-1)` @26673 (accessor @17731,
   `res+0x68 += amount`); coop.c's `RES_BOMBS 0x68` field-swap already attributes
   P2's bomb spend correctly. Per-player bombs need no extra work here.

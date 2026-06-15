@@ -22,8 +22,10 @@ ver 1.00b (`35467EAF…E80CA`).
 | `+0x414`/`418`/`41c` | float | option-A world pos (set from `+0x9b4/9b8` + camera) | FUN_00441fb0:27267 |
 | `+0x660`/`664`/`668` | float | option-B world pos (from `+0x9c0/9c4`) | 27270 |
 | `+0x930`/`934`/`938` | float | **player world pos X / Y / Z** | coop.c; FUN_004420b0:27260; FUN_00442370 |
-| `+0x948`/`94c`/`954`/`958` | float | **player HIT box edges** L/T/R/B (AABB the bullet/contact test compares against) | FUN_0043e260:25995-25998 |
-| `+0x960`/`964`/`96c`/`970` | float | **player GRAZE box edges** L/T/R/B (= hit box +20px each side) | FUN_0043e3b0:26035-26039; cherry §7c |
+| `+0x948`/`94c`/`950`/`954`/`958`/`95c` | float | **player HIT box edges** Xmin/Ymin/Zmin/Xmax/Ymax/Zmax (recomputed each frame = center `+0x930/4/8` ∓ the half-extents below) | built @26365-26370; tested by FUN_0043e260:25995 |
+| `+0x990`/`994`/`998` | float | **HIT box half-extents** X / Y / Z (init `cfg[0xc]/2`, `cfg[0xc]/2`, `5.0` @27388-27390; cfg = `DAT_00575948`). Also used directly by the rotated-frame LASER test FUN_0043e6b0:26099. ⚠️ coop.c mislabels `0x994` as `OFF_SPD_UNF` (speed) — it's the hit half-Y. | 26099/26365-69; 27388 |
+| `+0x960`/`964`/`96c`/`970` | float | **player GRAZE box edges** (recomputed = center ∓ the graze half-extent; the graze TEST adds a further +20px) | built @26372-26375; FUN_0043e3b0:26035 |
+| `+0x99c`/`9a0` | float | **GRAZE box half-extents** (init `cfg[0x10]/2` @27391). ⚠️ coop.c mislabels `0x9a0` as `OFF_SPD_FOC`. | 26372-75; 27391 |
 | `+0x9b4`/`9b8`, `+0x9c0`/`9c4` | float | option offsets (relative to player) | 27267-27271 |
 | `+0x16a00` | u32 | invuln-counter target/sentinel (`0xfffffc19` = -999) for FUN_0043958d | FUN_00441330:26891 |
 | `+0x16a04` | int | invuln-counter fractional carry | 26890; FUN_0043958d @26957 |
@@ -120,12 +122,19 @@ param-relative (so P2's shots live in P2's clone — coop.c relies on this).
   radius — the bullet/contact leaf `FUN_0043e260` (25995-25998) compares the bullet
   against hit-box edges `+0x948`(L)/`+0x94c`(T)/`+0x954`(R)/`+0x958`(B); the graze
   leaf `FUN_0043e3b0` (26035-26039) uses the wider `+0x960/+0x964/+0x96c/+0x970`
-  box (hit box +20px each side). These edges are recomputed each frame from the
-  player center ± the .sht-derived half-extent; the raw half-extent input field is
-  still the open part (coop.c’s old `OFF_HITBOX 0x23f8` was a MISLABEL — that field
-  is the death/deathbomb timer, see `th07_player_shot_bomb_system.md` §5). P2
-  collision works via the param-relative leaves regardless.
-- Focus-mode flag and the power-shot level field are not yet located.
+  box. The edges are recomputed each frame (`FUN_00441fb0` body @26365-26375)
+  from the player center (`+0x930/4/8`) ∓ the **half-extents**: hit = `+0x990`(X)/
+  `+0x994`(Y)/`+0x998`(Z), graze = `+0x99c`/`+0x9a0`. Init @27388-27392 from the
+  `DAT_00575948` config (`cfg[0xc]/2` for hit X&Y, `5.0` for Z, `cfg[0x10]/2` for
+  graze). The rotated-frame LASER test `FUN_0043e6b0` (@26099) uses `+0x990/+0x994`
+  directly. ⇒ the raw half-extent fields are now LOCATED; coop.c's old
+  `OFF_HITBOX 0x23f8` was a death-timer mislabel (`th07_player_shot_bomb_system.md`
+  §5). **⚠️ coop.c also mislabels `+0x994`/`+0x9a0` as `OFF_SPD_UNF`/`OFF_SPD_FOC`
+  (speed)** — the box-build proves they're the hit/graze half-extents; the real
+  movement-speed field is then unconfirmed (coop.c's full-clone SpawnP2 copies both
+  regardless, so its behaviour is unaffected). Confirm before reusing those names.
+- Focus-mode flag = `+0x240b` (✅, `th07_player_shot_bomb_system.md` §2); the
+  power-shot level field is not yet located.
 - ~~Whether `FUN_00441fb0`'s sub-calls pass `ECX = the cloned P2`~~ ✅ **RESOLVED
   (2026-06-12, disasm + in-game):** all sub-calls (incl. movement `FUN_0043ee50`)
   pass ECX = the saved player, so they DO drive the P2 clone (handoff §5d).

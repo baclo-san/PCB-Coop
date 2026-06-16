@@ -522,6 +522,24 @@ typedef int (__fastcall *ItemSpawnFn_t)(void *self, void *edx,
 #define ADDR_ITEM_SPAWN ((ItemSpawnFn_t)0x004326f0)
 #define ITEM_TYPE_1UP   5
 static volatile void *s_itemMgr = NULL;
+static ItemSpawnFn_t  s_origItemSpawn = NULL;   /* trampoline for the detour below */
+
+/* B2 — full-power -> cherry transform gated on BOTH players.
+ * The spawner FUN_004326f0 rewrites a power item (type 0/2) to a cherry item
+ * (type 7) when round(P1 power) > 0x7f (PCBdecomp.c:20255 — it rounds P1's power
+ * off the x87 stack the caller left). That starves a non-full P2 of its only power
+ * source. We can't pre-empt the x87 read, but the conversion ITSELF is the signal
+ * that P1 was full: if we asked for a power item and got back a cherry item, P1 is
+ * maxed. So when P2 has separate resources, is live, and is NOT yet full, revert the
+ * slot to the power item it should have been. Determinism-safe (keys off s_p2Power,
+ * identical on both netplay machines; no RNG). F7 is taken; toggle is compile-time
+ * ON (s_p2PowerGate) with a NET-safe default. */
+static int s_p2PowerGate = 1;
+static int s_powerGateLogged = 0;
+#define ITEM_OFF_TYPE   0x27c     /* u8  item type (collect switch reads this)       */
+#define ITEM_OFF_SPRID  0x1d8     /* u16 sprite/anm id = type + 0x2c4                 */
+#define ITEM_SPR_BASE   0x2c4
+#define ITEM_TYPE_CHERRY 7
 
 /* Tier-1: scale enemy/boss HP cap by the active player count. On by default;
  * only takes effect while P2 is live (factor = 1 + (s_p2 != NULL)). F5 toggles. */
@@ -2106,6 +2124,30 @@ static void __fastcall HookedItemLoop(void *self)
     RestoreHeldRes();
 }
 
+/* B2 — keep power items as power when only P1 is full (see the note at s_p2PowerGate). */
+static int __fastcall HookedItemSpawn(void *self, void *edx, float *pos, int type, int mode)
+{
+    int slot = s_origItemSpawn(self, edx, pos, type, mode);
+    /* Engine maxed-power auto-convert: an intended power item (0/2) handed back as a
+     * cherry item (7) means P1 is full. Revert it for a live, separate-resource P2
+     * that is NOT yet full, so its only power source isn't stolen. */
+    if (slot && s_p2PowerGate && s_p2SepRes && s_p2 && !s_p2Ghost &&
+        (type == 0 || type == 2) &&
+        *(unsigned char *)(slot + ITEM_OFF_TYPE) == ITEM_TYPE_CHERRY &&
+        s_p2Power < 127.5f) {
+        *(unsigned char *)(slot + ITEM_OFF_TYPE)  = (unsigned char)type;
+        *(unsigned short *)(slot + ITEM_OFF_SPRID) = (unsigned short)(type + ITEM_SPR_BASE);
+        /* NOTE: the anm sprite was already bound to the cherry script by the spawner
+         * (FUN_0044ea20). We deliberately do NOT re-bind: that fn is __thiscall(ECX=anm
+         * mgr, sprite_obj, script) and re-calling it would double-count the mgr's
+         * active-sprite counter (mgr+8). So the reverted item COLLECTS as power
+         * (gameplay-correct, the actual fix) but may still ANIMATE as a cherry item
+         * until a proper re-bind is verified in-game. Cosmetic only. */
+        if (!s_powerGateLogged) { Log("B2: kept power item (P1 full, P2 %.0f) -> power", s_p2Power); s_powerGateLogged = 1; }
+    }
+    return slot;
+}
+
 /* ---- suppress P2's bomb-declaration portrait (different-char P2) ----
  * The bomb spell declaration shows the GLOBAL char's face from data/face_*00.anm
  * (loaded once for P1's char at stage start). For a DIFFERENT-char P2 that face
@@ -3063,6 +3105,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_FRAME_TASK,     (LPVOID)&HookedFrameTask,     (LPVOID*)&s_origFrameTask)     != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
+    if (MH_CreateHook((LPVOID)ADDR_ITEM_SPAWN, (LPVOID)&HookedItemSpawn, (LPVOID*)&s_origItemSpawn)     != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
     if (MH_CreateHook(ADDR_MENU_DISPATCH,  (LPVOID)&HookedMenuDispatch,  (LPVOID*)&s_origMenuDispatch)  != MH_OK) return 0;
     if (MH_CreateHook(ADDR_HUD_DRAW,       (LPVOID)&HookedHudDraw,       (LPVOID*)&s_origHudDraw)       != MH_OK) return 0;
@@ -3088,6 +3131,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_FRAME_TASK)     != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLECT_OVERLAP)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_ITEM_LOOP)      != MH_OK) return 0;
+    if (MH_EnableHook((LPVOID)ADDR_ITEM_SPAWN) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;
     if (MH_EnableHook(ADDR_MENU_DISPATCH)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_HUD_DRAW)       != MH_OK) return 0;

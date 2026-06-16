@@ -1929,3 +1929,35 @@ refactor the anm swap or the menu FSM. Build with `powershell -File build.ps1`
 and confirm `th07_coop.dll` stays 32-bit (machine 0x014C). Commit incrementally
 with clear messages; leave the tree clean. Anything needing live verification:
 implement + document what to test, don't mark it done.
+
+### 5p — Gameplay-bug backlog pass (2026-06-16, unattended; PR #5)
+Worked `docs/th07_coop_gameplay_bugs.md` (local-co-op bug list). No game this
+session — fixes are reasoned + compile-verified (6 targets, 32-bit; native merge
+test green; CI green), NOT play-tested. **Branch `claude/quirky-heisenberg-znrauh`,
+PR #5.** Full per-bug detail (with the RE) lives in the bugs doc; summary:
+
+- **D1 — no free revives** (DONE): `ReviveByGraze` now needs a spare extend; the
+  last-life-death 1up drop is kept (user-confirmed).
+- **B1 — point-item extend shared** (DONE): mirrored to the partner via the
+  extend-tier counter `res+0x2c` (the 1up *item* doesn't bump it), through the
+  existing collect-time field-swap. FPU-safe.
+- **B3 — P2 autocollect** (DONE): `ApplyP2Autocollect` replicates ZUN's P1-only
+  line-cross / Extra trigger for P2 (sets item homing-mode `+0x27f=1` for items P2
+  is nearer to; existing nearer-player homing carries them in).
+- **B4 — P2 bomb clears bullets** (DONE): bomb clear = per-player region array
+  `player+0x17dc` (tested by `FUN_0043e0a0` inside the bullet hit test coop already
+  re-invokes for P2). `HookedAddClearCircle/Box` force ECX→P2 in P2's update window
+  so P2's bomb fills `P2+0x17dc`. Mechanism now mapped in `th07_player_struct.md`.
+- **B2 — full-power→cherry gate** (DEFERRED): blocked by a **new hazard** —
+  `FUN_004326f0` (item spawner) and `FUN_0042d83a` (extend) read the x87 **ST0** their
+  caller pushed, so a MinHook C detour can't wrap-and-forward them. Routes documented.
+- **B5 — boss invul-during-spell for P2 bomb** (DEFERRED): `+0x1fbac` is the BOSS
+  spell index (`FUN_00429a4f`); `DAT_012fe0c8` = boss-spell-active. The real gate is
+  in the boss-damage path and P2's bomb-damage route isn't confirmed to pass through
+  `FUN_0043d9e0`, so the fallback wasn't shipped blind. Lead documented.
+- **C1/C2 — crashes** (need repro): hit-path identity logging plan in the doc.
+
+**⚠️ Reusable hazard for the next session:** never C-hook a fn that reads the x87
+`ST0` set by its caller (`FUN_004326f0`, `FUN_0042d83a`, `FUN_0048b8a0` itself) — the
+detour clobbers ST0 before the trampoline runs. Use a side-channel (B1's tier counter)
+or a binary patch / `fldz`-guarded forward instead.

@@ -1984,8 +1984,15 @@ static int __fastcall HookedCollideBullet(void *self, void *edx, float *pos, flo
     int r = (isP1 && s_p1Ghost) ? 0                       /* ghost P1: untouchable */
           : s_origCollideBullet(self, edx, pos, size);    /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2))
-        s_origCollideBullet(p2, edx, pos, size);          /* P2 — param-relative */
+    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
+        int r2 = s_origCollideBullet(p2, edx, pos, size); /* P2 — param-relative */
+        /* The hit leaf returns 2 when the bullet sits in the player's BOMB-clear
+         * field (FUN_0043e0a0 reads player+0x17dc, which P2's bomb populates
+         * param-relatively). Propagate ONLY that clear so P2's bomb cancels bullets
+         * (B4). A player HIT (1) must NOT be propagated — it already drove P2's death
+         * FSM inside the call, and bullets don't despawn on hitting a player. */
+        if (r == 0 && r2 == 2) r = 2;
+    }
     return r;
 }
 
@@ -2014,7 +2021,12 @@ static int __fastcall HookedGraze(void *self, void *edx, float *pos, float *size
     void *p2 = (void *)s_p2;
     if (p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
         int r2 = s_origGraze(p2, edx, pos, size);          /* P2 — param-relative */
-        if (r == 0 && r2 == 1) r = 1;   /* P2 grazed -> mark bullet grazed so its hit test runs */
+        /* Leaf returns: 0 nothing, 1 grazed, 2 cleared-by-bomb-field. Take the
+         * stronger outcome (2 > 1 > 0): P2 grazing (1) flags the bullet so its hit
+         * test runs against P2; P2's bomb field (2) cancels the bullet outright (B4 —
+         * FUN_0043e3b0 also calls FUN_0043e0a0 on player+0x17dc, which P2's bomb fills
+         * param-relatively). Clear outranks graze. */
+        if (r2 > r) r = r2;
     }
     return r;
 }

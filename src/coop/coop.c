@@ -219,6 +219,10 @@
  * shots flow through P1's array (shot transfer), so the divisor halves the
  * TEAM's doubled DPS back to vanilla pacing. See docs/th07_boss_hp_scaling.md §5. */
 #define ADDR_DAMAGE ((LPVOID)0x0043d9e0) /* __thiscall(player, pos, size, outf) */
+/* Difficulty / stage rank: 0 Easy .. 3 Lunatic, 4 Extra, 5 Phantasm (DAT_0062f85c;
+ * the engine gates the Extra/Phantasm damage reductions on 4 and 5 at PCBdecomp.c
+ * 12849/12853). Used by the B5 P2-bomb boss-invuln gate. */
+#define ADDR_DIFFICULTY ((volatile int *)0x0062f85c)
 
 /* __thiscall modelled as __fastcall: ECX=this, EDX=unused, rest on stack.
  * Stack-arg count + order match, so callee stack cleanup (ret N) matches too. */
@@ -2246,6 +2250,23 @@ static int __fastcall HookedDamage(void *self, void *edx,
     if (s_bossHpScale && s_p2 && r > 0) {
         r = (int)(r * 0.6f);                 /* 2P team DPS damper (was /2) */
         if (r == 0) r = 1;
+    }
+
+    /* B5: Extra/Phantasm boss invincibility during a bomb. ZUN gates ALL shot
+     * damage on DAT_004d44f8==0 (= P1 NOT bombing; PCBdecomp.c:12829), so during
+     * P1's bomb the boss takes nothing — its "invincible spell form". P2's bomb
+     * never sets that P1-base flag, so the boss kept taking P1+P2 shot damage
+     * during a P2 bomb, cheesing Extra/Phantasm spells. Mirror P1 by zeroing the
+     * sweep's damage while P2 is bombing (the sweep already ran above, so shots
+     * are still consumed + sparked, exactly like ZUN's gate which blocks only the
+     * APPLY, not the sweep). Scoped to Extra/Phantasm (4/5) to leave normal-stage
+     * pacing untouched. This is the user's accepted fallback ("full boss invuln
+     * during P2 bomb"); reproducing P1's exact transform is left as a follow-up. */
+    if (r > 0 && (uint32_t)self == ADDR_PLAYER_BASE && p2 && !s_p2Ghost) {
+        int diff = *ADDR_DIFFICULTY;
+        if ((diff == 4 || diff == 5) &&
+            *(volatile int *)((char *)p2 + OFF_BOMBING) != 0)
+            r = 0;
     }
     return r;
 }

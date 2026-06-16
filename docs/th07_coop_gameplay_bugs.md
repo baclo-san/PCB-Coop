@@ -186,16 +186,18 @@ force ECX to P2 (re-call with the P2 base) — small, safe, mirrors the existing
 collision re-invoke pattern. No global over-clear, no FPU.
 
 ### ⏸ B5 — P2 bomb doesn't trigger boss invincible-spell form — NEEDS RE + TEST
-RE this session: the "is a player spell/bomb active" predicate `FUN_0042ad66`
-(@0x0042ad66) reads the **shared** resource struct field `res+0x1fbac` (the active
-spell-card index; set to a spell id when a spell declares — PCBdecomp.c:16184 — and to
--1 when it ends — 16102/16132; `FUN_0042ad66` returns "active" when `>=0` or `==-2`).
-Because it's the SHARED struct, B5 is NOT simply a P1-keyed read. So the next step is to
-determine **whether P2's bomb launch actually declares a spell** (sets `res+0x1fbac`)
-the way P1's does — i.e. does the bomb path call the spell-declare fn (~PCBdecomp.c:16170,
-which writes `+0x1fbac = param_2`)? If P2's bomb sets it, the boss SHOULD go invincible
-already and B5 may be a different gate (the boss's own per-spell invincibility flag, or
-the damage path); if it does NOT, mirror the declare for P2.
+RE this session (corrects an earlier guess): `+0x1fbac` is the **BOSS** spell-card
+index, not the player bomb — `FUN_00429a4f` @0x00429a4f `__thiscall(scoreMgr, spellIdx)`
+declares a boss spell (writes `+0x1fbac = spellIdx`, resets the 900-dword spell-bonus
+block); cleared to -1 at spell end (16102/16132). `FUN_0042ad66` @0x0042ad66 reports
+"a spell is active" off this. So the boss invincibility tied to spells is keyed to the
+**boss's** state, and B5 ("P2 bomb doesn't make the boss go invincible") is most likely
+in **how the player bomb signals the boss damage path** — i.e. a "player is bombing →
+deny boss damage during this spell" gate that reads P1's bomb (`FUN_0042ad66` with
+ECX=P1, or `P1+0x16a20`) but not P2's. Next: find where boss/enemy damage
+(`FUN_0043d9e0` / the enemy damage-apply `FUN_00420620`) is suppressed during a spell
+while bombing, and check whether it consults P2's bomb. That gate is the real fix
+point; mirror it for P2 (`P2+0x16a20`).
 
 The user-accepted fallback ("full boss invul during P2 bomb") is implementable in
 `HookedDamage` (P2+0x16a20 bombing && enemy flags&0x40 boss && difficulty>3 ⇒ return 0

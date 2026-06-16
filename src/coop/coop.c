@@ -87,7 +87,8 @@
  *   (FUN_0043eb90) fires every 6 frames for authentic graze SFX/spark feedback
  *   — with its stat effects (graze counters/score/bonus accumulator)
  *   snapshot-restored so nothing rises. The revive DONATES one of the
- *   survivor's lives — or is FREE when the survivor has no spare extends.
+ *   survivor's lives; with NO spare extend the revive cannot fire (D1,
+ *   user-confirmed 2026-06-16 — no free revives).
  *   Revive values: NO bonus lives (0 spares), bombs = the stock held at death,
  *   power = whatever the normal death drop left. Dying on the LAST life drops
  *   a guaranteed 1-UP at the death spot (tracked last-alive position; ZUN's
@@ -1816,6 +1817,10 @@ static void ReviveByGraze(void *ghost, void *reviver, int reviverIsP1,
             GrazeFeedback(reviver, (float *)((char *)ghost + OFF_POS_X));
         s_reviveFrames++;
         if (s_reviveFrames >= REVIVE_FRAMES && focusRelease) {
+            /* D1 (user-confirmed): NO free revive — the reviver must have a spare
+             * extend to spend. Without one, the confirm does nothing and the
+             * channel stays charged so the revive fires the instant they earn a
+             * life. (The last-life-death 1up drop is unaffected — kept.) */
             if (reviverIsP1) {
                 uint32_t res = *ADDR_RES_PTR;
                 if (res && *(float *)(res + RES_LIVES) >= 1.0f) {
@@ -1823,20 +1828,21 @@ static void ReviveByGraze(void *ghost, void *reviver, int reviverIsP1,
                     ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON); /* re-heal checksum */
                     Log("revive: P1 donated a life (%.0f spare left)",
                         *(float *)(res + RES_LIVES));
+                    ReviveP2();
+                    s_reviveFrames = 0;
                 } else {
-                    Log("revive: P1 has no spare extends -> free revive");
+                    Log("revive: P1 has no spare life -> cannot revive (D1)");
                 }
-                ReviveP2();
             } else {
                 if (s_p2Lives >= 1.0f) {
                     s_p2Lives -= 1.0f;
                     Log("revive: P2 donated a life (%.0f spare left)", s_p2Lives);
+                    ReviveP1();
+                    s_reviveFrames = 0;
                 } else {
-                    Log("revive: P2 has no spare extends -> free revive");
+                    Log("revive: P2 has no spare life -> cannot revive (D1)");
                 }
-                ReviveP1();
             }
-            s_reviveFrames = 0;
         }
     } else {
         s_reviveFrames = 0;
@@ -2056,8 +2062,54 @@ static void RestoreHeldRes(void)
         ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);       /* re-heal for the restored P1 state */
 }
 
+/* B1 — point-item EXTEND mirrored to the partner.
+ * A point-item threshold extend (PCBdecomp.c case 1, FUN_0042d83a inside the
+ * `+0x2c < +0x30` loop) bumps the extend-TIER counter res+0x2c and grants a
+ * life-or-bomb to whoever collected the triggering point item (the engine writes
+ * the resource struct, which the swap routes to the collector). B1: that extend
+ * should go to BOTH players. We detect it by the tier delta — the 1up ITEM
+ * (case 5) calls FUN_0042d83a WITHOUT touching res+0x2c, so it stays
+ * collector-specific (correct). The extend fn reads x87 ST0 set by its caller, so
+ * it CANNOT be C-hooked (a detour clobbers ST0 before the trampoline reads it);
+ * the tier-delta route is FPU-safe and reuses the existing swap.
+ *
+ * Must run while the triggering item's swap is still in place (BEFORE the next
+ * RestoreHeldRes) so s_p2ResHeld names the collector. The partner gets the extend
+ * appropriate to ITS OWN state (life if <8, else a bomb if <8 — ZUN's overflow). */
+#define COOP_MAX_LIVES 8.0f
+#define COOP_MAX_BOMBS 8.0f
+#define RES_EXTEND_TIER 0x2c
+static int s_lastExtendTier = -1;
+
+static void CheckPartnerExtend(void)
+{
+    uint32_t res = *ADDR_RES_PTR;
+    if (!res) return;
+    int tier = *(int *)(res + RES_EXTEND_TIER);
+    if (s_lastExtendTier < 0) { s_lastExtendTier = tier; return; }
+    if (tier > s_lastExtendTier && s_p2 && s_p2SepRes) {
+        int n = tier - s_lastExtendTier;
+        for (; n > 0; n--) {
+            if (s_p2ResHeld) {
+                /* P2 collected -> already credited to P2; mirror to P1 (its saved
+                 * values, written back + checksum-healed by RestoreHeldRes). */
+                if (s_heldP1Lives < COOP_MAX_LIVES)      s_heldP1Lives += 1.0f;
+                else if (s_heldP1Bombs < COOP_MAX_BOMBS) s_heldP1Bombs += 1.0f;
+            } else {
+                /* P1 collected -> already credited to P1; mirror to P2. */
+                if (s_p2Lives < COOP_MAX_LIVES)      s_p2Lives += 1.0f;
+                else if (s_p2Bombs < COOP_MAX_BOMBS) s_p2Bombs += 1.0f;
+            }
+        }
+        Log("B1: point-item extend mirrored to partner (%s collected, tier=%d)",
+            s_p2ResHeld ? "P2" : "P1", tier);
+    }
+    s_lastExtendTier = tier;
+}
+
 static int __fastcall HookedCollectOverlap(void *self, void *edx, float *pos, float *size)
 {
+    CheckPartnerExtend();                              /* B1: mirror the prev item's extend */
     RestoreHeldRes();                                  /* undo the previous item's P2 swap */
 
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
@@ -2085,13 +2137,73 @@ static int __fastcall HookedCollectOverlap(void *self, void *edx, float *pos, fl
     return r;
 }
 
+/* B3 — P2 autocollect above the point-of-collection line.
+ * ZUN's per-item autocollect trigger (FUN_00432990, PCBdecomp.c:20391) sets an item
+ * to homing-mode when `(P1 full power || Extra/Phantasm) && (P1_Y < line)`, keyed to
+ * P1 ONLY — so P2 never vacuums items by going up top, even on Extra. We replicate
+ * the SAME gate for P2: when P2 is above the line and (P2 full power || difficulty
+ * > Lunatic), set the homing-mode byte on each active item for which P2 is the nearer
+ * player. The engine's next-frame homing then carries it in, and HookedAngleToPlayer
+ * already redirects the homing target to the nearer player (so it lands on P2). We
+ * only ever WRITE the mode byte (no FPU, no RNG) -> determinism- and tamper-safe.
+ * (The full-power half is per-player only with s_p2SepRes on; otherwise P2 shares
+ * P1's power, in which case the engine's own P1 trigger already covers it.) */
+#define ADDR_GAME_CFG_PP ((volatile uint32_t *)0x00575948) /* -> config; +0x20 = collect line Y */
+#define ADDR_DIFFICULTY  ((volatile uint32_t *)0x00626280) /* 0..3 main, 4 Extra, 5 Phantasm    */
+#define ITEM_STRIDE      0x288
+#define ITEM_OFF_POSX    0x24c
+#define ITEM_OFF_POSY    0x250
+#define ITEM_OFF_ACTIVE  0x27d
+#define ITEM_OFF_MODE    0x27f      /* 0 pop-fall, 1 homing, 2 scatter */
+#define ITEM_COUNT       1100
+#define COOP_FULL_POWER  128.0f
+static int s_p2Autocollect = 1;     /* B3: P2 line-cross / Extra autocollect (default on) */
+
+static void ApplyP2Autocollect(void *mgr)
+{
+    void *p2 = (void *)s_p2;
+    if (!s_p2Autocollect || !p2 || s_p2Ghost || !mgr) return;
+
+    uint32_t cfg = *ADDR_GAME_CFG_PP;
+    if (!cfg) return;
+    float line = *(float *)(cfg + 0x20);
+    int   diff = (int)*ADDR_DIFFICULTY;
+
+    char *pp = (char *)p2, *p1 = (char *)ADDR_PLAYER_BASE;
+    float p2y  = *(float *)(pp + OFF_POS_Y);
+    float p2pw = s_p2Power;
+    if (!s_p2SepRes) {                            /* shared power: P1's trigger already covers it */
+        uint32_t res = *ADDR_RES_PTR;
+        p2pw = res ? *(float *)(res + RES_POWER) : 0.f;
+    }
+    /* same shape as ZUN's gate, for P2 */
+    if (!((p2pw >= COOP_FULL_POWER || diff > 3) && p2y < line)) return;
+
+    float ax = *(float *)(p1 + OFF_POS_X), ay = *(float *)(p1 + OFF_POS_Y);
+    float bx = *(float *)(pp + OFF_POS_X), by = p2y;
+    int i;
+    for (i = 0; i < ITEM_COUNT; i++) {
+        char *it = (char *)mgr + i * ITEM_STRIDE;
+        if (*(unsigned char *)(it + ITEM_OFF_ACTIVE) == 0) continue;
+        unsigned char mode = *(unsigned char *)(it + ITEM_OFF_MODE);
+        if (mode == 1 || mode == 2) continue;     /* already homing / scattering */
+        float ix = *(float *)(it + ITEM_OFF_POSX), iy = *(float *)(it + ITEM_OFF_POSY);
+        float d1 = (ax - ix) * (ax - ix) + (ay - iy) * (ay - iy);
+        float d2 = (bx - ix) * (bx - ix) + (by - iy) * (by - iy);
+        if (d2 < d1)                              /* P2 is the nearer player -> vacuum to P2 */
+            *(unsigned char *)(it + ITEM_OFF_MODE) = 1;
+    }
+}
+
 /* Bracket the item-update loop so the LAST collected item's P2 swap is undone
  * before anything outside the loop reads the shared resources. */
 static void __fastcall HookedItemLoop(void *self)
 {
     s_itemMgr = self;                   /* captured for DropOneUp */
     s_origItemLoop(self);
+    CheckPartnerExtend();               /* B1: catch the last item's extend (swap still in) */
     RestoreHeldRes();
+    ApplyP2Autocollect(self);           /* B3: P2 line-cross / Extra autocollect */
 }
 
 /* ---- suppress P2's bomb-declaration portrait (different-char P2) ----

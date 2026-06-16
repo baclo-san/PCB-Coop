@@ -87,7 +87,8 @@
  *   (FUN_0043eb90) fires every 6 frames for authentic graze SFX/spark feedback
  *   — with its stat effects (graze counters/score/bonus accumulator)
  *   snapshot-restored so nothing rises. The revive DONATES one of the
- *   survivor's lives — or is FREE when the survivor has no spare extends.
+ *   survivor's lives; with no spare life the partner CANNOT be revived (D1,
+ *   user-confirmed — no free revive). The last-life death still drops a 1up.
  *   Revive values: NO bonus lives (0 spares), bombs = the stock held at death,
  *   power = whatever the normal death drop left. Dying on the LAST life drops
  *   a guaranteed 1-UP at the death spot (tracked last-alive position; ZUN's
@@ -1896,6 +1897,9 @@ static void ReviveByGraze(void *ghost, void *reviver, int reviverIsP1,
             GrazeFeedback(reviver, (float *)((char *)ghost + OFF_POS_X));
         s_reviveFrames++;
         if (s_reviveFrames >= REVIVE_FRAMES && focusRelease) {
+            /* D1 (user-confirmed): no FREE revive — you may only revive a partner
+             * if you have a spare life to spend (the EoSD rule). The last-life 1up
+             * drop on death stays (it's in EnterGhostP1/P2, independent of this). */
             if (reviverIsP1) {
                 uint32_t res = *ADDR_RES_PTR;
                 if (res && *(float *)(res + RES_LIVES) >= 1.0f) {
@@ -1903,18 +1907,18 @@ static void ReviveByGraze(void *ghost, void *reviver, int reviverIsP1,
                     ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON); /* re-heal checksum */
                     Log("revive: P1 donated a life (%.0f spare left)",
                         *(float *)(res + RES_LIVES));
+                    ReviveP2();
                 } else {
-                    Log("revive: P1 has no spare extends -> free revive");
+                    Log("revive: P1 has no spare extend -> cannot revive (D1)");
                 }
-                ReviveP2();
             } else {
                 if (s_p2Lives >= 1.0f) {
                     s_p2Lives -= 1.0f;
                     Log("revive: P2 donated a life (%.0f spare left)", s_p2Lives);
+                    ReviveP1();
                 } else {
-                    Log("revive: P2 has no spare extends -> free revive");
+                    Log("revive: P2 has no spare extend -> cannot revive (D1)");
                 }
-                ReviveP1();
             }
             s_reviveFrames = 0;
         }

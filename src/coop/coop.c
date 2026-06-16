@@ -566,6 +566,7 @@ static char  s_dir[MAX_PATH];
 
 static int   s_readyFrames = 0;        /* consecutive P1-update frames seen        */
 static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch               */
+static int   s_suppressP2  = 0;        /* DIAGNOSTIC: never spawn P2 (desync isolation) */
 #define AUTO_SPAWN_AFTER 30            /* frames of P1 in state 0 after the stage
                                           fly-in, then spawn P2 (user: both players
                                           up together at stage start) */
@@ -823,13 +824,17 @@ static int P1Ready(void)
  * P2 word; the swap mechanism below is exactly what the netcode will drive. */
 static int Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
+/* P2 local-coop binds: WASD move (left hand), right hand on the actions.
+ * WASD chosen over IJKL per player feedback ("WASD is free real estate"). P1 uses
+ * arrows+Z/X/Shift, so W/A/D don't collide; S/D do alias menu keys (0x400/0x2000)
+ * but gameplay reads only the low 9 bits, and the menu pass is overridden per-player. */
 static uint16_t ReadP2InputLocal(void)
 {
     uint16_t w = 0;
-    if (Down('I'))      w |= IN_UP;
-    if (Down('K'))      w |= IN_DOWN;
-    if (Down('J'))      w |= IN_LEFT;
-    if (Down('L'))      w |= IN_RIGHT;
+    if (Down('W'))      w |= IN_UP;
+    if (Down('S'))      w |= IN_DOWN;
+    if (Down('A'))      w |= IN_LEFT;
+    if (Down('D'))      w |= IN_RIGHT;
     if (Down(VK_SPACE)) w |= IN_SHOOT;
     if (Down('U'))      w |= IN_FOCUS;
     if (Down('O'))      w |= IN_BOMB;
@@ -955,6 +960,12 @@ static void LoadNetConfig(void)
      * intended co-op look; set proximity_fade=0 in coop.ini to disable. */
     s_proxFade = (int)GetPrivateProfileIntA("coop", "proximity_fade", 1, ini);
     s_disableDemo = (int)GetPrivateProfileIntA("coop", "disable_demo", 1, ini);
+    /* DIAGNOSTIC: suppress the P2 entity entirely (no auto-spawn, F9 no-ops). Lets a
+     * netplay run test whether the residual sim-determinism desync (handoff §8m) comes
+     * from the grafted P2 entity: set suppress_p2=1 on BOTH machines — if the RNG
+     * counter then stays locked, P2's graft is the culprit; if it still desyncs, the
+     * cause is engine-side / a hook. Default 0. */
+    s_suppressP2 = (int)GetPrivateProfileIntA("coop", "suppress_p2", 0, ini);
     s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
     if (!s_netEnabled) return;
     GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);
@@ -1553,6 +1564,7 @@ static void ApplyP2Selection(void *p2)
 
 static void SpawnP2(void)
 {
+    if (s_suppressP2) { Log("spawn: SUPPRESSED (coop.ini suppress_p2=1, desync test)"); return; }
     if (s_p2) return;                       /* already spawned */
     if (!P1Ready()) { Log("spawn: P1 not ready (no char loaded) — ignored"); return; }
 
@@ -3015,10 +3027,10 @@ static void ResetCoopSession(void)
 static uint16_t ReadP2MenuInput(void)
 {
     uint16_t w = 0;
-    if (Down('I'))      w |= 0x10;          /* up    */
-    if (Down('K'))      w |= 0x20;          /* down  */
-    if (Down('J'))      w |= 0x40;          /* left  */
-    if (Down('L'))      w |= 0x80;          /* right */
+    if (Down('W'))      w |= 0x10;          /* up    */
+    if (Down('S'))      w |= 0x20;          /* down  */
+    if (Down('A'))      w |= 0x40;          /* left  */
+    if (Down('D'))      w |= 0x80;          /* right */
     if (Down(VK_SPACE)) w |= MENU_CONFIRM;  /* confirm */
     if (Down('O'))      w |= MENU_CANCEL;   /* cancel  */
     return w;
@@ -3265,15 +3277,15 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         { char *s = strrchr(s_dir, '\\'); if (s) s[1] = '\0'; }
         { char p[MAX_PATH]; snprintf(p, sizeof(p), "%scoop_log.txt", s_dir); s_log = fopen(p, "w"); }
         Log("th07_coop attached. Menu char-select: P1 picks, then P2 picks with "
-            "IJKL move / Space confirm / O cancel; game starts after both. AUTO-spawn "
-            "P2 ~3s into the stage. In-stage P2: IJKL move, Space shot, U focus, O bomb. "
+            "WASD move / Space confirm / O cancel; game starts after both. AUTO-spawn "
+            "P2 ~3s into the stage. In-stage P2: WASD move, Space shot, U focus, O bomb. "
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
-        Log("*** DIAGNOSTIC BUILD v5 (det-trace): buffer is clean (v4 detectors "
-            "silent) so now logs the WIRE itself — 'WIRE SEND frame=F key0=V' and "
-            "'WIRE RECV pkt=P slot=S val=V' for non-zero inputs. Diff host vs guest: "
-            "a RECV bit with no matching peer SEND = corruption in transit/recv. ***");
+        Log("*** DIAGNOSTIC BUILD v6: epoch fix resolved the INPUT desync; residual is "
+            "SIM-side (identical input, RNG counter splits — §8m). Set coop.ini [coop] "
+            "suppress_p2=1 on BOTH machines to test whether the grafted P2 entity is the "
+            "cause (counter stays locked => yes). P2 binds moved IJKL->WASD. ***");
         LoadNetConfig();
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */

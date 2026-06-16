@@ -1921,6 +1921,46 @@ across the whole stage and the RNG counter to stay locked through Letty and beyo
 > stage 1 — still tracked in `docs/th07_coop_gameplay_bugs.md`, unrelated to this transport
 > fix.
 
+### §8n — epoch fix CONFIRMED for transport; RESIDUAL desync is SIM-side (2026-06-16)
+
+The 2-PC re-test of the epoch build (delay=2; guest logged `EPOCH DROP` ×3 — the fix is
+live and catching the stale menu packets). **The input transport is now clean:** diffing
+the two stage traces shows **zero P2-input disagreements** (`host.rcvKey == guest.selfKey`
+every frame) and **`merged` identical on both** at the first divergence. §8m's contamination
+is gone.
+
+**But the run still desynced** (user reached Cirno with different power on each machine).
+The det-trace pins a *new, different* class of bug:
+- Frames are **byte-identical** (same seed AND counter) up to **netFrame 625**, then at
+  **626** — with **identical merged input `0081`**, P2 idle, P2 power 0 on both — the guest
+  makes **24 more RNG calls** than the host (host ctr 64 → seed `727e`; guest ctr 88 → seed
+  `bb83`). So **identical input now produces different RNG consumption** ⇒ a *simulation*
+  determinism divergence, not transport.
+- Vanilla PCB is cross-machine deterministic (its replays are), so the cause is in **our
+  additions** — overwhelmingly the **grafted P2 entity** (the one non-vanilla sim object).
+  Two corroborating signals: the divergence is byte-identical for 625 frames then tips at a
+  discrete event (a slow-accumulating float/state difference crossing an RNG-gated branch,
+  e.g. an item-drop `Rng_Next32()%100<=cherryRatio` roll), and the P2 clone lives at
+  **different addresses** on the two machines (host `res=0x029e79d0` vs guest `0x001e1338`)
+  — any logic keyed on that pointer/order diverges.
+- **Strong mechanism lead: the x87 ST0 / FPU hook hazard** documented in
+  `docs/th07_coop_gameplay_bugs.md` (nightshift). Several ZUN resource/damage/item fns read
+  values off the x87 stack the *caller* pushed; a non-FP-safe C hook (`HookedDamage` on
+  `FUN_0043d9e0`, the collect/item hooks) can leave the x87 stack/control word perturbed,
+  making ZUN's FP — hence damage/positions/item rolls — diverge.
+
+**Diagnostic shipped (v6): `coop.ini [coop] suppress_p2=1`** (gates `SpawnP2`, auto + F9).
+Run a 2-PC test with `suppress_p2=1` on BOTH machines (P1-only co-op-less netplay):
+- **Counter stays locked the whole stage ⇒ the P2 entity graft is the determinism culprit**
+  → next: audit P2's update for FP-stack safety (wrap hooks with `fnsave`/`frstor` or
+  `_control87` save/restore; verify no hook leaves ST0 pushed) and for any address/pointer-
+  ordered logic; bisect by selectively disabling P2 sub-systems (shot, collision, aim).
+- **Still desyncs without P2 ⇒ the cause is a hook that runs even without P2** (e.g. the
+  damage/seed hooks themselves) — instrument those.
+
+This is the current frontier: transport is solved, the remaining desync is sim-determinism
+from the P2 graft (most likely an x87/FP-safety or pointer-order issue).
+
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +
 retry all confirmed by the user). Before any risky change, note the last-good

@@ -123,20 +123,32 @@ nearer-player redirect carry it to P2. Only writes the mode byte → no FPU/RNG,
 **Verify in-game:** P2 at full power above the line vacuums nearby items; on
 Extra/Phantasm P2 autocollects regardless of power.
 
-### ⏸ B2 — full-power→cherry only when BOTH full — DEFERRED (FPU hazard)
-The conversion is in the item spawner `FUN_004326f0` (PCBdecomp.c:20255):
-`if (round(ST0_power) > 0x7f && type∈{0,2}) type = 7`. It reads **P1's power off ST0**
-— so per the hazard above it can't be C-hooked-and-forwarded, and there's no
-non-FPU global to gate it on. Two viable routes, both needing what this session lacks:
-1. **Binary patch** the convert site to read a DLL-controlled byte (needs the actual
-   th07.exe bytes — not in the repo — and is untestable here).
-2. **Hook + replicate**: hook `FUN_004326f0`, decide the final type in the detour from
-   the *resource struct* power (P1) and `s_p2Power` (both-full ⇒ keep type 7, else pass
-   0/2), and DEFEAT the engine's own convert (which will read the detour's clobbered
-   ST0). Defeating it reliably needs an `fldz` immediately before the trampoline call
-   (verify via `objdump` that no FPU op intervenes) AND confirming `FUN_0048b8a0` pops
-   ST0 (else the x87 stack leaks one slot per spawn → eventual crash). Feasible but
-   needs the disasm check + an in-game soak. **Do with the game in front of you.**
+### 🟡 B2 — full-power→cherry only when BOTH full — IMPLEMENTED (naked ST0 trampoline), needs in-game soak
+**Done** via the FPU-safe workaround the prior note flagged as route 2, but realized as
+a **naked detour** rather than a C-hook-and-forward (cleaner — it never runs a C
+prologue, so ST0 is never clobbered to begin with). `HookedItemSpawn` (coop.c) is
+`__attribute__((naked))`: it inspects the type arg at `[esp+8]` and, only for the
+convertible types (0,2) and only when `g_b2Suppress` is set, does `fstp %st(0); fldz`
+— popping the caller's P1 power and pushing 0.0 so the engine's own
+`round(ST0) > 0x7f` test fails and the item stays a power item. Everything else
+(including coop's own type-5 1up drops) is a clean `jmp` to the trampoline with ST0
+untouched. **Depth is preserved** (pop 1 + push 1 = the one slot `FUN_0048b8a0` pops),
+so no x87 stack leak — which resolves the prior note's open worry: `FUN_0048b8a0` is
+the standard lround helper (PCBdecomp.c:81531, `ROUND(in_ST0)`) and *does* pop, else
+vanilla would leak one slot per spawn and crash in seconds (it doesn't).
+
+`g_b2Suppress` is computed in C, FP-safely, once per frame in `HookedUpdate`:
+`s_p2 && s_p2Power < COOP_FULL_POWER` (P1 full + P2 not full ⇒ keep power; both full ⇒
+leave ST0 alone ⇒ vanilla converts). **Gated** behind `coop.ini [coop]
+cherry_both_full` (default 0) and the hook is only *installed* when the flag is set, so
+a default build is byte-for-byte unchanged.
+
+**Verify in-game (local co-op):** P1 at full power, P2 below full — killed enemies keep
+dropping **power** items (not cherries) until P2 also tops out; once both are full,
+drops convert to cherry as in vanilla. Soak a full stage to confirm no x87 drift
+(item spawns stay correct over hundreds of drops; no crash). **Net caveat:** it reads
+`s_p2Power`, the value currently desyncing — keep `cherry_both_full=0` over the network
+until power sync is solid, or it will feed the diverging value into drop types.
 
 ### 🟡 B4 — P2 bomb doesn't clear bullets — IMPLEMENTED, needs in-game test (commit pending)
 **Shipped:** `HookedAddClearCircle` (FUN_004418b0) + `HookedAddClearBox` (FUN_00441800)

@@ -548,6 +548,52 @@ typedef int (__fastcall *ItemSpawnFn_t)(void *self, void *edx,
 #define ITEM_TYPE_1UP   5
 static volatile void *s_itemMgr = NULL;
 
+/* ── B2: power-item → cherry conversion gated on BOTH players full ──────────────
+ * Vanilla PCB turns dropped power items into cherry (point) items as soon as P1 is
+ * at full power — which in co-op starves P2's only power source. We want the
+ * conversion to wait until BOTH players are full.
+ *
+ * The decision lives inside the spawner FUN_004326f0: it reads P1's power off the
+ * x87 ST0 the caller pushed (via the lround helper FUN_0048b8a0) and, if
+ * round(power) > 0x7f and type ∈ {0,2}, rewrites the type to 7 (cherry). Because
+ * the value is taken from ST0 — not a normal argument — a C detour can't wrap it:
+ * the C prologue clobbers ST0 before the trampoline reads it (the "x87 ST0 hazard"
+ * in docs/th07_coop_gameplay_bugs.md). So this detour is NAKED: it runs no C
+ * prologue and leaves the FPU stack untouched EXCEPT, when we want to suppress the
+ * conversion, it pops the caller's power and pushes 0.0 in its place. round(0)=0 ≤
+ * 0x7f ⇒ the engine keeps the item as power. Depth is preserved (the helper pops
+ * exactly one slot either way), so there is no x87 stack leak.
+ *
+ * g_b2Suppress is computed in C, FP-safely, once per frame:
+ *   P2 live && P2 power < full  (i.e. P1 full + P2 not full ⇒ keep it a power item).
+ * When P2 is also full we leave ST0 alone, so vanilla converts (both full). Only
+ * the convertible types (0,2) are touched; every other spawn — including coop's own
+ * 1up drops (type 5) — is a clean passthrough that never touches ST0. Gated behind
+ * coop.ini [coop] cherry_both_full (default off). It reads s_p2Power, so keep it
+ * OFF over the network until the power-sync desync is solved (it would otherwise
+ * feed the diverging value into drop types).
+ * thiscall: ECX=mgr; [esp]=ret, [esp+4]=pos*, [esp+8]=type, [esp+12]=mode. */
+unsigned char g_b2Suppress      = 0;    /* asm-read: force no-convert for this spawn */
+void         *g_b2OrigItemSpawn = NULL; /* MinHook trampoline for FUN_004326f0        */
+
+__attribute__((naked)) static void HookedItemSpawn(void)
+{
+    __asm__ volatile (
+        "movl 8(%esp), %eax\n\t"        /* type (param_3)                          */
+        "cmpl $0, %eax\n\t"
+        "je   1f\n\t"
+        "cmpl $2, %eax\n\t"
+        "jne  2f\n\t"                   /* not a power item -> passthrough          */
+    "1:\n\t"
+        "cmpb $0, _g_b2Suppress\n\t"
+        "je   2f\n\t"                   /* not suppressing -> vanilla convert       */
+        "fstp %st(0)\n\t"               /* drop caller's P1 power...                 */
+        "fldz\n\t"                      /* ...replace with 0 => round<=0x7f, no cherry */
+    "2:\n\t"
+        "jmp  *_g_b2OrigItemSpawn\n\t"  /* tail-call trampoline (ECX/stack/ST0 kept) */
+    );
+}
+
 /* Tier-1: scale enemy/boss HP cap by the active player count. On by default;
  * only takes effect while P2 is live (factor = 1 + (s_p2 != NULL)). F5 toggles. */
 static int   s_bossHpScale = 1;
@@ -567,6 +613,7 @@ static char  s_dir[MAX_PATH];
 static int   s_readyFrames = 0;        /* consecutive P1-update frames seen        */
 static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch               */
 static int   s_suppressP2  = 0;        /* DIAGNOSTIC: never spawn P2 (desync isolation) */
+static int   s_b2CherryBothFull = 0;   /* B2: power->cherry only when BOTH full (FPU asm; default off) */
 #define AUTO_SPAWN_AFTER 30            /* frames of P1 in state 0 after the stage
                                           fly-in, then spawn P2 (user: both players
                                           up together at stage start) */
@@ -966,6 +1013,10 @@ static void LoadNetConfig(void)
      * counter then stays locked, P2's graft is the culprit; if it still desyncs, the
      * cause is engine-side / a hook. Default 0. */
     s_suppressP2 = (int)GetPrivateProfileIntA("coop", "suppress_p2", 0, ini);
+    /* B2: gate the power->cherry conversion on BOTH players full (else P1 alone
+     * full starves P2's power). Installs an FP-safe naked detour on the spawner;
+     * default off. Keep OFF over the network until the power-sync desync is fixed. */
+    s_b2CherryBothFull = (int)GetPrivateProfileIntA("coop", "cherry_both_full", 0, ini);
     s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
     if (!s_netEnabled) return;
     GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);
@@ -2486,6 +2537,12 @@ static int __fastcall HookedUpdate(void *self)
     int p1Fake = 0;
     uint16_t p1GhostSavedIn = 0;
 
+    /* B2: refresh the power->cherry suppression flag once per frame (read by the
+     * naked HookedItemSpawn; inert when that hook isn't installed). Suppress while
+     * P2 is live and below full power — so P1-full alone keeps drops as power. */
+    if (isP1)
+        g_b2Suppress = (unsigned char)(s_p2 && s_p2Power < COOP_FULL_POWER);
+
     /* PHANTOM SPARE (P1): while co-op is active, ZUN's death commit must never
      * see 0 lives — the lives==0 path is game-over + full-power items + the
      * continue-style reset. With a phantom spare swapped in, a last-life death
@@ -3242,6 +3299,14 @@ static int InstallHooks(void)
     if (s_netEnabled) {
         if (MH_CreateHook(ADDR_SCENE_TICK, (LPVOID)&HookedSceneTick, (LPVOID*)&s_origSceneTick) != MH_OK) return 0;
         if (MH_CreateHook(ADDR_GAME_START, (LPVOID)&HookedGameStart, (LPVOID*)&s_origGameStart) != MH_OK) return 0;
+    }
+    /* B2: FP-safe naked detour on the item spawner, gated on coop.ini so a default
+     * build is byte-for-byte unchanged. Create+enable together (MinHook allows it). */
+    if (s_b2CherryBothFull) {
+        if (MH_CreateHook((LPVOID)0x004326f0, (LPVOID)&HookedItemSpawn,
+                          (LPVOID*)&g_b2OrigItemSpawn) != MH_OK) return 0;
+        if (MH_EnableHook((LPVOID)0x004326f0) != MH_OK) return 0;
+        Log("B2: power->cherry gated on BOTH players full (cherry_both_full=1)");
     }
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;

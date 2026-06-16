@@ -665,10 +665,17 @@ typedef int (__fastcall *ShtLoadFn_t)(void **out, const char *name); /* 0 = ok *
 #define OFF_SHT_UNFOC     0xb7e70      /* void*: unfocused .sht buffer            */
 #define OFF_SHT_FOC       0xb7e74      /* void*: focused .sht buffer              */
 #define OFF_BOMB_CB       0x16a3c     /* 4 consecutive cb ptrs                    */
-#define OFF_SPD_UNF_CUR   0x990
-#define OFF_SPD_UNF       0x994       /* = sht[+0xc]/2                            */
-#define OFF_SPD_FOC_CUR   0x99c
-#define OFF_SPD_FOC       0x9a0       /* = sht[+0x10]/2                           */
+/* ⚠️ MISNOMER (kept for churn-safety): these four are NOT speed — they are the
+ * player's HIT/GRAZE half-extents (the engine recomputes the AABB edges each
+ * frame from player center ∓ these): +0x990/+0x994 = hit half-X/Y, +0x99c/+0x9a0 =
+ * graze half-X/Y. ApplyP2Selection sets them from the .sht (sht[0xc]/2 hit,
+ * sht[0x10]/2 graze) — semantically correct for P2's hitbox, so behaviour is fine;
+ * only the names mislead. See docs/th07_player_struct.md "Open / unverified".
+ * Do NOT reuse these as a movement-speed field — that field is unconfirmed. */
+#define OFF_SPD_UNF_CUR   0x990       /* hit half-extent X (cur)   */
+#define OFF_SPD_UNF       0x994       /* hit half-extent Y = sht[+0xc]/2   */
+#define OFF_SPD_FOC_CUR   0x99c       /* graze half-extent X (cur) */
+#define OFF_SPD_FOC       0x9a0       /* graze half-extent Y = sht[+0x10]/2 */
 #define OFF_DEATH_TIMER   0x23f8      /* int death/deathbomb-window countdown (NOT
                                        * a hitbox): max while alive, decremented
                                        * while dying, finalizes death at 0. See

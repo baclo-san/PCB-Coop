@@ -94,6 +94,15 @@ static void WriteIni(int role)
 
     WritePrivateProfileStringA("coop", "proximity_fade", fade ? "1" : "0", g_iniPath);
 
+    /* Surface the diagnostic [coop] flags in the file so they're visible to flip,
+     * but NEVER clobber a value the user set by hand: only write when the key is
+     * absent (default -1 sentinel). suppress_p2 isolates the residual netplay
+     * desync; cherry_both_full gates the power->cherry conversion (B2). */
+    if (GetPrivateProfileIntA("coop", "suppress_p2", -1, g_iniPath) < 0)
+        WritePrivateProfileStringA("coop", "suppress_p2", "0", g_iniPath);
+    if (GetPrivateProfileIntA("coop", "cherry_both_full", -1, g_iniPath) < 0)
+        WritePrivateProfileStringA("coop", "cherry_both_full", "0", g_iniPath);
+
     WritePrivateProfileStringA("net", "enabled", role ? "1" : "0", g_iniPath);
     WritePrivateProfileStringA("net", "role", role == 2 ? "guest" : "host", g_iniPath);
     WritePrivateProfileStringA("net", "peer", ip, g_iniPath);

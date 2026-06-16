@@ -3347,11 +3347,20 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
-        Log("*** DIAGNOSTIC BUILD v6: epoch fix resolved the INPUT desync; residual is "
-            "SIM-side (identical input, RNG counter splits — §8m). Set coop.ini [coop] "
-            "suppress_p2=1 on BOTH machines to test whether the grafted P2 entity is the "
-            "cause (counter stays locked => yes). P2 binds moved IJKL->WASD. ***");
+        Log("*** DIAGNOSTIC BUILD v7: epoch fix resolved the INPUT desync; residual is "
+            "SIM-side (identical input, RNG counter splits — §8m). To isolate the cause, set "
+            "suppress_p2=1 under [coop] in the coop.ini that sits NEXT TO this DLL in the GAME "
+            "folder, on BOTH machines (the launcher preserves the key). Then VERIFY the CONFIG "
+            "line below reads suppress_p2=1 BEFORE starting the netplay session. P2 binds: WASD. ***");
         LoadNetConfig();
+        /* Echo the resolved config so every log self-documents what was actually read
+         * (a hand-added diagnostic flag that lands in the wrong coop.ini copy silently
+         * defaults off — this line makes that visible at a glance / lets the friend
+         * pre-flight check solo before the netplay round). */
+        Log("CONFIG (read from %scoop.ini): suppress_p2=%d  cherry_both_full=%d  "
+            "proximity_fade=%d | net.enabled=%d role=%s delay=%d seed=0x%04x",
+            s_dir, s_suppressP2, s_b2CherryBothFull, s_proxFade,
+            s_netEnabled, s_netIsHost ? "host" : "guest", s_netDelay, s_netSeed);
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */
         if (!InstallHooks())

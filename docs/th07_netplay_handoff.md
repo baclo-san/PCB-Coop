@@ -1921,6 +1921,49 @@ across the whole stage and the RNG counter to stay locked through Letty and beyo
 > stage 1 — still tracked in `docs/th07_coop_gameplay_bugs.md`, unrelated to this transport
 > fix.
 
+### §8n — gameplay bug pass + x87 desync mitigation (2026-06-16, overnight)
+
+Unattended session on branch `claude/keen-ramanujan-mrh2n7`. Fixed four backlogged
+gameplay bugs (all in `src/coop/coop.c`, all build-clean + 32-bit, all **awaiting an
+in-game confirm** — no Windows/display here) and added a speculative netplay desync
+mitigation. Full per-bug write-ups in `docs/th07_coop_gameplay_bugs.md`.
+
+- **B4 — P2 bomb now clears bullets.** The clear path is `FUN_0043e3b0`/`FUN_0043e260`
+  returning **2** when `FUN_0043e0a0` finds the bullet inside the player's clear-region
+  array `player+0x17dc` (param-relative; the bomb cbs write it relative to the bomber).
+  `HookedGraze`/`HookedCollideBullet` were dropping P2's `r2==2` — now propagated. The
+  prior "last attempt" probably chased the P1-only globals `DAT_004d44f8`/`DAT_004bfee0`,
+  which are just P1+0x16a20 / P1+0x2408 and do NOT drive the clear.
+- **B2 — power→cherry transform gated on BOTH players.** `FUN_004326f0` converts a power
+  item (0/2) to cherry (7) when `round(shared power res+0x7c) > 127` (PCBdecomp.c:20255).
+  `HookedItemSpawn` suppresses the convert (zero the power the spawner reads, restore
+  after) when P2's separate power isn't full → P2's power source isn't starved.
+- **B5 — P2 bomb makes Extra/Phantasm bosses invincible (accepted fallback).** ZUN's
+  `DAT_004d44f8==0` gate (P1 not bombing) blocks all shot damage during P1's bomb; P2's
+  bomb never set the flag. `HookedDamage` now zeroes the sweep while P2 is bombing
+  (read P2+0x16a20), scoped to difficulty 4/5. The full P1-transform mirror is a follow-up.
+- **D1 — no free revives.** `ReviveByGraze` revives only when the reviver can spend a
+  spare life; the last-life 1up drop stays. (User-confirmed supersession of §5f.)
+
+- **x87 control-word pin (SPECULATIVE — the user's "x87 ST0" desync suspect).** The §8m
+  epoch fix removed the stale-packet contamination but the next desync suspect is x87
+  float rounding. PCB's lockstep sim rounds floats on the x87 stack (Rng_NextFloat FDIV,
+  enemy-aim `fpatan`, shot cos/sin, the power round off ST0); two machines' D3D drivers
+  can leave the **control word** at different precision (24- vs 53-bit), splitting an
+  item-drop / aim roll a few frames in. `PinFpuForNetplay()` pins precision=24-bit
+  (D3D/vanilla default), round-nearest, once per logic frame in `HookedSceneTick`. Gated
+  on `s_netActive` ONLY → the confirmed-good local build is byte-identical. The first pin
+  **logs the previous control word** so the next 2-PC test reveals whether host and guest
+  actually differed (CONFIRM/REFUTE x87). If the trace then shows 0 input disagreements
+  AND the RNG counter still splits, the FPU pin is the place to look; if the logged
+  control words already matched on both machines, x87 is ruled out and the residual is
+  elsewhere (re-instrument the sim divergence with the counter oracle).
+
+**Still open / not done here** (need the user / a 2-PC run): the epoch fix (§8m) and the
+x87 pin both need the two-machine re-test; C1 (P1-Sakuya+P2-Reimu Phantasm crash) and C2
+(stage-4 death-fairy crash) did not reproduce in the available build and remain unfixed;
+B1 (shared point-extend) and B3 (P2 autocollect line) untouched this session.
+
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +
 retry all confirmed by the user). Before any risky change, note the last-good

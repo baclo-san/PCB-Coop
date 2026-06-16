@@ -36,6 +36,12 @@ well-specified enough to fix + self-verify without the user. **Crashes first.**
   power→cherry transform when **both** players are at full power. (Notes #2.) Find the
   item-spawn/transform decision (item-drop path, cherry doc / item-collect doc) and gate
   it on `min(P1power, P2power) == full` instead of P1 alone.
+  **✅ FIXED 2026-06-16 (awaiting in-game confirm).** The convert lives in the item
+  spawner `FUN_004326f0` (PCBdecomp.c:20255): it FLDs the shared power `res+0x7c` and
+  rewrites a power item (type 0/2) to cherry (type 7) when `round(power) > 127`. The
+  shared power is P1's. `HookedItemSpawn` now detours it: when P2 has separate power and
+  is NOT full, it zeros the power the spawner reads across the original call (restoring
+  after) so the item stays a power item — i.e. convert only when BOTH are full.
 - **B3 — P2 never gets autocollect above the point-of-collection line, EVER** — not even
   on Extra, where everyone should autocollect regardless of power. (Notes #7.) The
   autocollect trigger (full-power line-cross, and the Extra-stage always-on rule) is
@@ -48,11 +54,33 @@ well-specified enough to fix + self-verify without the user. **Crashes first.**
   clear-bullets call on the P1 path and re-invoke it for P2 (mind the single border-ring
   slot caveat, handoff §5d — this is the bomb/spell bullet-clear, distinct from the
   cherry border).
+  **✅ FIXED 2026-06-16 (awaiting in-game confirm).** Mechanism: a bullet is cleared
+  during a bomb when the graze test `FUN_0043e3b0` / hit test `FUN_0043e260` return **2**,
+  which they do when `FUN_0043e0a0` finds the bullet inside the player's bomb-clear-region
+  array at `player+0x17dc`. Both that array and `FUN_0043e0a0` are param-relative, so a
+  P2-base call already tests P2's OWN regions (the bomb callbacks write them relative to
+  the bombing player). The detours, though, dropped P2's return: `HookedGraze` only
+  propagated `r2==1` (grazed) and `HookedCollideBullet` discarded P2's return entirely.
+  Fix: propagate `r2==2` (clear) from P2 in both hooks (graze path = not-yet-grazed
+  bullets, hit path = already-grazed ones). **The earlier "last attempt" likely chased the
+  wrong mechanism** (the global bomb-active flags `DAT_004d44f8`/`DAT_004bfee0` are
+  P1-struct fields at fixed addresses — P1+0x16a20 / P1+0x2408 — and do NOT drive the
+  bullet clear; that is the `+0x17dc` region test).
 - **B5 — Extra/Phantasm bosses: P2 bomb doesn't trigger their invincible spell form.**
   In vanilla you can't damage an Extra/Phantasm boss during a spell — they go invincible
   for its duration. P1 bombs respect this; **P2 bombs don't**, so Extra/Phantasm fights
   get cheesy. (Notes #8.) Make P2's bomb damage path honor the same boss-invincible-
   during-spell gate P1's does. (claude oversimplified it here, ideally P2 bombing should trigger same tranforming mechanism as P1 bomb. if turns out too hard, full boss invul during P2 bomb can do too)
+  **✅ FIXED 2026-06-16 via the accepted fallback (awaiting in-game confirm).** ZUN gates
+  ALL player shot damage on `DAT_004d44f8==0` (= P1 NOT bombing, PCBdecomp.c:12829) — that
+  is the "invincible spell form": during P1's bomb the boss takes nothing. The flag is
+  P1+0x16a20, never set by P2's bomb, so the boss kept taking P1+P2 damage during a P2
+  bomb. `HookedDamage` now zeroes the sweep's damage while P2 is bombing (read P2+0x16a20),
+  scoped to Extra/Phantasm (difficulty 4/5, `DAT_0062f85c`) to leave normal stages alone.
+  The sweep still runs so shots are consumed + spark, exactly like ZUN's gate (which blocks
+  only the apply). NOTE: this is the "full boss invuln during P2 bomb" fallback, NOT the
+  exact P1 transform — left as a follow-up. The bomb→boss damage path is `FUN_0043d9e0`
+  (the only caller is the enemy update at 12822); no separate bomb-damage path was found.
 
 ## P2 — design decision (NOT a bug — confirm intent, then enforce)
 
@@ -62,6 +90,10 @@ well-specified enough to fix + self-verify without the user. **Crashes first.**
   you can only revive a partner if you have a life to spend. Before changing, confirm
   this supersedes §5f, then remove the free-revive / guaranteed-last-life-1up paths.
   (message from me, the user. confirmed! but only about free revives. when player pichuuns on last life, he still should drop 1up)
+  **✅ DONE 2026-06-16.** `ReviveByGraze` now revives ONLY when the reviver has a spare
+  life to donate (no free revive); the graze channel completes but nothing happens with
+  zero spares. The guaranteed last-life 1up drop is KEPT (it lives in EnterGhostP1/P2 on
+  death, separate from the revive path) per the user's note.
 
 ## Confirmed working-as-intended (no fix wanted)
 

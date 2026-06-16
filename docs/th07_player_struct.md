@@ -129,6 +129,24 @@ register regions as their spell objects move.
   P2 (reads `P2+0x17dc`). coop.c's `HookedAddClearCircle`/`HookedAddClearBox` force
   ECX→P2 while `s_inP2Update`, so P2's bomb populates `P2+0x17dc`.
 
+### Bomb callback table (per char×type), 2026-06-16
+The four bomb fn-ptr fields are installed at player init (PCBdecomp.c:27417) from
+**four parallel tables** keyed by the global sel id `DAT_0062f647` (0=ReimuA … 5=SakuyaB):
+
+| Field | Role | Table base | Called at |
+|---|---|---|---|
+| `+0x16a3c` | UNFOCUSED bomb **update** | `0x0049ec50`[sel] | launch 26683, per-frame tick 26712 |
+| `+0x16a40` | UNFOCUSED bomb **draw**   | `0x0049ec54`[sel] | draw 27253 |
+| `+0x16a44` | FOCUSED bomb **update**   | `0x0049ec58`[sel] | launch 26686, tick 26715 |
+| `+0x16a48` | FOCUSED bomb **draw**     | `0x0049ec5c`[sel] | draw 27256 |
+
+So each of the 6 sels has its own (update, draw) × (unfocused, focused) bomb code. The
+update callbacks live around PCBdecomp.c 5708–7700 (`__fastcall(player)`, param-relative
+— they spawn spell objects at `player+0x16a4c` and register bullet-clear regions via
+`FUN_004418b0`/`FUN_00441800` on `player+0x17dc`, see above). Resolving sel→fn needs the
+table data in the binary; coop swaps `DAT_0062f647` (`SwapSelGlobals`) so P2 installs its
+own char's bomb callbacks. **For B4/B5 (P2 bomb parity) these are the functions to read.**
+
 - **`.sht` character shot config:** the per-character shot/bomb setup fns run at
   PCBdecomp.c 5932-7625 (one block per char×type; each clears `+0x16a20`). They
   install the shot-spawn callbacks + the bomb fn ptrs (`+0x16a40/48`) for the

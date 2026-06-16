@@ -71,3 +71,109 @@ well-specified enough to fix + self-verify without the user. **Crashes first.**
 ## Suggested nightshift order
 C1/C2 (crashes) → B1/B2/B3 (resource sharing, high play-feel impact, low risk) →
 B4/B5 (bombs) → D1 (needs the user's confirmation it supersedes §5f, so do last or ask).
+
+---
+
+## Status — 2026-06-16 (unattended session, PR #5)
+
+All compile-verified (6 targets, 32-bit; native merge test passes). **No in-game test
+available this session** — items below are reasoned from the decomp, not play-tested.
+
+### ⚠️ CRITICAL FINDING — the x87 ST0 hook hazard (read before touching B1/B2)
+Several of ZUN's resource/item fns read the **x87 FPU `ST0`** register that their
+**caller** pushed, instead of taking it as a normal argument:
+- `FUN_0042d83a` (extend grant — reads round(ST0)=lives, then bombs)
+- `FUN_004326f0` (item spawner — `FUN_0048b8a0()` reads round(ST0)=power for the
+  power→cherry auto-convert at PCBdecomp.c:20255)
+- `FUN_0048b8a0` itself (`ROUND(in_ST0)`, ≈ `lroundf`) used all over the credit switch.
+
+A **MinHook C detour cannot wrap these and call the original**: the detour's C
+prologue clobbers `ST0` before the trampoline runs, so the original reads garbage.
+(coop's existing hooks are safe only because their targets — `FUN_0043d9e0` damage,
+`FUN_0043e260` collision, etc. — take real args, not `ST0`.) Implication: B1/B2 must
+NOT be done by hooking those fns. B1 below uses a side-channel instead; B2 has no
+clean binary-feasible route yet.
+
+### ✅ D1 — no free revives — DONE (commit 28c66d7)
+`ReviveByGraze` now requires the reviver to hold ≥1 spare extend; with none the
+focus-release confirm does nothing (the channel stays charged so it fires the instant
+they earn a life). The last-life-death **1up drop is kept** (per the user's note). The
+P1/P2 paths are symmetric. Header comment updated.
+
+### ✅ B1 — point-item extend shared — DONE (commit 28c66d7)
+A point-item threshold extend (PCBdecomp.c case 1, the `+0x28 >= +0x30` loop calling
+`FUN_0042d83a`) now grants the life/bomb to **both** players. Implemented FPU-safely
+via the **extend-tier counter `res+0x2c`**: `CheckPartnerExtend()` watches it for an
+increment (the 1up *item*, case 5, calls `FUN_0042d83a` WITHOUT bumping `+0x2c`, so
+item pickups correctly stay collector-specific) and mirrors the extend to the partner
+through the existing collect-time field-swap (the collector is named by `s_p2ResHeld`,
+still set because the check runs before `RestoreHeldRes`). Partner gets a life if <8
+else a bomb if <8 (ZUN's own overflow). Determinism-safe (no extra RNG; the heal is
+the one RestoreHeldRes already does). **Verify in-game:** P1 and P2 both gain a life
+when the point-item counter crosses an extend threshold, regardless of who collected.
+
+### ✅ B3 — P2 autocollect above the line / on Extra — DONE (commit 28c66d7)
+ZUN's per-item autocollect trigger (`FUN_00432990` PCBdecomp.c:20391) is
+`(P1 full power || difficulty>3) && (P1_Y < line)`, P1-only. `ApplyP2Autocollect`
+(in `HookedItemLoop`, after the original) replicates the same gate for P2 — when P2 is
+above the collect line `*(*0x575948 + 0x20)` and (P2 full power || `*0x626280 > 3`),
+it sets the homing-mode byte (`item+0x27f = 1`) on each active item for which P2 is the
+nearer player. The engine's next-frame homing + the existing `HookedAngleToPlayer`
+nearer-player redirect carry it to P2. Only writes the mode byte → no FPU/RNG, safe.
+**Verify in-game:** P2 at full power above the line vacuums nearby items; on
+Extra/Phantasm P2 autocollects regardless of power.
+
+### ⏸ B2 — full-power→cherry only when BOTH full — DEFERRED (FPU hazard)
+The conversion is in the item spawner `FUN_004326f0` (PCBdecomp.c:20255):
+`if (round(ST0_power) > 0x7f && type∈{0,2}) type = 7`. It reads **P1's power off ST0**
+— so per the hazard above it can't be C-hooked-and-forwarded, and there's no
+non-FPU global to gate it on. Two viable routes, both needing what this session lacks:
+1. **Binary patch** the convert site to read a DLL-controlled byte (needs the actual
+   th07.exe bytes — not in the repo — and is untestable here).
+2. **Hook + replicate**: hook `FUN_004326f0`, decide the final type in the detour from
+   the *resource struct* power (P1) and `s_p2Power` (both-full ⇒ keep type 7, else pass
+   0/2), and DEFEAT the engine's own convert (which will read the detour's clobbered
+   ST0). Defeating it reliably needs an `fldz` immediately before the trampoline call
+   (verify via `objdump` that no FPU op intervenes) AND confirming `FUN_0048b8a0` pops
+   ST0 (else the x87 stack leaks one slot per spawn → eventual crash). Feasible but
+   needs the disasm check + an in-game soak. **Do with the game in front of you.**
+
+### ⏸ B4 — P2 bomb doesn't clear bullets — NEEDS RE + TEST
+RE this session: the bomb's bullet clear is NOT `player+0x2400` (that's the cherry
+**border** sweep — set to 0x3c only in `FUN_004411c0`, drained in `FUN_00441330` via
+`FUN_00424740(0)`). The global bullet-clear sweeps are `FUN_00424740(mgr, n)` /
+`FUN_004249a0(mgr, …)` (walk the `&DAT_0063b218` bullet array, set state 5, latch
+`mgr+0x37a12c=10`). The actual per-bomb clear lives in the **per-character bomb
+callbacks** at `player+0x16a3c`/`+0x16a44`, installed at init from
+`(&PTR_FUN_0049ec50)[DAT_0062f647*4]` keyed by the GLOBAL sel id (so P2 gets its own
+char's callbacks via `SwapSelGlobals`). The callbacks are invoked
+`(**(code**)(player+0x16a3c))()` — Ghidra shows no ECX, so it's **unresolved whether
+they're `__thiscall(player)` (operate on P2) or read the P1 static base `0x4bdad8`
+directly**. That ambiguity IS the open question: identify the 6 callback fns (the
+`0x49ec50` table), read one (e.g. ReimuA), and see whether its bullet-clear /
+spell-spawn is player-relative or P1-hardwired. If P1-hardwired, the spell clears via
+P1 and "no clear for P2" would instead mean the callback isn't running for P2 — but
+P2's bomb visibly deploys, so more likely the clear is keyed off a P1-only flag.
+**Instrument:** log inside one callback (or hook `FUN_00424740`) whether it fires
+during P2's bomb (`s_inP2Update && P2+0x16a20`). Don't implement blind — a generic
+"call `FUN_00424740` while P2 bombs" over-clears and needs the bullet-mgr ECX base
+resolved.
+
+### ⏸ B5 — P2 bomb doesn't trigger boss invincible-spell form — NEEDS RE + TEST
+Same callback family as B4. The boss-invincible-during-spell anti-cheese is gated on a
+flag P1's bomb sets that P2's may not (candidates seen near the spell-declaration
+`FUN_0040fc90`: `DAT_012fe0c8` spell-active, `DAT_012fe0cc/d0` spell-bonus). The
+user-accepted fallback ("full boss invul during P2 bomb") is implementable in
+`HookedDamage` (P2+0x16a20 bombing && enemy flags&0x40 boss && difficulty>3 ⇒ return 0
++ skip the P2 re-invoke) BUT it OVER-nerfs (blocks damage on attack spells where P1
+could damage while bombing), so it risks regressing feel — left unimplemented pending
+the proper gate + a play-test. Resolve the spell-invincibility flag P1's bomb sets,
+then mirror it for P2.
+
+### ⏸ C1 / C2 — crashes — NEED IN-GAME REPRO
+No new lead findable without a repro/log. C2's note says a `coop_log.txt` from that
+session is in `build/` — but the committed one is stale (§5b). Capture fresh logs:
+C1 = P1 Sakuya + P2 Reimu, Reimu's bullets hit an enemy; C2 = stage-4 death-fairy.
+Both are plausibly in the per-player shot/aim graft (`BuildP2TargetBlock`, the
+`HookedDamage` P2 re-invoke) — add player/shot identity logging to the hit path and
+bisect by char combo.

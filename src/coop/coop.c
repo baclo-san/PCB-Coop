@@ -147,6 +147,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <float.h>
 #include "MinHook.h"
 
 /* ---- build-specific addresses (Ghidra db: th07.exe.c ver 1.00b) ---- */
@@ -995,6 +996,38 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
     fflush(s_trace);                        /* survive the freeze tail */
 }
 
+/* ---- x87 FPU control-word pin (speculative netplay desync mitigation) ----
+ * PCB's simulation is full of x87 float work that feeds the SHARED, lockstep sim:
+ * Rng_NextFloat (FDIV [0x498b28] -> item-drop rolls), the enemy-aim atan2
+ * (FUN_004319b0/fpatan), shot cos/sin (FUN_0048bbf0/40), and the power round off
+ * ST0 (FUN_0048b8a0). For lockstep to hold, those ops must round IDENTICALLY on
+ * both machines — which requires the same x87 control word (precision + rounding).
+ * Direct3D8 sets single precision (24-bit) at device-create unless FPU_PRESERVE is
+ * used (ZUN does not), so vanilla PCB runs at 24-bit and its replays rely on it.
+ * But two players' D3D drivers / wrappers can leave the control word in DIFFERENT
+ * states (e.g. one 24-bit, one 53-bit) -> the same float op rounds differently ->
+ * the item-drop / aim RNG branches split a few frames later: the §8l/§8m symptom
+ * AFTER the epoch fix (the user's "x87 ST0" suspect).
+ *
+ * Pin precision=24-bit single, rounding=nearest once per logic frame (re-pin in
+ * case D3D resets it during present). Matches vanilla's expected state, so both
+ * machines agree. Gated on s_netActive ONLY — single-player / replay never touch
+ * the control word, so the confirmed-good local build is byte-identical. The first
+ * pin logs the PREVIOUS control word so a 2-PC test reveals whether host and guest
+ * actually differed (which would CONFIRM x87 as the post-epoch desync cause).
+ * SPECULATIVE: needs the two-machine re-test to confirm. */
+static int s_fpuPinned = 0;
+static void PinFpuForNetplay(void)
+{
+    unsigned prev = _controlfp(0, 0);                       /* read current */
+    _controlfp(_PC_24 | _RC_NEAR, _MCW_PC | _MCW_RC);       /* pin 24-bit, round-nearest */
+    if (!s_fpuPinned) {
+        s_fpuPinned = 1;
+        Log("netplay: x87 control word pinned to 24-bit/round-nearest "
+            "(was 0x%04x). role=%s", prev & 0xffff, Nc_IsHost() ? "host" : "guest");
+    }
+}
+
 /* FUN_00437c70 — per-logic-frame scene input task. Owns the netcode frame
  * counter and overwrites g_InputMenu with the merged word. */
 static int __fastcall HookedSceneTick(void *self)
@@ -1025,6 +1058,7 @@ static int __fastcall HookedSceneTick(void *self)
         return r;                           /* no lockstep until connected             */
     }
     if (s_netActive) {
+        PinFpuForNetplay();         /* x87 determinism: same rounding on both machines */
         /* START BARRIER / scene-reset — the th06 Supervisor::OnUpdate "last_frame_a >
          * frame_a" realign (Supervisor.cpp), driven here by PCB's top-level scene id
          * at self+0x154. th06's lockstep clock is the game's per-scene calcCount, which

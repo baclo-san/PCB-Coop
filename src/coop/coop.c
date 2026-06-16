@@ -522,6 +522,7 @@ typedef int (__fastcall *ItemSpawnFn_t)(void *self, void *edx,
 #define ADDR_ITEM_SPAWN ((ItemSpawnFn_t)0x004326f0)
 #define ITEM_TYPE_1UP   5
 static volatile void *s_itemMgr = NULL;
+static ItemSpawnFn_t  s_origItemSpawn = NULL;   /* FUN_004326f0 detour (B2 max-power gate) */
 
 /* Tier-1: scale enemy/boss HP cap by the active player count. On by default;
  * only takes effect while P2 is live (factor = 1 + (s_p2 != NULL)). F5 toggles. */
@@ -1718,6 +1719,47 @@ static void Spawn1Up(float *pos3)
     void *mgr = (void *)s_itemMgr;
     if (!mgr) { Log("1up spawn SKIPPED: item manager not seen yet"); return; }
     ADDR_ITEM_SPAWN(mgr, NULL, pos3, ITEM_TYPE_1UP, 0);
+}
+
+/* ---- B2: max-power power->cherry transform gated on BOTH players ----
+ * FUN_004326f0 auto-converts a power item (type 0/2) into a cherry/point item
+ * (type 7) when round(shared power) > 127 — it FLDs the shared power res+0x7c
+ * right before the gate (PCBdecomp.c:20255) and reads it nowhere else. The shared
+ * power is P1's, so P1 alone being full turns every power drop into cherry and
+ * starves P2's only power source (gameplay bug B2).
+ *
+ * Fix: when P2 has its own power and is NOT full, suppress the convert by lowering
+ * the power the spawner reads (temporarily zero res+0x7c across the original, then
+ * restore), so the item stays a power item P2 can collect. When P2 IS full the
+ * original runs untouched -> it still converts iff P1 is full (i.e. convert only
+ * when BOTH are full, the intended rule). Power items only; every other type and
+ * the no-P2 / shared-res case fall straight through to the original.
+ *
+ * Determinism: P2's power (s_p2Power) and the shared power are both lockstep sim
+ * state, so the gate decides identically on both machines.
+ *
+ * Timing: the spawner fires from the enemy/death path, outside P2's update and the
+ * collect-hold, so res+0x7c holds P1's power and s_p2Power is current here. */
+static int __fastcall HookedItemSpawn(void *self, void *edx,
+                                      float *pos3, int type, int mode)
+{
+    if (s_p2 && s_p2SepRes && (type == 0 || type == 2)) {
+        int p2full = (s_p2Power >= 127.5f);   /* mirror round(power) > 127 */
+        if (!p2full) {
+            uint32_t res = *ADDR_RES_PTR;
+            if (res) {
+                float *pp = (float *)(res + RES_POWER);
+                float saved = *pp;
+                if (saved >= 127.5f) {        /* only when it would actually convert */
+                    *pp = 0.0f;
+                    int r = s_origItemSpawn(self, edx, pos3, type, mode);
+                    *pp = saved;
+                    return r;
+                }
+            }
+        }
+    }
+    return s_origItemSpawn(self, edx, pos3, type, mode);
 }
 
 /* ---- ghost entry (phantom-spare aftermath) ----
@@ -3066,6 +3108,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_FRAME_TASK,     (LPVOID)&HookedFrameTask,     (LPVOID*)&s_origFrameTask)     != MH_OK) return 0;
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
+    if (MH_CreateHook((LPVOID)ADDR_ITEM_SPAWN, (LPVOID)&HookedItemSpawn, (LPVOID*)&s_origItemSpawn)     != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
     if (MH_CreateHook(ADDR_MENU_DISPATCH,  (LPVOID)&HookedMenuDispatch,  (LPVOID*)&s_origMenuDispatch)  != MH_OK) return 0;
     if (MH_CreateHook(ADDR_HUD_DRAW,       (LPVOID)&HookedHudDraw,       (LPVOID*)&s_origHudDraw)       != MH_OK) return 0;
@@ -3091,6 +3134,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_FRAME_TASK)     != MH_OK) return 0;
     if (MH_EnableHook(ADDR_COLLECT_OVERLAP)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_ITEM_LOOP)      != MH_OK) return 0;
+    if (MH_EnableHook((LPVOID)ADDR_ITEM_SPAWN) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_BORDER_BREAK)   != MH_OK) return 0;
     if (MH_EnableHook(ADDR_MENU_DISPATCH)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_HUD_DRAW)       != MH_OK) return 0;

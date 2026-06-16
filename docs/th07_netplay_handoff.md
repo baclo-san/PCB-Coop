@@ -1961,6 +1961,66 @@ Run a 2-PC test with `suppress_p2=1` on BOTH machines (P1-only co-op-less netpla
 This is the current frontier: transport is solved, the remaining desync is sim-determinism
 from the P2 graft (most likely an x87/FP-safety or pointer-order issue).
 
+### §8o — suppress_p2 test: P2 graft RULED OUT; residual desync is CROSS-PLATFORM FP (2026-06-17)
+
+The §8n hypothesis ("the P2 graft is the determinism culprit") is **DISPROVEN.** A clean
+2-PC run with **`suppress_p2=1` confirmed on both machines** (both logs: `spawn: SUPPRESSED`,
+CONFIG echo `suppress_p2=1`) — i.e. **no P2 entity exists at all** — *still desynced*
+(fairies, item drops, death-[P] pattern, then a hard desync at the stage-1 boss from
+divergent power states).
+
+**What the traces show (decisive):**
+- Both machines are **bit-identical** — same `seed` AND `counter` every frame — from stage
+  frame 2 (where the per-scene seed force lands, both → `2915`) through **frame 742**. 740
+  frames (~12.4 s) of perfect lockstep.
+- At **stage frame 743**, with **identical inputs** (P2 suppressed, P1 word identical) and
+  identical RNG state through 742, the **guest makes +24 RNG calls** (host ctr 84 → seed
+  `271b`; guest ctr 108 → seed `b1b3`). From there they cascade apart.
+- The earlier `DESYNC in stage at frame 4` log line is a **false alarm** — it compares the
+  frame-1 *pre-force* seeds (`93b3`/`f880`), before the stage-start force applies at frame 2.
+  Ignore it; the real divergence is frame 743 (and it varies by run — §8n saw 626).
+
+**Why this is NOT our mod:**
+- **coop never calls the game RNG** (it only *reads* `0x0049fe20/24` for the trace). So the
+  +24 calls are entirely inside **ZUN's own code** taking a different branch.
+- **P2 is suppressed** ⇒ every P2-gated path is off; `HookedAngleToPlayer` is a pure
+  passthrough when `s_p2==NULL` (coop.c:2932); no coop hook writes game state or calls RNG.
+- Identical inputs + identical RNG + same code diverging ⇒ the only remaining variable is a
+  **floating-point result differing between the two machines.**
+
+**The machines are different platforms:** host = `Z:\home\muddy\...` (**Wine/Linux**), guest
+= `C:\game\Touhou\...` (**native Windows**). 740 bit-perfect frames then a sudden branch
+divergence is the textbook signature of **subtle x87 FP nondeterminism** — accumulated
+last-bit differences (almost certainly **CPU-vendor-dependent transcendentals**: `fsin`/
+`fcos`/`fpatan`, used by PCB for movement/aim) crossing a decision threshold. A gross
+mismatch (FPU precision/rounding control word) is ruled out — it would diverge at frame 2,
+not 742.
+
+**Implication:** delay-based lockstep requires *bit-identical* simulation. If the two
+machines' x87 math isn't bit-identical, **no fix in our code can hold sync** — the divergence
+is in ZUN's own arithmetic. This is exactly what EoSD's periodic resync window papers over
+(see the resync discussion); pure lockstep does not.
+
+**Next (confirmation, cheap):**
+1. **Same-platform / same-CPU-vendor test** — two native-Windows boxes (ideally same vendor),
+   or two Wine boxes on the same CPU. Expectation: stays synced ⇒ confirms it's the
+   Wine-vs-Windows / Intel-vs-AMD FP gap.
+2. **Vanilla replay cross-test** (no mod): record a PCB replay on machine A, play it on B. If
+   the *vanilla* replay visibly desyncs, PCB itself isn't cross-platform deterministic between
+   these two machines — proves the cause is the platform, not netplay.
+3. Capture both machines' **CPU vendor/model + OS** (Wine version on the Linux side).
+
+**If confirmed cross-platform FP — strategic options (all heavier than a code fix):**
+- **Constrain deployment:** document that lockstep needs matching FP (same CPU vendor / both
+  native or both Wine). Lowest effort; works today between like machines.
+- **Periodic state resync** (EoSD-style): host authoritatively pushes RNG + critical sim state
+  every N frames; guest snaps to it. Hides small divergences but needs real state transfer
+  (enemies/bullets) to avoid visible rubber-banding ⇒ approaches rollback complexity.
+- **Deterministic FP shim:** force identical x87 control word (likely already matching) and
+  replace the divergent transcendentals with a bit-identical software `fsin/fcos/fpatan` on
+  both machines (hook the math or the callers). Most invasive; only route to true
+  cross-CPU lockstep.
+
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +
 retry all confirmed by the user). Before any risky change, note the last-good

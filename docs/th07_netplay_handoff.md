@@ -2021,6 +2021,37 @@ is in ZUN's own arithmetic. This is exactly what EoSD's periodic resync window p
   both machines (hook the math or the callers). Most invasive; only route to true
   cross-CPU lockstep.
 
+### §8p — user reports vanilla replays DO sync cross-OS ⇒ suspect OUR netcode's FPU use (2026-06-17)
+
+User correction: he has received working PCB replays from the Wine-host friend many times, so
+**vanilla PCB is deterministic across these two machines** — the base-game-FP hypothesis (§8o)
+is wrong. Re-frame: the base game is fine; **our netplay additions introduce the divergence**,
+and they must do so in a way that *differs per machine* (else both machines would just change
+identically and stay in sync with each other). Vanilla and replays have **no netcode running**,
+which is exactly why they're immune.
+
+Prime suspect (P2 already ruled out): the **per-frame netcode perturbing the shared x87 FPU**.
+`Nc_GetInputNet` (called from `HookedSceneTick` right before ZUN's player update) runs the
+lockstep wait — double timing math busy-spinning a **machine-dependent number of times**
+(network latency / scheduling differ). If that leaves the x87 control word, rounding, or stack
+depth even slightly different on the two machines, ZUN's subsequent FP forks. Fits the trace:
+bit-identical for ~740 frames, then a sudden branch (a slow-creeping float crossing an RNG-gated
+threshold), and the fork frame varies by run (626 / 743) like a timing-sensitive effect.
+
+**v8 ships the probe + a candidate fix:**
+- **Probe:** trace gains `fpucw,fpusw` columns — the x87 control + status words read right
+  AFTER `Nc_GetInputNet` each frame. Diff host vs guest: if they diverge, the netcode is
+  perturbing the FPU (status-word TOP field = stack depth catches stack leaks; control word
+  catches precision/rounding).
+- **Fix (gated `coop.ini [coop] fpu_guard=1`, launcher checkbox):** `fnsave`/`frstor` the full
+  x87 state around the netcode call — a firewall so the netcode can't touch ZUN's FPU at all.
+
+Test plan: round 1 `fpu_guard=0` (observe `fpucw/fpusw` diverge at/around the fork frame) →
+round 2 `fpu_guard=1` (should hold sync). If it still desyncs with the guard AND fpucw/fpusw
+are identical host-vs-guest throughout, the cause is NOT the FPU and the search moves to other
+per-machine inputs our code might feed the sim (pointer/address-ordered logic, uninitialised
+reads) — though P2-suppressed leaves very little of that surface.
+
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +
 retry all confirmed by the user). Before any risky change, note the last-good

@@ -614,6 +614,7 @@ static int   s_readyFrames = 0;        /* consecutive P1-update frames seen     
 static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch               */
 static int   s_suppressP2  = 0;        /* DIAGNOSTIC: never spawn P2 (desync isolation) */
 static int   s_b2CherryBothFull = 0;   /* B2: power->cherry only when BOTH full (FPU asm; default off) */
+static int   s_fpuGuard    = 0;        /* §8o: firewall the netcode's x87 FPU use (desync fix test) */
 #define AUTO_SPAWN_AFTER 30            /* frames of P1 in state 0 after the stage
                                           fly-in, then spawn P2 (user: both players
                                           up together at stage start) */
@@ -1017,6 +1018,10 @@ static void LoadNetConfig(void)
      * full starves P2's power). Installs an FP-safe naked detour on the spawner;
      * default off. Keep OFF over the network until the power-sync desync is fixed. */
     s_b2CherryBothFull = (int)GetPrivateProfileIntA("coop", "cherry_both_full", 0, ini);
+    /* §8o follow-up: firewall the per-frame netcode's x87 FPU use (save/restore the
+     * game's full x87 state around Nc_GetInputNet) so the lockstep wait's timing math
+     * can't perturb ZUN's FP differently on the two machines. Candidate desync fix. */
+    s_fpuGuard = (int)GetPrivateProfileIntA("coop", "fpu_guard", 0, ini);
     s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
     if (!s_netEnabled) return;
     GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);
@@ -1049,6 +1054,26 @@ static void StartNet(void)
         s_netIsHost ? "host" : "guest", s_netPeer, s_netPort, s_netLocal);
 }
 
+/* ── x87 FPU state probe + firewall (§8o follow-up) ────────────────────────────
+ * Vanilla PCB replays sync across the host (Wine) and guest (Windows), so ZUN's
+ * own FP is deterministic between these machines. Yet our netplay desyncs even
+ * with P2 suppressed — pointing at something OUR per-frame netcode does to the
+ * shared x87 state. The lockstep wait in Nc_GetInputNet busy-spins a
+ * MACHINE-DEPENDENT number of times doing double timing math; if that leaves the
+ * x87 control word / stack different on the two machines, ZUN's subsequent FP
+ * (positions, aim) rounds differently and the sim forks. FpuCw/FpuSw read the
+ * control + status words (status TOP field = stack depth) so we can diff them
+ * host-vs-guest in the trace. FPU_SAVE/RESTORE wrap the netcode call so it can't
+ * touch the game's FPU at all (gated by s_fpuGuard). */
+static inline unsigned short FpuCw(void)
+{ unsigned short w; __asm__ __volatile__("fnstcw %0" : "=m"(w)); return w; }
+static inline unsigned short FpuSw(void)
+{ unsigned short w; __asm__ __volatile__("fnstsw %0" : "=m"(w)); return w; }
+static unsigned char s_fpuState[108] __attribute__((aligned(16)));
+#define FPU_SAVE()    __asm__ __volatile__("fnsave  %0" : "=m"(s_fpuState) : : "memory")
+#define FPU_RESTORE() __asm__ __volatile__("frstor  %0" : : "m"(s_fpuState) : "memory")
+static unsigned short s_fpuCw = 0, s_fpuSw = 0;   /* last-frame x87 words for the trace (s_fpuGuard declared above) */
+
 /* DIAGNOSTIC (det-trace) — one CSV row per logic frame while netplay is active.
  * Both machines run the SAME frame indices under lockstep, so diffing the host
  * and guest CSVs by the `frame` column gives the exact frame the sims part ways.
@@ -1066,7 +1091,7 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
         s_trace = fopen(p, "w");
         if (!s_trace) return;
         fputs("frame,inStage,merged,p1,p2,seed,counter,waitMs,sync,"
-              "readFrame,selfKey,rcvKey,rcvStatus,rcvSrc,rcvWrites\n", s_trace);
+              "readFrame,selfKey,rcvKey,rcvStatus,rcvSrc,rcvWrites,fpucw,fpusw\n", s_trace);
     }
     /* netcode internals for this frame: the index GetKeys read (readFrame =
      * netFrame-delay) and the raw self/rcv words it merged. Diffing host vs guest
@@ -1077,10 +1102,10 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
     int rsrc = -1, rwr = 0;
     Nc_GetReadStats(&rf, &sk, &rk, &rs);
     Nc_GetRcvSrc(&rsrc, &rwr);
-    fprintf(s_trace, "%d,%d,%04x,%04x,%04x,%04x,%u,%d,%d,%d,%04x,%04x,%d,%d,%d\n",
+    fprintf(s_trace, "%d,%d,%04x,%04x,%04x,%04x,%u,%d,%d,%d,%04x,%04x,%d,%d,%d,%04x,%04x\n",
             frame, inStage, merged, s_netP1Menu, s_netP2Menu,
             (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR, waitMs, sync,
-            rf, sk, rk, rs, rsrc, rwr);
+            rf, sk, rk, rs, rsrc, rwr, s_fpuCw, s_fpuSw);
     fflush(s_trace);                        /* survive the freeze tail */
 }
 
@@ -1139,7 +1164,13 @@ static int __fastcall HookedSceneTick(void *self)
         }
         int inStage = (int)((*ADDR_MODE_FLAGS >> 2) & 1);  /* recording active = in a stage */
         int ctrl = 0;
+        /* FPU firewall: save ZUN's full x87 state, run the netcode (its lockstep wait
+         * does double timing math + a machine-dependent spin count), then capture what
+         * it left (for the trace) and restore the game's state so its FP is untouched. */
+        if (s_fpuGuard) FPU_SAVE();
         unsigned short merged = Nc_GetInputNet(s_netFrame++, inStage ? 0 : 1, &ctrl);
+        s_fpuCw = FpuCw(); s_fpuSw = FpuSw();   /* x87 words AFTER the netcode ran this frame */
+        if (s_fpuGuard) FPU_RESTORE();
         s_netMerged = merged;
         /* de-merged per-player words for the menu FSM (in menus the local poll is
          * the menu-bit layout, so these are P1's / P2's raw menu words). */
@@ -3347,19 +3378,21 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
-        Log("*** DIAGNOSTIC BUILD v7: epoch fix resolved the INPUT desync; residual is "
-            "SIM-side (identical input, RNG counter splits — §8m). To isolate the cause, set "
-            "suppress_p2=1 under [coop] in the coop.ini that sits NEXT TO this DLL in the GAME "
-            "folder, on BOTH machines (the launcher preserves the key). Then VERIFY the CONFIG "
-            "line below reads suppress_p2=1 BEFORE starting the netplay session. P2 binds: WASD. ***");
+        Log("*** DIAGNOSTIC BUILD v8: suppress_p2 ruled out the P2 graft (still desynced) — "
+            "the sims stay bit-identical ~740 frames then ZUN's own code forks, and coop never "
+            "calls RNG, so our per-frame NETCODE is perturbing the shared x87 FPU differently per "
+            "machine (vanilla replays sync, so the base game is fine — §8o). This build logs the "
+            "x87 control+status words per frame (trace cols fpucw,fpusw) and adds fpu_guard=1 (an "
+            "FPU firewall around the netcode). Test: run fpu_guard=0 (watch fpucw/fpusw diverge), "
+            "then fpu_guard=1 (should hold sync). P2 binds: WASD. ***");
         LoadNetConfig();
         /* Echo the resolved config so every log self-documents what was actually read
          * (a hand-added diagnostic flag that lands in the wrong coop.ini copy silently
          * defaults off — this line makes that visible at a glance / lets the friend
          * pre-flight check solo before the netplay round). */
         Log("CONFIG (read from %scoop.ini): suppress_p2=%d  cherry_both_full=%d  "
-            "proximity_fade=%d | net.enabled=%d role=%s delay=%d seed=0x%04x",
-            s_dir, s_suppressP2, s_b2CherryBothFull, s_proxFade,
+            "fpu_guard=%d  proximity_fade=%d | net.enabled=%d role=%s delay=%d seed=0x%04x",
+            s_dir, s_suppressP2, s_b2CherryBothFull, s_fpuGuard, s_proxFade,
             s_netEnabled, s_netIsHost ? "host" : "guest", s_netDelay, s_netSeed);
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */

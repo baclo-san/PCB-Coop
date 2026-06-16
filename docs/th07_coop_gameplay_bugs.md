@@ -138,26 +138,52 @@ non-FPU global to gate it on. Two viable routes, both needing what this session 
    ST0 (else the x87 stack leaks one slot per spawn → eventual crash). Feasible but
    needs the disasm check + an in-game soak. **Do with the game in front of you.**
 
-### ⏸ B4 — P2 bomb doesn't clear bullets — NEEDS RE + TEST
-RE this session: the bomb's bullet clear is NOT `player+0x2400` (that's the cherry
-**border** sweep — set to 0x3c only in `FUN_004411c0`, drained in `FUN_00441330` via
-`FUN_00424740(0)`). The global bullet-clear sweeps are `FUN_00424740(mgr, n)` /
-`FUN_004249a0(mgr, …)` (walk the `&DAT_0063b218` bullet array, set state 5, latch
-`mgr+0x37a12c=10`). The actual per-bomb clear lives in the **per-character bomb
-callbacks** at `player+0x16a3c`/`+0x16a44`, installed at init from
-`(&PTR_FUN_0049ec50)[DAT_0062f647*4]` keyed by the GLOBAL sel id (so P2 gets its own
-char's callbacks via `SwapSelGlobals`). The callbacks are invoked
-`(**(code**)(player+0x16a3c))()` — Ghidra shows no ECX, so it's **unresolved whether
-they're `__thiscall(player)` (operate on P2) or read the P1 static base `0x4bdad8`
-directly**. That ambiguity IS the open question: identify the 6 callback fns (the
-`0x49ec50` table), read one (e.g. ReimuA), and see whether its bullet-clear /
-spell-spawn is player-relative or P1-hardwired. If P1-hardwired, the spell clears via
-P1 and "no clear for P2" would instead mean the callback isn't running for P2 — but
-P2's bomb visibly deploys, so more likely the clear is keyed off a P1-only flag.
-**Instrument:** log inside one callback (or hook `FUN_00424740`) whether it fires
-during P2's bomb (`s_inP2Update && P2+0x16a20`). Don't implement blind — a generic
-"call `FUN_00424740` while P2 bombs" over-clears and needs the bullet-mgr ECX base
-resolved.
+### 🟡 B4 — P2 bomb doesn't clear bullets — IMPLEMENTED, needs in-game test (commit pending)
+**Shipped:** `HookedAddClearCircle` (FUN_004418b0) + `HookedAddClearBox` (FUN_00441800)
+force ECX to P2 while `s_inP2Update` is set, so P2's bomb registers its clear-regions on
+**P2+0x17dc** (where coop's existing `FUN_0043e260` re-invoke reads them). Safe-by-
+construction: +0x17dc is bomb-only and during P2's update the only legitimate region
+owner is P2 (no-op if ECX was already P2; fix if it was the P1 base). Default on
+(`s_p2BombClear`). **Verify in-game:** P2's bomb now sweeps bullets the way P1's does,
+for every character; P1's own bomb unchanged. If it does NOT clear after this, the
+region positions are being computed from the P1 base too (not just ECX) — then also
+log/redirect the pos arg. Mechanism RE below.
+
+
+**The bomb's bullet clear is the per-player CLEAR-REGION array at `player+0x17dc`** —
+NOT the global sweep (`FUN_00424740`/`FUN_004249a0`, which serve spell-declaration /
+full-power-item / death / cherry-border, none of them player bombs) and NOT
+`player+0x2400` (that's the cherry-border sweep timer). Full map (read this session):
+
+- **Storage:** `player+0x17dc` = 96 clear-region slots, stride **0x20** (8 floats):
+  `[0]=x [1]=y [2]=width(0 ⇒ circle) [3]=height [4]=radius(circle) [6]=? [7]=clear-type`,
+  plus an int **timer at +0x18** (decremented per frame).
+- **Register a region:** `FUN_004418b0` @0x004418b0 (circle: sets `[4]=radius`) and
+  `FUN_00441800` @0x00441800 (box: sets `[2]=w,[3]=h`), both `__thiscall(ECX=player,
+  pos*, …)` — they scan `player+0x17dc` for a free slot and write it.
+- **Test/clear:** `FUN_0043e0a0` @0x0043e0a0 `__thiscall(ECX=player, bulletPos,
+  bulletSize)` walks the 96 regions; a bullet inside any ⇒ returns 2. It's called at
+  the top of the bullet HIT test `FUN_0043e260` (PCBdecomp.c:25992) — `if
+  (FUN_0043e0a0(...)!=0) return 2` ⇒ the bullet update sets state 5 (clearing) +
+  drops a scratch item. **coop ALREADY re-invokes `FUN_0043e260` for P2**
+  (`HookedCollide`), so it reads `P2+0x17dc`.
+- **Per-frame maintenance:** `FUN_00440940` @0x00440940 `__fastcall(player)` decays
+  each region's `+0x18` timer and expires it.
+
+⇒ The clear is **player-relative through and through**. So B4 reduces to ONE question:
+when P2 bombs, do `FUN_004418b0`/`FUN_00441800` write the regions to **P2**+0x17dc?
+The bomb callbacks (5708–6131, `__fastcall(player)`, e.g. ReimuA `FUN_00408710`) run
+param-relative on P2 and call `FUN_004418b0(<ECX hidden>, param_1+0x930, …)`. Ghidra
+hides the ECX, so it's unresolved whether the call threads ECX=param_1 (→ P2+0x17dc,
+B4 would already work) or reloads the P1 static base `0x4bdad8` (→ regions land on
+P1+0x17dc, P2's array stays empty → **exactly B4**). This is the documented coop ECX
+pitfall (§5b).
+
+**Decide it with the disasm** of `FUN_00408710`'s `FUN_004418b0` call (or instrument:
+log `P2+0x17dc[0..]` after P2's bomb callback in `s_inP2Update`). **Scoped fix if
+P1-hardwired:** detour `FUN_004418b0` + `FUN_00441800` and, while `s_inP2Update`,
+force ECX to P2 (re-call with the P2 base) — small, safe, mirrors the existing
+collision re-invoke pattern. No global over-clear, no FPU.
 
 ### ⏸ B5 — P2 bomb doesn't trigger boss invincible-spell form — NEEDS RE + TEST
 Same callback family as B4. The boss-invincible-during-spell anti-cheese is gated on a

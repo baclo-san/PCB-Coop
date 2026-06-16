@@ -208,6 +208,22 @@
 #define OFF_BORDER_REQ  0x240d    /* border request/active flag (1 = pressing bomb pops)*/
 #define OFF_BORDER_SPR  0xb7e6c   /* border-ring sprite object ptr                     */
 
+/* B4 — bomb bullet-clear for P2. PCB's bomb clears bullets via per-player CLEAR-REGION
+ * slots at player+0x17dc (96 × 0x20: x,y,w,h,radius,…,type + timer@+0x18). The bullet
+ * HIT test FUN_0043e260 calls FUN_0043e0a0(player, bulletPos) — a bullet inside any of
+ * the player's regions returns "clear" (state 5). coop ALREADY re-invokes FUN_0043e260
+ * for P2, so it reads P2+0x17dc. The regions are registered by FUN_004418b0 (circle) /
+ * FUN_00441800 (box), __thiscall(ECX=player, pos*, …), called only from the per-char
+ * bomb callbacks. The reported bug = P2's bomb registers nothing on P2+0x17dc (its
+ * callback threads the P1 static base for ECX — the documented coop ECX pitfall). Fix:
+ * detour both registrars and, while inside P2's update window, force ECX to P2. This is
+ * safe-by-construction: +0x17dc is bomb-only and during P2's update the only legitimate
+ * region owner is P2, so the redirect is a no-op if ECX was already P2 and the fix
+ * otherwise. */
+#define ADDR_ADD_CLEAR_CIRCLE ((LPVOID)0x004418b0) /* __thiscall(player,pos,r,col,?,type) */
+#define ADDR_ADD_CLEAR_BOX    ((LPVOID)0x00441800) /* __thiscall(player,pos,w,h,type)      */
+#define OFF_CLEAR_REGIONS 0x17dc
+
 /* Tier-1 boss/enemy HP scaling — DAMAGE-side lever. The first attempt scaled
  * the per-phase max-life cap (+0xd30) at the ECL set-life opcode (FUN_00424290),
  * but the 2026-06-12 eclhp diagnostic proved only popcorn (cap 60) ever passes
@@ -234,6 +250,11 @@ typedef void (__fastcall *ItemLoopFn_t)(void *self);
 /* FUN_00441bd0 is __thiscall(player[ECX], int flag[stack]) with `ret 4` (verified vs the
  * binary). Model as __fastcall: ECX=self, EDX unused, flag on the stack. */
 typedef void (__fastcall *BorderBreakFn_t)(void *self, void *edx, int flag);
+/* B4 clear-region registrars (__thiscall(player, pos*, …)). */
+typedef void *(__fastcall *AddClearCircleFn_t)(void *self, void *edx, void *pos,
+                                               uint32_t r, uint32_t col, uint32_t type);
+typedef void *(__fastcall *AddClearBoxFn_t)(void *self, void *edx, void *pos,
+                                            uint32_t w, uint32_t h, uint32_t type);
 
 /* ---- separate resources (lives/bombs/power) ----
  * They live in the struct at *(player+8) == DAT_00626278, stored as floats, and
@@ -294,6 +315,9 @@ static CollideBulletFn_t s_origCollideBullet = NULL;
 static CollideBulletFn_t s_origGraze         = NULL;   /* FUN_0043e3b0, same signature */
 static CollideLaserFn_t  s_origCollideLaser  = NULL;
 static CollectOverlapFn_t s_origCollectOverlap = NULL;
+static AddClearCircleFn_t s_origAddClearCircle = NULL;  /* B4 */
+static AddClearBoxFn_t    s_origAddClearBox    = NULL;  /* B4 */
+static int s_p2BombClear = 1;          /* B4: P2 bomb clears bullets (default on) */
 static DamageFn_t        s_origDamage        = NULL;
 static ItemLoopFn_t      s_origItemLoop       = NULL;
 
@@ -2025,6 +2049,26 @@ static int __fastcall HookedGraze(void *self, void *edx, float *pos, float *size
     return r;
 }
 
+/* B4 — route P2's bomb clear-region registrations onto P2's own +0x17dc array.
+ * While inside P2's update window, force ECX to P2 so a region (circle/box) the bomb
+ * callback would otherwise stamp on the P1 static base lands on P2 instead. No-op when
+ * the call was already P2's; never touches P1's own bomb (s_inP2Update == 0 then). */
+static void *__fastcall HookedAddClearCircle(void *self, void *edx, void *pos,
+                                             uint32_t r, uint32_t col, uint32_t type)
+{
+    if (s_p2BombClear && s_inP2Update && s_p2 && !s_p2Ghost && self != (void *)s_p2)
+        self = (void *)s_p2;
+    return s_origAddClearCircle(self, edx, pos, r, col, type);
+}
+
+static void *__fastcall HookedAddClearBox(void *self, void *edx, void *pos,
+                                          uint32_t w, uint32_t h, uint32_t type)
+{
+    if (s_p2BombClear && s_inP2Update && s_p2 && !s_p2Ghost && self != (void *)s_p2)
+        self = (void *)s_p2;
+    return s_origAddClearBox(self, edx, pos, w, h, type);
+}
+
 /* ---- item collection: P2 collects items, credited to P2's OWN resources ----
  * The per-item "touched the player -> collect" overlap test (single caller =
  * the item-update loop FUN_00432990). After it runs for P1, if P1 did NOT collect
@@ -3164,6 +3208,8 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_ADD_CLEAR_CIRCLE,(LPVOID)&HookedAddClearCircle,(LPVOID*)&s_origAddClearCircle)!= MH_OK) return 0; /* B4 */
+    if (MH_CreateHook(ADDR_ADD_CLEAR_BOX,  (LPVOID)&HookedAddClearBox,   (LPVOID*)&s_origAddClearBox)   != MH_OK) return 0; /* B4 */
     if (MH_CreateHook(ADDR_MENU_DISPATCH,  (LPVOID)&HookedMenuDispatch,  (LPVOID*)&s_origMenuDispatch)  != MH_OK) return 0;
     if (MH_CreateHook(ADDR_HUD_DRAW,       (LPVOID)&HookedHudDraw,       (LPVOID*)&s_origHudDraw)       != MH_OK) return 0;
     if (MH_CreateHook((LPVOID)ADDR_ANGLE_TO_PLAYER, (LPVOID)&HookedAngleToPlayer, (LPVOID*)&s_origAngleToPlayer) != MH_OK) return 0;

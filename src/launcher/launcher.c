@@ -42,8 +42,9 @@
 #define IDC_CONNECT   1009
 #define IDC_LOCALCOOP 1010
 #define IDC_STATUS    1011
+#define IDC_SUPPRESS  1012
 
-static HWND g_ip, g_port, g_local, g_delay, g_fade, g_exe, g_status;
+static HWND g_ip, g_port, g_local, g_delay, g_fade, g_suppress, g_exe, g_status;
 static char g_dir[MAX_PATH];      /* launcher's own folder (trailing '\\')   */
 static char g_iniPath[MAX_PATH];  /* g_dir + coop.ini                        */
 static char g_dllPath[MAX_PATH];  /* g_dir + th07_coop.dll                   */
@@ -87,19 +88,18 @@ static void WriteIni(int role)
     int local = GetEditInt(g_local, 47001);
     int delay = GetEditInt(g_delay, 2);
     int fade  = (SendMessageA(g_fade, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+    int sup   = (SendMessageA(g_suppress, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
     GetEditStr(g_ip, ip, sizeof(ip));
     if (!ip[0]) strcpy(ip, "127.0.0.1");
     if (delay < 0)  delay = 0;
     if (delay > 10) delay = 10;
 
     WritePrivateProfileStringA("coop", "proximity_fade", fade ? "1" : "0", g_iniPath);
-
-    /* Surface the diagnostic [coop] flags in the file so they're visible to flip,
-     * but NEVER clobber a value the user set by hand: only write when the key is
-     * absent (default -1 sentinel). suppress_p2 isolates the residual netplay
-     * desync; cherry_both_full gates the power->cherry conversion (B2). */
-    if (GetPrivateProfileIntA("coop", "suppress_p2", -1, g_iniPath) < 0)
-        WritePrivateProfileStringA("coop", "suppress_p2", "0", g_iniPath);
+    /* suppress_p2: the netplay desync isolation checkbox — write its state every
+     * launch (like fade) so what the box shows is exactly what the DLL reads. */
+    WritePrivateProfileStringA("coop", "suppress_p2", sup ? "1" : "0", g_iniPath);
+    /* cherry_both_full (B2): no checkbox yet — surface it (default 0) only when
+     * absent, so a hand-set value is never clobbered. */
     if (GetPrivateProfileIntA("coop", "cherry_both_full", -1, g_iniPath) < 0)
         WritePrivateProfileStringA("coop", "cherry_both_full", "0", g_iniPath);
 
@@ -260,6 +260,10 @@ static void Prefill(void)
     sprintf(buf, "%d", local); SetWindowTextA(g_local, buf);
     sprintf(buf, "%d", delay); SetWindowTextA(g_delay, buf);
     SendMessageA(g_fade, BM_SETCHECK, fade ? BST_CHECKED : BST_UNCHECKED, 0);
+    {   /* diagnostic: P2-suppress isolation flag (default off) */
+        int sup = (int)GetPrivateProfileIntA("coop", "suppress_p2", 0, g_iniPath);
+        SendMessageA(g_suppress, BM_SETCHECK, sup ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
 
     /* th07.exe: prefer the path remembered from a previous run, then one sitting
      * next to the launcher (the intended drop). */
@@ -301,6 +305,9 @@ static void CreateControls(HWND w)
     y += row;
     g_fade = mk(w, "BUTTON", "Fade the other player when they overlap you",
                 BS_AUTOCHECKBOX, edx, y, 300, 22, IDC_FADE);
+    y += row;
+    g_suppress = mk(w, "BUTTON", "Suppress P2 (netplay desync isolation test)",
+                BS_AUTOCHECKBOX, edx, y, 300, 22, IDC_SUPPRESS);
     y += row;
 
     mk(w, "STATIC", "th07.exe:", WS_VISIBLE, lblx, y+3, 110, 20, 0);
@@ -368,7 +375,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
     sprintf(title, "%s  [net protocol %s]", APP_TITLE, "3.9.5");
     w = CreateWindowA("PcbCoopLauncher", title,
                       WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                      CW_USEDEFAULT, CW_USEDEFAULT, 438, 430,
+                      CW_USEDEFAULT, CW_USEDEFAULT, 438, 464,
                       NULL, NULL, hInst, NULL);
     if (!w) return 1;
     ShowWindow(w, show);

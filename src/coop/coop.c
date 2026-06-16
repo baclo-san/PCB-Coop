@@ -1984,8 +1984,17 @@ static int __fastcall HookedCollideBullet(void *self, void *edx, float *pos, flo
     int r = (isP1 && s_p1Ghost) ? 0                       /* ghost P1: untouchable */
           : s_origCollideBullet(self, edx, pos, size);    /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2))
-        s_origCollideBullet(p2, edx, pos, size);          /* P2 — param-relative */
+    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
+        int r2 = s_origCollideBullet(p2, edx, pos, size); /* P2 — param-relative */
+        /* This is the per-bullet HIT test (runs once the bullet is grazed). It also
+         * returns 2 when the bullet is inside the player's bomb-clear field
+         * (FUN_0043e0a0 over +0x17dc). For an already-grazed bullet THIS is the only
+         * test that runs, so P2's bomb-clear of grazed bullets comes through here.
+         * Propagate r2==2 (clear) so the bullet despawns (gameplay bug B4). A plain
+         * P2 HIT (r2==1) stays discarded: a bullet that hits a player does not
+         * despawn in PCB, so leaving the caller's bookkeeping on P1's return is right. */
+        if (r == 0 && r2 == 2) r = 2;
+    }
     return r;
 }
 
@@ -2014,7 +2023,13 @@ static int __fastcall HookedGraze(void *self, void *edx, float *pos, float *size
     void *p2 = (void *)s_p2;
     if (p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
         int r2 = s_origGraze(p2, edx, pos, size);          /* P2 — param-relative */
-        if (r == 0 && r2 == 1) r = 1;   /* P2 grazed -> mark bullet grazed so its hit test runs */
+        /* r2==2 -> the bullet sits inside P2's bomb-clear field (FUN_0043e0a0 hit a
+         *          clear region in P2's OWN +0x17dc array, populated by P2's bomb cb).
+         *          Propagate it so the bullet update despawns the bullet -> P2's bomb
+         *          now clears bullets too (gameplay bug B4). r2==2 takes precedence
+         *          over a graze: a cleared bullet should not merely be flagged grazed.
+         * r2==1 -> P2 grazed -> mark the bullet grazed so its hit test runs for P2. */
+        if (r == 0) { if (r2 == 2) r = 2; else if (r2 == 1) r = 1; }
     }
     return r;
 }

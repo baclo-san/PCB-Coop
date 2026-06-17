@@ -197,7 +197,19 @@ P1-hardwired:** detour `FUN_004418b0` + `FUN_00441800` and, while `s_inP2Update`
 force ECX to P2 (re-call with the P2 base) — small, safe, mirrors the existing
 collision re-invoke pattern. No global over-clear, no FPU.
 
-### ⏸ B5 — P2 bomb doesn't trigger boss invincible-spell form — NEEDS RE + TEST
+### 🟡 B5 — P2 bomb → Extra/Phantasm boss invuln — IMPLEMENTED (fallback), needs in-game test
+Ported from nightshift's keen-ramanujan branch (commit 2a5c785) to main. ZUN gates ALL shot
+damage on `DAT_004d44f8==0` (= P1 NOT bombing, PCBdecomp.c:12829), so during P1's bomb the boss
+takes nothing (its invincible spell form). That flag is P1's field (`P1+0x16a20` = `OFF_BOMBING`);
+P2's bomb never set it, so the boss kept taking P1+P2 damage during a P2 bomb. Fix in
+`HookedDamage`: when P2 is bombing (`P2+OFF_BOMBING != 0`) on Extra/Phantasm (`ADDR_DIFFICULTY`
+4/5), zero the sweep's damage — the sweep already ran so shots are still consumed/sparked, exactly
+like ZUN's gate (which blocks only the apply). This is the **user-accepted fallback** ("full boss
+invuln during P2 bomb"); reproducing P1's exact transform is the follow-up. **Verify in-game:**
+on Extra/Phantasm, P2 bombing during a boss spell stops damage (no cheese); normal stages
+unaffected. NB: uses main's validated `ADDR_DIFFICULTY 0x626280`, not the branch's `0x62f85c`.
+
+### ⏸ B5 (original RE notes) — the proper transform follow-up
 RE this session (corrects an earlier guess): `+0x1fbac` is the **BOSS** spell-card
 index, not the player bomb — `FUN_00429a4f` @0x00429a4f `__thiscall(scoreMgr, spellIdx)`
 declares a boss spell (writes `+0x1fbac = spellIdx`, resets the 900-dword spell-bonus

@@ -2052,6 +2052,52 @@ are identical host-vs-guest throughout, the cause is NOT the FPU and the search 
 per-machine inputs our code might feed the sim (pointer/address-ordered logic, uninitialised
 reads) — though P2-suppressed leaves very little of that surface.
 
+### §8q — fpu_guard gave ONE perfect run but desync is INTERMITTENT ⇒ D3D x87 precision; PIN the control word (2026-06-17)
+
+**Result of the v8 test.** With `suppress_p2=1, fpu_guard=1` the main pair (Ryzen 5800X ↔
+i7-2620M, one on Wine) ran **18,766 stage frames bit-perfect** (seed AND counter identical the
+whole stage, to a Chen death) — `diverging frames: 0`. Proof the netcode WAS a real source and
+the firewall removes it. **BUT** the user reports that was the *only* time it worked: all
+further runs "back to Desync City, with or without P2." A second old-laptop pair (i7-2620M ↔ i5,
+Win7↔8.1) desynced with `fpu_guard` on AND off — its trace shows the x87 **status word differing
+host (`0020`) vs guest (`0000`)** at the fork (frame 936), i.e. the two CPUs handling identical
+FP ops differently.
+
+**The intermittency is the key clue** (the desync fork frame varies: 626 / 743 / 936 / never).
+A deterministic cause (fixed CPU-transcendental gap) would fork at the SAME frame every run.
+Varying ⇒ a per-run variable. The strongest fit, and the correct read (caught by nightshift's
+keen-ramanujan branch, commit 8d09974): **the x87 PRECISION control word set by Direct3D8.**
+ZUN omits `D3DCREATE_FPU_PRESERVE`, so D3D8 sets 24-bit single precision at device-create and can
+RESET it on `Present()`. Two machines' D3D drivers/wrappers (Wine vs Windows, different GPUs)
+can leave it in DIFFERENT states (24- vs 53-bit) — so whether they match **varies run-to-run**:
+a clean run when they happen to agree, desync when they don't. This also corrects §8o (the base
+game IS cross-deterministic — vanilla replays sync; the user confirmed receiving working replays
+many times).
+
+Why `fpu_guard` didn't fix it: `fnsave`/`frstor` faithfully *preserves* whatever control word
+the game already had — if D3D left it at 53-bit on one machine, the guard keeps it 53-bit. The
+guard removes the NETCODE's stack churn (a second, real source — hence the one clean run when the
+control words happened to match) but cannot equalise a D3D-induced precision mismatch.
+
+**v9 fix (ported from the branch, adapted): `PinFpuForNetplay()`** — `_controlfp(_PC_24 |
+_RC_NEAR, _MCW_PC | _MCW_RC)` once per logic frame in `HookedSceneTick` under `s_netActive`, so
+BOTH machines run ZUN's sim at vanilla's 24-bit/round-nearest regardless of what D3D did. It logs
+the PREVIOUS control word on the first pin — **if the host and guest "was 0x____" values differ
+in the next 2-PC test, that was the desync, confirmed.** `fpu_guard` stays on by default as a
+complement (it covers x87 *stack* state, which the CW pin does not). Gated on netplay only, so
+local/replay is byte-identical.
+
+**Branch housekeeping:** `keen-ramanujan-6unds2` (B2+B4) is fully redundant with main. From
+`keen-ramanujan-mrh2n7` only two things were new and were ported to main manually (not merged —
+the branch's B2/B4/D1/§8n duplicate main in conflicting form): the **CW pin** above and **B5**
+(P2 bomb → Extra/Phantasm boss invuln, using main's validated `ADDR_DIFFICULTY 0x626280`, not the
+branch's `0x62f85c`). Both branches can be deleted once this is pushed.
+
+**Next test:** `suppress_p2=1` (keep P2 out to stay minimal), `fpu_guard=1`, run 2-3 stages.
+Read the `control word pinned (was 0x__)` line on each machine — differing values confirm the
+mechanism. If it now holds sync across several runs, re-enable P2 (`suppress_p2=0`) for the real
+full-co-op test.
+
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +
 retry all confirmed by the user). Before any risky change, note the last-good

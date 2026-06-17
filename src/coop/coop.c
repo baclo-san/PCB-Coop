@@ -148,6 +148,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <float.h>
 #include "MinHook.h"
 
 /* ---- build-specific addresses (Ghidra db: th07.exe.c ver 1.00b) ---- */
@@ -1021,7 +1022,7 @@ static void LoadNetConfig(void)
     /* §8o follow-up: firewall the per-frame netcode's x87 FPU use (save/restore the
      * game's full x87 state around Nc_GetInputNet) so the lockstep wait's timing math
      * can't perturb ZUN's FP differently on the two machines. Candidate desync fix. */
-    s_fpuGuard = (int)GetPrivateProfileIntA("coop", "fpu_guard", 0, ini);
+    s_fpuGuard = (int)GetPrivateProfileIntA("coop", "fpu_guard", 1, ini);  /* CONFIRMED FIX — default ON */
     s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
     if (!s_netEnabled) return;
     GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);
@@ -1073,6 +1074,32 @@ static unsigned char s_fpuState[108] __attribute__((aligned(16)));
 #define FPU_SAVE()    __asm__ __volatile__("fnsave  %0" : "=m"(s_fpuState) : : "memory")
 #define FPU_RESTORE() __asm__ __volatile__("frstor  %0" : : "m"(s_fpuState) : "memory")
 static unsigned short s_fpuCw = 0, s_fpuSw = 0;   /* last-frame x87 words for the trace (s_fpuGuard declared above) */
+
+/* ── x87 FPU control-word PIN (the likely real desync fix — from nightshift's
+ *    keen-ramanujan branch, §8q) ────────────────────────────────────────────────
+ * Direct3D8 sets the x87 to 24-bit single precision at device-create (ZUN omits
+ * D3DCREATE_FPU_PRESERVE), so vanilla PCB — and its replays — run at 24-bit. But the
+ * two players' D3D drivers / wrappers (Wine vs Windows, different GPUs) can leave the
+ * control word in DIFFERENT states, and D3D can RESET it on Present(); so whether the
+ * two machines' precision matches varies run-to-run — exactly the INTERMITTENT desync
+ * (a clean run when they happen to match, "Desync City" when they don't). fnsave/
+ * frstor (s_fpuGuard) can't fix this: it faithfully preserves whatever (wrong) word
+ * the game already had. The pin FORCES precision=24-bit, rounding=nearest each logic
+ * frame so both machines agree regardless of what D3D did. Gated on s_netActive — the
+ * confirmed-good local/replay build never touches the control word. The first pin logs
+ * the PREVIOUS word so a 2-PC test reveals whether host and guest actually differed. */
+static int s_fpuPinned = 0;
+static void PinFpuForNetplay(void)
+{
+    unsigned prev = _controlfp(0, 0);                   /* read current */
+    _controlfp(_PC_24 | _RC_NEAR, _MCW_PC | _MCW_RC);   /* pin 24-bit single, round-nearest */
+    if (!s_fpuPinned) {
+        s_fpuPinned = 1;
+        Log("netplay: x87 control word pinned to 24-bit/round-nearest (was 0x%04x). "
+            "role=%s — if host and guest 'was' values differ, that was the desync.",
+            prev & 0xffff, Nc_IsHost() ? "host" : "guest");
+    }
+}
 
 /* DIAGNOSTIC (det-trace) — one CSV row per logic frame while netplay is active.
  * Both machines run the SAME frame indices under lockstep, so diffing the host
@@ -1139,6 +1166,7 @@ static int __fastcall HookedSceneTick(void *self)
         return r;                           /* no lockstep until connected             */
     }
     if (s_netActive) {
+        PinFpuForNetplay();   /* §8q: force matching x87 precision/rounding before the sim runs */
         /* START BARRIER / scene-reset — the th06 Supervisor::OnUpdate "last_frame_a >
          * frame_a" realign (Supervisor.cpp), driven here by PCB's top-level scene id
          * at self+0x154. th06's lockstep clock is the game's per-scene calcCount, which
@@ -2447,6 +2475,23 @@ static int __fastcall HookedDamage(void *self, void *edx,
         r = (int)(r * 0.6f);                 /* 2P team DPS damper (was /2) */
         if (r == 0) r = 1;
     }
+
+    /* B5 (from nightshift's keen-ramanujan branch): Extra/Phantasm boss invincibility
+     * during a bomb. ZUN gates ALL shot damage on DAT_004d44f8==0 (= P1 NOT bombing,
+     * PCBdecomp.c:12829), so during P1's bomb the boss takes nothing — its invincible
+     * spell form. That flag is P1's struct field (P1+0x16a20); P2's bomb never sets it,
+     * so the boss kept taking P1+P2 damage during a P2 bomb, cheesing Extra/Phantasm.
+     * Mirror P1 by zeroing the sweep's damage while P2 is bombing (the sweep already ran,
+     * so shots are still consumed + sparked, exactly like ZUN's gate which blocks only
+     * the APPLY). Scoped to Extra/Phantasm (difficulty 4/5) to leave normal pacing alone.
+     * User's accepted fallback ("full boss invuln during P2 bomb"); the real transform
+     * is a follow-up. Uses main's validated ADDR_DIFFICULTY (0x626280), not the branch's. */
+    if (r > 0 && (uint32_t)self == ADDR_PLAYER_BASE && p2 && !s_p2Ghost) {
+        int diff = (int)*ADDR_DIFFICULTY;
+        if ((diff == 4 || diff == 5) &&
+            *(volatile int *)((char *)p2 + OFF_BOMBING) != 0)
+            r = 0;
+    }
     return r;
 }
 
@@ -3378,13 +3423,14 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
-        Log("*** DIAGNOSTIC BUILD v8: suppress_p2 ruled out the P2 graft (still desynced) — "
-            "the sims stay bit-identical ~740 frames then ZUN's own code forks, and coop never "
-            "calls RNG, so our per-frame NETCODE is perturbing the shared x87 FPU differently per "
-            "machine (vanilla replays sync, so the base game is fine — §8o). This build logs the "
-            "x87 control+status words per frame (trace cols fpucw,fpusw) and adds fpu_guard=1 (an "
-            "FPU firewall around the netcode). Test: run fpu_guard=0 (watch fpucw/fpusw diverge), "
-            "then fpu_guard=1 (should hold sync). P2 binds: WASD. ***");
+        Log("*** DIAGNOSTIC BUILD v9: the residual desync is INTERMITTENT (fpu_guard gave one "
+            "bit-perfect run then desync recurred, with/without P2) — the tell that D3D leaves the "
+            "x87 PRECISION control word in different states per machine/run (§8q). This build now "
+            "PINS the x87 control word to 24-bit/round-nearest each frame under netplay (vanilla's "
+            "value) so both machines agree — the likely real fix. fpu_guard (FPU firewall) stays on "
+            "by default as a complement; fpucw/fpusw still logged. Watch the 'control word pinned "
+            "(was 0x__)' line: if host and guest differ, that was the desync. Also B5 (P2 bomb -> "
+            "Extra/Phantasm boss invuln). P2 binds: WASD. ***");
         LoadNetConfig();
         /* Echo the resolved config so every log self-documents what was actually read
          * (a hand-added diagnostic flag that lands in the wrong coop.ini copy silently

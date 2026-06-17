@@ -1029,6 +1029,16 @@ static int s_p2InputLogged = 0;
 #define ADDR_INPUT_MENU ((volatile uint16_t *)0x004b9e4c) /* g_InputMenu (raw poll)    */
 #define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
 #define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
+/* Menu key-REPEAT (hold-to-scroll) state. ZUN's scene-tick (FUN_00437c70 @22803-22816)
+ * derives these from the LOCAL keyboard poll, BEFORE our merged-word overwrite — so the
+ * cursor's hold-scroll (gated on the repeat flag @PCBdecomp.c:29077) advances a machine-
+ * dependent number of steps and the two peers land on DIFFERENT difficulty/cursor rows
+ * (confirmed: one HOST on Hard, one on Phantasm). We recompute both from the MERGED stream
+ * each menu frame so hold-scroll is deterministic. (Taps already sync: they edge-detect
+ * cur/prev, both of which carry the merged word.) */
+#define ADDR_MENU_REPEAT_FLAG ((volatile uint16_t *)0x004b9e5c) /* DAT_004b9e5c: repeat tick */
+#define ADDR_MENU_REPEAT_CTR  ((volatile uint16_t *)0x004b9e60) /* DAT_004b9e60: hold counter */
+static uint16_t s_menuRepeatCtr = 0;   /* our shadow of the repeat counter, merged-driven */
 
 typedef int (__fastcall *SceneTickFn_t)(void *self);
 typedef int (__fastcall *GameStartFn_t)(int self);
@@ -1240,6 +1250,29 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
     fflush(s_trace);                        /* survive the freeze tail */
 }
 
+/* Re-derive ZUN's menu key-repeat (hold-to-scroll) from the MERGED word so it is
+ * identical on both peers. Mirrors FUN_00437c70's own logic (PCBdecomp.c:22806-22816)
+ * verbatim, but with prev = last frame's merged (ZUN already copied it into
+ * ADDR_MENU_IN_PREV) and cur = this frame's merged — instead of the local poll ZUN used.
+ * We keep our own shadow counter (ZUN's was already bumped from the local compare this
+ * frame; we discard that by overwriting both globals). Menu-only — the flag is consumed
+ * solely by the menu cursor; in-stage the merged word is gameplay input. */
+static void SyncMenuRepeat(uint16_t merged)
+{
+    uint16_t prevMerged = *ADDR_MENU_IN_PREV;     /* = last frame's merged word */
+    *ADDR_MENU_REPEAT_FLAG = 0;
+    if (prevMerged == merged) {
+        if (s_menuRepeatCtr > 0x1d) {
+            *ADDR_MENU_REPEAT_FLAG = (uint16_t)(s_menuRepeatCtr % 8 == 0);
+            if (s_menuRepeatCtr > 0x25) s_menuRepeatCtr = 0x1e;
+        }
+        s_menuRepeatCtr++;
+    } else {
+        s_menuRepeatCtr = 0;
+    }
+    *ADDR_MENU_REPEAT_CTR = s_menuRepeatCtr;
+}
+
 /* FUN_00437c70 — per-logic-frame scene input task. Owns the netcode frame
  * counter and overwrites g_InputMenu with the merged word. */
 static int __fastcall HookedSceneTick(void *self)
@@ -1290,6 +1323,7 @@ static int __fastcall HookedSceneTick(void *self)
                 s_netSceneId, sceneId, s_netFrame);
             s_netSceneId = sceneId;
             s_netFrame   = 0;
+            s_menuRepeatCtr = 0;        /* fresh hold-scroll state for the new scene  */
             s_seedForced = 0;           /* re-force the shared seed at the new scene  */
             Nc_Reset();                 /* clear peer buffer + frame index (th06 reset) */
             s_netDesyncLogged = 0; s_netSyncRun = 0;
@@ -1310,6 +1344,10 @@ static int __fastcall HookedSceneTick(void *self)
          * the menu-bit layout, so these are P1's / P2's raw menu words). */
         Nc_GetLastSplit(&s_netP1Menu, &s_netP2Menu);
         *ADDR_INPUT_MENU = merged;          /* menus together; in-stage -> g_InputGameplay */
+        /* menus only: make hold-to-scroll deterministic by recomputing the key-repeat
+         * from the merged word (ZUN derived it from the local poll above) — fixes the
+         * peers landing on different difficulties. */
+        if (!inStage) SyncMenuRepeat(merged);
 
         /* live telemetry for the overlay + log: the RNG pair we compare and how long
          * this frame blocked on the peer (the direct read on a lockstep stall). */
@@ -2848,6 +2886,15 @@ static int __fastcall HookedFrameTask(int *self)
             Log("frame counter reset -> FRESH start (score %d < %d) -> P2 reset",
                 score, s_lastScore);
             s_p2Carry = 0;              /* reseed P2 fresh (lives from P1, char bombs) */
+            /* NETPLAY: an Esc+R / continue retry stays in the SAME scene, so the
+             * scene-change re-force (HookedSceneTick) never fires and the restart kept
+             * the old RNG seed — a forked stage could only re-align by a full title
+             * round-trip (the test logs: "couldn't sync no matter how many Esc+R").
+             * Re-arm the seed force here so the next HookedGameStart re-applies the
+             * shared init seed on BOTH peers, exactly like a scene reset does. Both
+             * peers detect this fresh-start on the same merged-input-driven frame, so
+             * the re-arm lands together. */
+            if (s_netActive) s_seedForced = 0;
         } else {
             Log("frame counter reset (stage advance) -> P2 rebuild (resources carried)");
             s_p2Carry = (s_p2 != NULL);

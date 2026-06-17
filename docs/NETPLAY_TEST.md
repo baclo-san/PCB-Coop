@@ -108,8 +108,37 @@ menu RNG readout (added this cut) is to catch exactly when/where that divergence
 real fix remains the EoSD-style "Start Game" barrier**, not more FPU tweaking. Tracked, not yet
 implemented — it's the next netplay work item.
 
+### Root cause CONFIRMED from those logs + two fixes (2026-06-18)
+Reading `tovrof`/`7454cb` frame-by-frame settled three things — **none of it is the x87 control
+word** (every `control word pinned` line is `was 0x001f` on *both* peers, so the §8q precision
+theory is ruled out for these builds):
+
+1. **The menu "desync" is real and game-breaking — different difficulties.** A live run put one
+   peer on Hard, the other on Phantasm. Traced to ZUN's menu **key-repeat** (hold-to-scroll):
+   `FUN_00437c70` (PCBdecomp.c:22803-22816) derives the repeat counter/flag (`DAT_004b9e60` /
+   `DAT_004b9e5c`) from the **local keyboard poll**, *before* our merged-word overwrite. The
+   cursor's hold-scroll is gated on that flag (PCBdecomp.c:29077), so holding a direction advances
+   the cursor a **machine-dependent** number of steps. Taps already sync (they edge-detect
+   cur/prev, which carry the merged word); only *holds* diverged. **Fix:** `SyncMenuRepeat()` now
+   recomputes the repeat counter/flag from the **merged** word each menu frame, so hold-scroll is
+   deterministic on both peers.
+2. **The menu RNG heartbeat (`ctr=0`) is a different, harmless signal** — the menu draws no RNG,
+   so `self/peer` just differ by an idle seed value. The difficulty fork above is an *input*
+   divergence, not RNG. Both now visible on the menu HUD.
+3. **Esc+R never re-seeded.** `SEEDFORCE` only fired on first stage entry from the menu; the
+   `frame counter reset -> FRESH start` retry path stays in the same scene, so a forked stage
+   could only re-align via a full title round-trip — exactly "couldn't sync no matter how many
+   Esc+R" in attempt 1. **Fix:** the fresh-start retry now re-arms the seed force, so the next
+   `HookedGameStart` re-applies the shared init seed on both peers (the same realign the HARD
+   DESYNC log already names, now reachable from a quick restart).
+
+Still open: the **first** menu→stage transition can still fork from front-end load drift (each PC
+burns a different number of loading ticks); the scene-reset re-zero handles most of it but the
+EoSD-style explicit start barrier remains the proper long-term fix.
+
 ## Notes / known limits (this cut)
 - **Launcher** replaces hand-editing `coop.ini`. Auto-connect; host pushes delay+seed.
 - **Per-player character select** works (host=P1 then guest=P2). Title/difficulty host-led.
+- **Menu hold-to-scroll** is now lockstep-deterministic (difficulty can't fork between peers).
 - **Proximity fade** is ON by default (set `[coop] proximity_fade=0` to disable).
 - Local-keyboard co-op is unchanged — click **Local Co-op** (or `[net] enabled=0`).

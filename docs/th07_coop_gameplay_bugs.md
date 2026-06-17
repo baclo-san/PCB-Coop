@@ -503,3 +503,38 @@ spell, param_1≠0 and we resolve the enemy-manager base from `enBase`.
 
 > The earlier session-5 crash was unrelated to B5 — it was bombing while **P2 killable was off**
 > (a separate bug to chase). The `FUN_0042ad66` call was reverted to a plain memory read regardless.
+
+## Status — 2026-06-18 (session 7) — B5 base FIXED, focus-hitbox fade, menu net HUD
+
+**B5 — the "param_1 = 0" assumption was WRONG; armour now reads the LIVE enemy-manager base.**
+The session-6 `@hit` dump came back exactly as the fallback note predicted: `scActive=0
+usedBomb=0 … enBase=0x009b3998` while a real Extra boss spell was being bombed, and `bomb END …
+zeroed = 0`. `enBase` (the boss ENEMY) is non-zero, which means `param_1` (the enemy-MANAGER
+context base) is non-zero too — so `0x9545c8` / `0x9545dc` are **displacements off that base**,
+not absolute globals. Reading the absolute addresses returned a perpetual 0, so the armour never
+engaged.
+
+Fix: `param_1` is the `ECX` of the enemy-update fn `FUN_00420620` (it stores ECX at `[ebp-0x1e8]`,
+the exact local feeding the spellcard read at `0x421387` / PCBdecomp.c:12868). `HookedEnemyUpdate`
+captures that base into `s_enemyMgr` every tick (record-and-forward, no behaviour change), and
+`SpellcardActive()`/`SpellcardUsedBomb()` read `s_enemyMgr + 0x9545c8 / +0x9545dc`. The hook was
+**defined but never installed** before — it's now in the `MH_CreateHook`/`MH_EnableHook` list
+(`ADDR_ENEMY_UPDATE`). The `B5 diag` START/@hit lines now also print `mgr=0x%08x`. **Confirm next
+run:** `mgr` is non-zero, `scActive=1` while bombing a boss spell, `bomb END … zeroed > 0`.
+
+**Gameplay — proximity fade now fades the OTHER player's focus-mode hitbox too.** The fade only
+tinted the sprite (`player+OFF_TINT`); the focus ring + central hitbox dot (effect type `0x18`,
+handle at `player+0x9d8`) stayed fully opaque and, per the user, is *more* distracting than the
+sprite when the two overlap. `FadePlayerFocusFx()` writes the same alpha into the effect's ARGB
+field (`fx+0x1b8`, set once at spawn by `FUN_0041c610`, never rewritten by the focus updater
+`FUN_0041abe0`, so a per-frame write sticks to the draw). Applied symmetrically in
+`ApplyProximityFade` (host fades P2's, guest fades the remote P1's). No-op when that player isn't
+focusing. Gated on `proximity_fade` exactly like the sprite fade.
+
+**Netplay — status HUD now shows on the menu (top row).** Menu desyncs were invisible until the
+game refused to start in sync. `HookedSceneTick` runs the same lockstep merge on the front-end, so
+`s_netFrame` / `s_netSync` / the RNG oracle are live there. `DrawNetMenuStatus()` queues a top-row
+ascii line — `NET <H|G> F<frame> d<delay> <SYNC|DSYN> <selfRng>/<rcvRng>` (or `NET … WAITms` on a
+stall, `NET LOST` on drop) — via the same global ascii queue the menu already flushes for the "P2
+SELECT CHARACTER" prompt. Pure draw, no determinism impact. A menu desync is now visible the instant
+the two RNG seeds diverge. (Menu *stability* itself is still open — see NETPLAY_TEST notes.)

@@ -408,6 +408,7 @@ static float s_p1AliveBombs = 0.f, s_p2AliveBombs = 0.f;
 #define OFF_FX_KILL       0x1c6    /* u16: 1 = fade out & die                      */
 #define OFF_FX_TYPE       0x2cd    /* u8: effect type byte                         */
 #define OFF_FX_POS        0x24c    /* float[3] world position                      */
+#define OFF_FX_COLOR      0x1b8    /* u32 ARGB tint (param_6 of FUN_0041c610@26415)*/
 #define OFF_PLAYER_FX     0x9d8    /* player: handle of its own focus effect       */
 /* __thiscall(mgr, type, pos, slotArg, a5, color) modelled as __fastcall */
 typedef void *(__fastcall *EffectSpawnFn_t)(void *mgr, void *edx, int type,
@@ -1970,6 +1971,20 @@ static void MoveGhost(void *p2)
 #define PROX_FAR2   (48.0f * 48.0f)    /* >= this: fully opaque                   */
 #define PROX_FLOOR  0x40u              /* minimum alpha when fully overlapped     */
 
+/* Fade a player's FOCUS-mode indicator (the rotating ring + central hitbox dot,
+ * effect type 0x18) to match the sprite fade. The handle lives at player+0x9d8;
+ * its ARGB tint is at fx+0x1b8 (set once at spawn, never rewritten by the focus
+ * updater FUN_0041abe0, so a per-frame write here sticks until the draw). The
+ * focused remote player's hitbox is at least as distracting as the sprite when
+ * the two overlap, so it gets the same alpha. No-op when that player isn't
+ * focusing (no live focus effect). */
+static void FadePlayerFocusFx(void *player, uint32_t tint)
+{
+    uint32_t fx = *(uint32_t *)((char *)player + OFF_PLAYER_FX);
+    if (fx && *(unsigned char *)(fx + OFF_FX_TYPE) == FX_TYPE_FOCUS)
+        *(uint32_t *)(fx + OFF_FX_COLOR) = tint;
+}
+
 static void ApplyProximityFade(void *p2)
 {
     float *p1pos = (float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X);
@@ -1985,12 +2000,15 @@ static void ApplyProximityFade(void *p2)
     }
     uint32_t tint = (a << 24) | 0x00ffffffu;
     if (s_netActive && !Nc_IsHost()) {
-        /* guest: local = P2, so fade the REMOTE P1; keep P2 opaque */
+        /* guest: local = P2, so fade the REMOTE P1 (sprite + focus hitbox); keep P2 opaque */
         *(uint32_t *)((char *)ADDR_PLAYER_BASE + OFF_TINT) = tint;
+        FadePlayerFocusFx((void *)ADDR_PLAYER_BASE, tint);
         *(uint32_t *)((char *)p2 + OFF_TINT) = 0xffffffffu;
+        FadePlayerFocusFx(p2, 0xffffffffu);
     } else {
-        /* host / single-machine: local = P1, so fade the REMOTE P2 */
+        /* host / single-machine: local = P1, so fade the REMOTE P2 (sprite + focus hitbox) */
         *(uint32_t *)((char *)p2 + OFF_TINT) = tint;
+        FadePlayerFocusFx(p2, tint);
     }
 }
 
@@ -2585,11 +2603,13 @@ static void __fastcall HookedDeclDraw(void *self)
  *   if (isActive) { if (out==0) dmg/=7; else if (usedBomb) dmg/=3; else dmg=0; }
  * and the bomb handler does `usedBomb = isActive` (Player.cpp:364). PCB is the same engine:
  * the damage code at PCBdecomp.c:12867-12899 reads `DAT_009545c8 + param_1` (isActive) and
- * `DAT_009545dc + param_1` (usedBomb). param_1 is the enemy-manager context base; for the
- * single active game it is 0, so the fields are the absolute globals 0x009545c8 / 0x009545dc
- * (the addresses Ghidra resolved). We read isActive directly to gate the bomb armour, and
- * log both + the old declaration index so one run confirms the signal. (The transform that
- * "removes the boss hitbox" is the dmg=0 leaf of that same model.) */
+ * `DAT_009545dc + param_1` (usedBomb). param_1 is the enemy-manager context base. We first
+ * assumed it was 0 (absolute globals), but an in-game @hit dump read scActive=0 with a real
+ * boss present — param_1 is genuinely NON-ZERO, so 0x9545c8/0x9545dc are DISPLACEMENTS off
+ * that base, not absolute addresses. We capture the live base at runtime (HookedEnemyUpdate,
+ * = ECX of FUN_00420620, verified stored at [ebp-0x1e8] for the read at 0x421387) and read
+ * isActive/usedBomb relative to it (SC_OFF_* below). (The transform that "removes the boss
+ * hitbox" is the dmg=0 leaf of that same model.) */
 #define SC_OFF_ISACTIVE   0x9545c8   /* enemy-manager spellcardInfo.isActive (from base) */
 #define SC_OFF_USEDBOMB   0x9545dc   /* enemy-manager spellcardInfo.usedBomb             */
 #define ADDR_SPELL_MGR_PTR ((volatile uint32_t *)0x0049fbf8) /* (old decl-index path, diag only) */
@@ -2714,15 +2734,17 @@ static int __fastcall HookedDamage(void *self, void *edx,
             unsigned char fl = pos ? *(unsigned char *)((char *)pos - ENEMY_OFF_POS + ENEMY_OFF_FLAGS) : 0;
             int isBoss = (fl & ENEMY_FLAG_BOSS) != 0;
             /* One-shot per bomb: dump the decision-point state so ONE Extra/Phantasm run
-             * confirms the corrected signal — scActive/usedBomb (0x9545c8/0x9545dc) should
-             * be nonzero on a spell, the old declIdx stays -1. enBase sanity-checks param_1=0. */
+             * confirms the corrected signal — scActive/usedBomb (read off the live enemy-mgr
+             * base, mgr=0x%08x) should be nonzero on a spell, the old declIdx stays -1.
+             * enBase is the boss ENEMY base; mgr is the captured enemy-MANAGER base. */
             if (isBoss && !s_b5HitLogged) {
                 s_b5HitLogged = 1;
                 Log("B5 diag@hit: scActive=%d usedBomb=%d declIdx=%d flags=0x%02x "
-                    "(b3invuln=%d b4dmg=%d b6boss=1) r=%d enBase=0x%08x",
+                    "(b3invuln=%d b4dmg=%d b6boss=1) r=%d enBase=0x%08x mgr=0x%08x",
                     SpellcardActive(), SpellcardUsedBomb(), BossSpellIndexRaw(), fl,
                     (fl >> 3) & 1, (fl >> 4) & 1, r,
-                    pos ? (uint32_t)((char *)pos - ENEMY_OFF_POS) : 0);
+                    pos ? (uint32_t)((char *)pos - ENEMY_OFF_POS) : 0,
+                    (uint32_t)s_enemyMgr);
             }
             if (isBoss && SpellcardActive()) {
                 r = 0;
@@ -2880,9 +2902,9 @@ static int __fastcall HookedUpdate(void *self)
             s_b5ZeroCount = 0;
             s_b5HitLogged = 0;           /* re-arm the @hit dump for this bomb */
             Log("B5 diag: P2 bomb START  diff[0x626280]=%u diff[0x62f85c]=%u p2bombing=%d "
-                "scActive=%d usedBomb=%d declIdx=%d",
+                "scActive=%d usedBomb=%d declIdx=%d mgr=0x%08x",
                 *(volatile uint32_t *)0x00626280, *(volatile uint32_t *)0x0062f85c, b,
-                SpellcardActive(), SpellcardUsedBomb(), BossSpellIndexRaw());
+                SpellcardActive(), SpellcardUsedBomb(), BossSpellIndexRaw(), (uint32_t)s_enemyMgr);
         } else if (!b && s_p2PrevBombing) {
             Log("B5 diag: P2 bomb END    times B5 zeroed boss damage this bomb = %d", s_b5ZeroCount);
         }
@@ -3462,11 +3484,42 @@ static int MenuIsShotState(uint32_t s) { return s == 6 || s == 0xe; }
 static int MenuInCoopFlow(uint32_t s)
 { return s == 4 || s == 5 || s == 6 || s == 0xc || s == 0xd || s == 0xe; }
 
+/* Menu netplay status line (top row). The menu is just as easy to DESYNC as a
+ * stage — HookedSceneTick runs the same lockstep merge on the front-end, so
+ * s_netFrame / s_netSync / the RNG oracle (self vs rcv) are all live here. The
+ * menu scene flushes the global ascii queue every frame (same path as the "P2
+ * SELECT CHARACTER" prompt), so this is a pure draw — no determinism impact.
+ * Shows role, lockstep frame, delay, sync state, the per-frame wait when it
+ * climbs (a stall), and the self/rcv RNG seeds so a menu desync is visible the
+ * instant the two seeds diverge. */
+#define MENU_NET_X   8.f
+#define MENU_NET_Y   12.f
+static void DrawNetMenuStatus(void)
+{
+    float pos[3];
+    pos[0] = MENU_NET_X; pos[1] = MENU_NET_Y; pos[2] = 0.f;
+    if (s_netPeerLost) {
+        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET LOST");
+    } else if (s_netActive) {
+        if (s_netWaitMs >= 100)
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d WAIT%dms",
+                             Nc_IsHost() ? 'H' : 'G', s_netFrame, s_netWaitMs);
+        else
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d d%d %s %04X/%04X",
+                             Nc_IsHost() ? 'H' : 'G', s_netFrame, Nc_GetDelay(),
+                             s_netSync ? "SYNC" : "DSYN", s_netSelfRng, s_netRcvRng);
+    }
+}
+
 static int __fastcall HookedMenuDispatch(void *menuv)
 {
     char *menu = (char *)menuv;
     uint32_t state = *(uint32_t *)(menu + MENU_OFF_STATE);
     int r;
+
+    /* surface the netplay sync state on the front-end too (top row) — a menu
+     * desync is otherwise invisible until the game won't start in sync */
+    if (s_netActive || s_netPeerLost) DrawNetMenuStatus();
 
     /* The menu dispatcher ONLY runs in the front-end (title/main/char-select),
      * never during gameplay. So if a co-op session is still alive here, the
@@ -3643,6 +3696,10 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_DECL_MAKE,      (LPVOID)&HookedDeclMake,      (LPVOID*)&s_origDeclMake)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DECL_DRAW,      (LPVOID)&HookedDeclDraw,      (LPVOID*)&s_origDeclDraw)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_REPLAY_HDR_INIT,(LPVOID)&HookedReplayHdrInit, (LPVOID*)&s_origReplayHdr)     != MH_OK) return 0;
+    /* B5: capture the enemy-manager base (FUN_00420620's ECX/param_1) so the boss-spell
+     * armour gate reads the LIVE spellcardInfo.isActive at param_1+0x9545c8. The base is
+     * non-zero in-game (the absolute-globals assumption was wrong — see HookedEnemyUpdate). */
+    if (MH_CreateHook(ADDR_ENEMY_UPDATE,   (LPVOID)&HookedEnemyUpdate,   (LPVOID*)&s_origEnemyUpdate)   != MH_OK) return 0;
     /* Netplay seams: install ONLY when netplay is enabled in coop.ini. These two
      * addresses are unverified in-game, so with [net] enabled=0 (default) we don't
      * even lay the trampolines — the confirmed-good local build is byte-for-byte
@@ -3676,6 +3733,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_DECL_MAKE)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_REPLAY_HDR_INIT)!= MH_OK) return 0;
+    if (MH_EnableHook(ADDR_ENEMY_UPDATE)   != MH_OK) return 0;   /* B5: live enemy-manager base */
     if (s_netEnabled) {
         if (MH_EnableHook(ADDR_SCENE_TICK) != MH_OK) return 0;
         if (MH_EnableHook(ADDR_GAME_START) != MH_OK) return 0;

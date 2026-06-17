@@ -43,7 +43,8 @@ netplay: transport up role=host ... Handshaking — waiting for the peer ...
 netplay: LINK UP (handshake done). role=host delay=2 seed=0x....
 ```
 Both should log `LINK UP` with the **same seed**. Then a **NET status line** appears
-top-right in-game (see below).
+top-right in-game — and now also **top-left on the menu** (see below), so you can watch
+the front-end sync state before the game even starts.
 
 ## 5. Play
 - **Title / difficulty:** the **host (P1)** drives.
@@ -60,6 +61,12 @@ Top-right during play, e.g. `NET H F1234 d2 SYNC`:
   climbing WAIT with a near-frozen frame number IS a stall** (the other PC fell
   behind or hit a loading hitch).
 - `NET LOST` = the link timed out; you dropped back to local P2.
+
+**On the menu** the same line shows top-left, with the two RNG seeds appended:
+`NET H F1234 d2 SYNC AB12/AB12`. The trailing `self/rcv` pair is the desync oracle — the
+instant they diverge (`… DSYN AB12/CD34`) the front-end has desynced, which is the usual
+precursor to a menu→stage stall. Watch it while navigating: if `Esc+R` / returning to title
+is what diverges them, you'll see it here in real time.
 
 `coop_log.txt` mirrors this: a heartbeat every ~2s (`F#### SYNC wait=…ms rng
 self=… peer=…`), a one-line `STALL` warning when a frame blocks ≥250 ms, and a
@@ -85,6 +92,21 @@ the two machines never sharing a common start state. **The fix is a real start
 barrier** (both machines begin lockstep frame 0 from the *same* screen, the way
 EoSD's "Start Game" button works), rather than connecting mid-menu. The new sync
 telemetry above is the instrumentation to confirm that before/after.
+
+### Field-test log — 2026-06-17 (P1 `tovrof.zip` / P2 `7454cb.zip`)
+Three back-to-back attempts, same two PCs:
+1. **Total failure** — never synced; repeated `Esc+R` and return-to-menu didn't recover.
+2. **No FPU guard** (`[net] fpu_guard=0`) — synced in **game 3** and stayed synced through
+   everything afterward.
+3. **FPU guard back ON** — synced after **one restart**; "good enough."
+
+Read: the sync is **fragile at start** (needs 1+ restarts) but **stable once locked**, and the
+FPU guard isn't clearly helping/hurting the *start* path. The fragile-start + easy-menu-desync
+both point at the same root cause as the Known issue above — **no shared start barrier**, so the
+two machines begin lockstep from different states and only converge by luck after a restart. The
+menu RNG readout (added this cut) is to catch exactly when/where that divergence happens. **The
+real fix remains the EoSD-style "Start Game" barrier**, not more FPU tweaking. Tracked, not yet
+implemented — it's the next netplay work item.
 
 ## Notes / known limits (this cut)
 - **Launcher** replaces hand-editing `coop.ini`. Auto-connect; host pushes delay+seed.

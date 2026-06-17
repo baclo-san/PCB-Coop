@@ -113,6 +113,13 @@ as PCB; PCB is "ECL v1.1", a minor evolution of EoSD's):
 
 **The th07-SPECIFIC opcode→meaning numbers are the missing piece, and the obvious
 sources are blocked/wrong (dead-ends checked so this isn't re-walked):**
+- ✅ **RESOLVED 2026-06-17 → the full opcode table (0–161) + variable registers
+  is now in `docs/th07_ecl_vm.md`**, pulled from **ExpHP/`truth`**'s `map/th07.eclm`
+  (the standard modding mnemonic map; touhouwiki 403s but `truth`'s raw GitHub
+  eclmap fetches fine). It's cross-referenced to this repo's RE (op 110
+  `enemy_life_set` = `FUN_00424290`; op 160 `add_cherry`; op 90/91 spell-card =
+  bug B5; op 119/154 item drops; ops 24–26 x87 transcendentals = the netplay FP
+  desync surface). Read that doc for the table; the trail below is kept for record.
 - **touhouwiki "User:Mddass/…/ECL/V1.1"** is the authoritative PCB opcode table —
   but it 403s automated fetch (WebFetch); pull it in a browser, or via an
   authenticated/mirror route, into a `th07.eclm`.

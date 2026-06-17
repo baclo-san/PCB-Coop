@@ -319,8 +319,19 @@ static CollectOverlapFn_t s_origCollectOverlap = NULL;
 static AddClearCircleFn_t s_origAddClearCircle = NULL;  /* B4 */
 static AddClearBoxFn_t    s_origAddClearBox    = NULL;  /* B4 */
 static int s_p2BombClear = 1;          /* B4: P2 bomb clears bullets (default on) */
+static int s_p2PrevBombing = 0;        /* B5 diag: P2 bombing-flag edge tracker    */
+static int s_b5ZeroCount   = 0;        /* B5 diag: times B5 zeroed boss damage/bomb */
+static int s_b5HitLogged   = 0;        /* B5 diag: one-shot @hit dump per bomb      */
 static DamageFn_t        s_origDamage        = NULL;
 static ItemLoopFn_t      s_origItemLoop       = NULL;
+
+/* B5: the enemy-manager base (FUN_00420620's param_1/ECX). The boss spellcard flags live
+ * at base+0x9545c8 (isActive) / base+0x9545dc (usedBomb) — param_1 is NOT 0 (the in-game
+ * boss enemy logged at 0x009b3998), so we capture the live base each enemy-update tick. */
+typedef int (__fastcall *EnemyUpdateFn_t)(void *self);
+#define ADDR_ENEMY_UPDATE ((LPVOID)0x00420620)
+static EnemyUpdateFn_t s_origEnemyUpdate = NULL;
+static volatile uint32_t s_enemyMgr = 0;
 
 /* ---- aim & item-suction: target the NEARER player (coop gameplay) ----
  * FUN_00442370 is Player::AngleToPlayer(this=player, pos): the angle from world
@@ -554,50 +565,69 @@ static volatile void *s_itemMgr = NULL;
  * at full power — which in co-op starves P2's only power source. We want the
  * conversion to wait until BOTH players are full.
  *
- * The decision lives inside the spawner FUN_004326f0: it reads P1's power off the
- * x87 ST0 the caller pushed (via the lround helper FUN_0048b8a0) and, if
- * round(power) > 0x7f and type ∈ {0,2}, rewrites the type to 7 (cherry). Because
- * the value is taken from ST0 — not a normal argument — a C detour can't wrap it:
- * the C prologue clobbers ST0 before the trampoline reads it (the "x87 ST0 hazard"
- * in docs/th07_coop_gameplay_bugs.md). So this detour is NAKED: it runs no C
- * prologue and leaves the FPU stack untouched EXCEPT, when we want to suppress the
- * conversion, it pops the caller's power and pushes 0.0 in its place. round(0)=0 ≤
- * 0x7f ⇒ the engine keeps the item as power. Depth is preserved (the helper pops
- * exactly one slot either way), so there is no x87 stack leak.
+ * The decision lives inside the spawner FUN_004326f0. An EARLIER reading of the
+ * decomp (Ghidra modelled the round as `FUN_0048b8a0()` reading in_ST0) concluded the
+ * caller pushes P1's power on the x87 ST0, so the convert couldn't be wrapped by a C
+ * detour and was attacked with a NAKED ST0 trampoline. That was WRONG, and is exactly
+ * why B2 "never worked regardless of config": the disassembly shows the function loads
+ * P1's power FRESH FROM MEMORY and ignores the caller's ST0 —
+ *     432710  mov eax, [0x626278]          ; res base  == *ADDR_RES_PTR
+ *     432715  fld dword ptr [eax+0x7c]     ; ST0 = P1 power  (RES_POWER)
+ *     432718  call 0x48b8a0                ; round(power)
+ *     43271d  cmp eax, 0x80 ; (>=128) && type∈{0,2} ⇒ type = 7 (cherry)
+ * So the old detour's fstp/fldz mutated a dead ST0 that 432715 immediately overwrote.
+ *
+ * Correct, FPU-free fix: a normal thiscall detour. When we want to keep the drop as a
+ * power item (g_b2Suppress: P2 live and below full) and the item is a convertible type
+ * (0/2), temporarily write P1's power to 0.0f around the original call, so the engine's
+ * own `round(*(res+0x7c)) >= 0x80` test fails and it leaves the type unchanged; then
+ * restore. 0.0f is all-zero bits ⇒ the save/zero/restore is a plain integer memory copy
+ * (no FPU, no RNG, deterministic), and the anti-tamper checksum (res+0xb0) is untouched
+ * because power is restored before any accessor runs. The convert test is the spawner's
+ * SOLE power read (432715 verified), so nothing else is disturbed.
  *
  * g_b2Suppress is computed in C, FP-safely, once per frame:
  *   P2 live && P2 power < full  (i.e. P1 full + P2 not full ⇒ keep it a power item).
- * When P2 is also full we leave ST0 alone, so vanilla converts (both full). Only
- * the convertible types (0,2) are touched; every other spawn — including coop's own
- * 1up drops (type 5) — is a clean passthrough that never touches ST0. Gated behind
- * coop.ini [coop] cherry_both_full (default off). It reads s_p2Power, so keep it
- * OFF over the network until the power-sync desync is solved (it would otherwise
- * feed the diverging value into drop types).
- * thiscall: ECX=mgr; [esp]=ret, [esp+4]=pos*, [esp+8]=type, [esp+12]=mode. */
-unsigned char g_b2Suppress      = 0;    /* asm-read: force no-convert for this spawn */
+ * When P2 is also full we leave power alone, so vanilla converts (both full). Only the
+ * convertible types (0,2) are touched; every other spawn — including coop's own 1up
+ * drops (type 5) — is a clean passthrough. Gated behind coop.ini [coop] cherry_both_full
+ * (default ON since the 2026-06-17 x87 desync fix; set it to 0 to restore vanilla).
+ * thiscall: ECX=mgr (this), then pos*, type, mode on the stack. */
+unsigned char g_b2Suppress      = 0;    /* read by the detour: keep this spawn as power */
 void         *g_b2OrigItemSpawn = NULL; /* MinHook trampoline for FUN_004326f0        */
+volatile uint32_t g_b2Calls      = 0;   /* diag: spawner calls seen by the hook        */
+volatile uint32_t g_b2Suppressed = 0;   /* diag: conversions suppressed (kept as power)*/
+static int s_b2LoggedFire = 0;          /* one-shot: logged the first real suppression */
 
-__attribute__((naked)) static void HookedItemSpawn(void)
+/* (ItemSpawnFn_t / FUN_004326f0 typedef declared above with the spawner addr.) */
+static int __fastcall HookedItemSpawn(void *self, void *edx, float *pos, int type, int mode)
 {
-    __asm__ volatile (
-        "movl 8(%esp), %eax\n\t"        /* type (param_3)                          */
-        "cmpl $0, %eax\n\t"
-        "je   1f\n\t"
-        "cmpl $2, %eax\n\t"
-        "jne  2f\n\t"                   /* not a power item -> passthrough          */
-    "1:\n\t"
-        "cmpb $0, _g_b2Suppress\n\t"
-        "je   2f\n\t"                   /* not suppressing -> vanilla convert       */
-        "fstp %st(0)\n\t"               /* drop caller's P1 power...                 */
-        "fldz\n\t"                      /* ...replace with 0 => round<=0x7f, no cherry */
-    "2:\n\t"
-        "jmp  *_g_b2OrigItemSpawn\n\t"  /* tail-call trampoline (ECX/stack/ST0 kept) */
-    );
+    g_b2Calls++;
+    if (g_b2Suppress && (type == 0 || type == 2)) {
+        uint32_t res = *ADDR_RES_PTR;
+        if (res) {
+            volatile uint32_t *pw = (volatile uint32_t *)(res + RES_POWER);
+            uint32_t saved = *pw;
+            int rr;
+            *pw = 0;            /* 0.0f ⇒ round(power)=0 ≤ 0x7f ⇒ engine keeps it power */
+            rr = ((ItemSpawnFn_t)g_b2OrigItemSpawn)(self, edx, pos, type, mode);
+            *pw = saved;        /* restore before any accessor checks the checksum     */
+            g_b2Suppressed++;
+            return rr;
+        }
+    }
+    return ((ItemSpawnFn_t)g_b2OrigItemSpawn)(self, edx, pos, type, mode);
 }
 
 /* Tier-1: scale enemy/boss HP cap by the active player count. On by default;
  * only takes effect while P2 is live (factor = 1 + (s_p2 != NULL)). F5 toggles. */
 static int   s_bossHpScale = 1;
+/* N2 — team DPS damper tuning + mode (coop.ini [coop] damper_boss_only, launcher box).
+ * FLAT (0): every enemy *= 0.75. BOSS-ONLY (1): only lifebar enemies *= 0.60, popcorn
+ * full damage. Constants are easy to retune from play feel. */
+#define COOP_DAMPER_FLAT 0.75f
+#define COOP_DAMPER_BOSS 0.60f
+static int   s_damperBossOnly = 0;     /* 0 = flat 0.75 all; 1 = boss-only 0.60 */
 
 /* SHARED TEAM BORDER: the automatic Cherry+ supernatural border. P1 keeps the one real
  * ZUN border (single ring slot); P2 rides along in a ringless "shadow" state 4 synced to
@@ -611,10 +641,23 @@ static BorderBreakFn_t s_origBorderBreak = NULL;
 static FILE *s_log = NULL;
 static char  s_dir[MAX_PATH];
 
+/* ── crash breadcrumbs ──────────────────────────────────────────────────────────
+ * A cryptic crash (the C1/C2 family) usually faults INSIDE a ZUN function we re-invoked
+ * for P2, a few frames after the real cause, so the faulting EIP alone says little. We
+ * keep a one-word breadcrumb of the last coop hook/section entered and which player it
+ * was running for; the vectored exception handler (CoopCrashHandler) dumps it together
+ * with the faulting context. Writing a pointer + int each hook entry is essentially free
+ * and is the cheapest "what was coop doing when it died" signal. */
+static volatile const char *s_crumb    = "init";   /* last hook/section reached      */
+static volatile int         s_crumbWho = 0;         /* 0 = P1 / engine, 1 = P2 re-invoke */
+static volatile uint32_t    s_crumbSeq = 0;         /* bumps every breadcrumb (liveness) */
+#define CRUMB(name)       do { s_crumb = (name); s_crumbSeq++; } while (0)
+#define CRUMB2(name, who) do { s_crumb = (name); s_crumbWho = (who); s_crumbSeq++; } while (0)
+
 static int   s_readyFrames = 0;        /* consecutive P1-update frames seen        */
 static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch               */
 static int   s_suppressP2  = 0;        /* DIAGNOSTIC: never spawn P2 (desync isolation) */
-static int   s_b2CherryBothFull = 0;   /* B2: power->cherry only when BOTH full (FPU asm; default off) */
+static int   s_b2CherryBothFull = 1;   /* B2: power->cherry only when BOTH full (FPU asm; default ON since x87 desync fix) */
 static int   s_fpuGuard    = 0;        /* §8o: firewall the netcode's x87 FPU use (desync fix test) */
 #define AUTO_SPAWN_AFTER 30            /* frames of P1 in state 0 after the stage
                                           fly-in, then spawn P2 (user: both players
@@ -862,6 +905,57 @@ static void Log(const char *fmt, ...)
     fflush(s_log);
 }
 
+/* Vectored exception handler: turn a silent crash into a log line. Fires for the whole
+ * process, so we only report genuinely fatal codes (not the C++ EH / debug-print pseudo
+ * exceptions the game/D3D raise normally), dump the faulting context + our breadcrumb,
+ * then EXCEPTION_CONTINUE_SEARCH so the OS crash path proceeds unchanged (we never
+ * swallow it). Re-entry-guarded in case the handler itself faults. The game has no ASLR
+ * (fixed 0x400000 base), so a raw EIP/target like 0x0043d9e0 is directly greppable
+ * against PCBdecomp / objdump; >= 0x10000000 is typically our DLL or a wild pointer. */
+static LONG WINAPI CoopCrashHandler(EXCEPTION_POINTERS *ep)
+{
+    static volatile LONG s_inHandler = 0;
+    DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    switch (code) {                       /* only the fatal ones — ignore EH/debug noise */
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (InterlockedExchange(&s_inHandler, 1)) return EXCEPTION_CONTINUE_SEARCH;
+
+    if (s_log) {
+        CONTEXT *c = ep->ContextRecord;
+        EXCEPTION_RECORD *r = ep->ExceptionRecord;
+        Log("====================  CRASH  ====================");
+        Log("exception 0x%08lx at EIP=0x%08lx   crumb=\"%s\" who=%s seq=%u frame=%d",
+            (unsigned long)code, (unsigned long)(c ? c->Eip : 0),
+            s_crumb ? s_crumb : "?", s_crumbWho ? "P2" : "P1", s_crumbSeq, s_lastLogicFrame);
+        if (code == EXCEPTION_ACCESS_VIOLATION && r && r->NumberParameters >= 2)
+            Log("  access violation: %s 0x%08lx",
+                r->ExceptionInformation[0] == 1 ? "WRITE to" :
+                r->ExceptionInformation[0] == 8 ? "EXECUTE at" : "READ from",
+                (unsigned long)r->ExceptionInformation[1]);
+        if (c)
+            Log("  EAX=%08lx EBX=%08lx ECX=%08lx EDX=%08lx\n"
+                "  ESI=%08lx EDI=%08lx EBP=%08lx ESP=%08lx",
+                (unsigned long)c->Eax, (unsigned long)c->Ebx, (unsigned long)c->Ecx,
+                (unsigned long)c->Edx, (unsigned long)c->Esi, (unsigned long)c->Edi,
+                (unsigned long)c->Ebp, (unsigned long)c->Esp);
+        Log("  coop: p2=%p ghost=%d anmActive=%d inP2Update=%d  (P1 base=0x%08x)",
+            (void *)s_p2, s_p2Ghost, s_p2AnmActive, s_inP2Update, ADDR_PLAYER_BASE);
+        Log("=================================================");
+    }
+    s_inHandler = 0;
+    return EXCEPTION_CONTINUE_SEARCH;     /* let the real crash path run */
+}
+
 static int P1Ready(void)
 {
     /* a character must be loaded (char-data ptr set) for the clone to be valid */
@@ -957,6 +1051,11 @@ static int      s_netFrame   = 0;          /* DLL-owned logic-frame index       
 static uint16_t s_netMerged  = 0;          /* this frame's merged word (P2 reads high) */
 static int      s_netSync    = 1;          /* last seen Nc_IsSync()                    */
 static int      s_netDesyncLogged = 0;     /* nonzero = inside a desync episode        */
+static int      s_netDesyncRun = 0;        /* consecutive in-stage sync=0 frames (fork)*/
+static int      s_netHardDesyncLogged = 0; /* latch: sustained (real) desync reported  */
+#define HARD_DESYNC_FRAMES 180             /* ~3s of unbroken in-stage sync=0 = a real
+                                              fork, vs the ≤15-frame blips that self-heal
+                                              at scene/seed-reforce boundaries (§8r) */
 static int      s_netSyncRun  = 0;         /* consecutive in-sync gameplay frames      */
 static int      s_netWaitMs   = 0;         /* last frame's lockstep wait (ms)          */
 static uint16_t s_netSelfRng  = 0;         /* our RNG seed vs the peer's, last compared*/
@@ -1009,6 +1108,8 @@ static void LoadNetConfig(void)
      * intended co-op look; set proximity_fade=0 in coop.ini to disable. */
     s_proxFade = (int)GetPrivateProfileIntA("coop", "proximity_fade", 1, ini);
     s_disableDemo = (int)GetPrivateProfileIntA("coop", "disable_demo", 1, ini);
+    /* N2: damper mode. 0 = flat 0.75 on all enemies; 1 = boss-only 0.60 (stage full). */
+    s_damperBossOnly = (int)GetPrivateProfileIntA("coop", "damper_boss_only", 0, ini);
     /* DIAGNOSTIC: suppress the P2 entity entirely (no auto-spawn, F9 no-ops). Lets a
      * netplay run test whether the residual sim-determinism desync (handoff §8m) comes
      * from the grafted P2 entity: set suppress_p2=1 on BOTH machines — if the RNG
@@ -1016,9 +1117,11 @@ static void LoadNetConfig(void)
      * cause is engine-side / a hook. Default 0. */
     s_suppressP2 = (int)GetPrivateProfileIntA("coop", "suppress_p2", 0, ini);
     /* B2: gate the power->cherry conversion on BOTH players full (else P1 alone
-     * full starves P2's power). Installs an FP-safe naked detour on the spawner;
-     * default off. Keep OFF over the network until the power-sync desync is fixed. */
-    s_b2CherryBothFull = (int)GetPrivateProfileIntA("coop", "cherry_both_full", 0, ini);
+     * full starves P2's power). Installs an FP-safe naked detour on the spawner.
+     * Default ON since 2026-06-17: it reads s_p2Power, which is now in sync after
+     * the x87 desync fix, so the prior reason to keep it off is gone. Set
+     * cherry_both_full=0 to restore vanilla (P1-full converts). */
+    s_b2CherryBothFull = (int)GetPrivateProfileIntA("coop", "cherry_both_full", 1, ini);
     /* §8o follow-up: firewall the per-frame netcode's x87 FPU use (save/restore the
      * game's full x87 state around Nc_GetInputNet) so the lockstep wait's timing math
      * can't perturb ZUN's FP differently on the two machines. Candidate desync fix. */
@@ -1152,6 +1255,7 @@ static int __fastcall HookedSceneTick(void *self)
              * title menu) so the first active frame doesn't fire a spurious re-zero. */
             s_netSceneId = *(int *)((char *)self + 0x154);
             s_netDesyncLogged = 0; s_netSyncRun = 0; s_netPeerLost = 0;
+            s_netDesyncRun = 0;    s_netHardDesyncLogged = 0;
             s_netStallLogged = 0;  s_netStatLogged = 0;
             s_seedForced = 0;               /* force the shared seed at the first stage */
             Nc_Reset();                     /* fresh lockstep maps from frame 0         */
@@ -1188,6 +1292,7 @@ static int __fastcall HookedSceneTick(void *self)
             s_seedForced = 0;           /* re-force the shared seed at the new scene  */
             Nc_Reset();                 /* clear peer buffer + frame index (th06 reset) */
             s_netDesyncLogged = 0; s_netSyncRun = 0;
+            s_netDesyncRun = 0;    s_netHardDesyncLogged = 0;
             s_netStallLogged  = 0; s_netStatLogged = 0;
         }
         int inStage = (int)((*ADDR_MODE_FLAGS >> 2) & 1);  /* recording active = in a stage */
@@ -1248,10 +1353,28 @@ static int __fastcall HookedSceneTick(void *self)
                         s_netFrame, s_netSelfRng, s_netRcvRng, (unsigned)*ADDR_RNG_CTR);
                     s_netDesyncLogged = 1;
                 }
-            } else if (s_netDesyncLogged && ++s_netSyncRun >= 120) {
-                Log("netplay: back in sync at frame %d (held 120 frames)", s_netFrame);
-                s_netDesyncLogged = 0;
-                s_netSyncRun = 0;
+                /* §8r: a blip (≤15 frames) heals at the next scene/seed-reforce; a SUSTAINED
+                 * run is the real first-run fork. Flag it distinctly, ONCE, with the local
+                 * RNG counter (diff host-vs-guest logs: if the counters differ at the fork,
+                 * one machine drew a different number of times => an FP-codepath divergence,
+                 * not an input divergence) and the live x87 control word (confirm it was
+                 * pinned to 24-bit at the fork — ruling FPU precision in or out). */
+                if (++s_netDesyncRun == HARD_DESYNC_FRAMES && !s_netHardDesyncLogged) {
+                    Log("netplay: *** HARD DESYNC *** sustained %d frames (real fork) at frame %d "
+                        "rng self=0x%04x peer=0x%04x localCtr=%u cw=0x%04x pinned=%d — retry "
+                        "(Escape->Give up->Retry) re-aligns via scene-reset+SEEDFORCE.",
+                        HARD_DESYNC_FRAMES, s_netFrame, s_netSelfRng, s_netRcvRng,
+                        (unsigned)*ADDR_RNG_CTR, _controlfp(0, 0) & 0xffff, s_fpuPinned);
+                    s_netHardDesyncLogged = 1;
+                }
+            } else {
+                s_netDesyncRun = 0;
+                if (s_netDesyncLogged && ++s_netSyncRun >= 120) {
+                    Log("netplay: back in sync at frame %d (held 120 frames)", s_netFrame);
+                    s_netDesyncLogged = 0;
+                    s_netHardDesyncLogged = 0;
+                    s_netSyncRun = 0;
+                }
             }
         }
 
@@ -1299,8 +1422,12 @@ static int __fastcall HookedGameStart(int self)
         uint16_t before = *ADDR_RNG_SEED;
         *ADDR_RNG_SEED = Nc_GetInitSeed();
         s_seedForced = 1;
-        Log("netplay: SEEDFORCE F%d seed 0x%04x -> 0x%04x ctr=%u (once/scene)",
-            s_netFrame, before, (unsigned)Nc_GetInitSeed(), (unsigned)*ADDR_RNG_CTR);
+        /* §8r: log the x87 control word at the seeding moment too — if host and guest
+         * differ here on the first stage, FP precision forked before the per-frame pin
+         * settled; if they match (both 0x_01f) the first-run fork is elsewhere. */
+        Log("netplay: SEEDFORCE F%d seed 0x%04x -> 0x%04x ctr=%u cw=0x%04x (once/scene)",
+            s_netFrame, before, (unsigned)Nc_GetInitSeed(), (unsigned)*ADDR_RNG_CTR,
+            _controlfp(0, 0) & 0xffff);
     }
     return s_origGameStart(self);
 }
@@ -2140,11 +2267,14 @@ static int P2CollisionSkipped(void *p2)
 static int __fastcall HookedCollideBullet(void *self, void *edx, float *pos, float *size)
 {
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    CRUMB2("collideBullet", 0);
     int r = (isP1 && s_p1Ghost) ? 0                       /* ghost P1: untouchable */
           : s_origCollideBullet(self, edx, pos, size);    /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2))
+    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
+        CRUMB2("collideBullet:P2", 1);
         s_origCollideBullet(p2, edx, pos, size);          /* P2 — param-relative */
+    }
     return r;
 }
 
@@ -2152,11 +2282,14 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
                                          void *a, void *b, void *c, void *d, int e)
 {
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    CRUMB2("collideLaser", 0);
     int r = (isP1 && s_p1Ghost) ? 0
           : s_origCollideLaser(self, edx, a, b, c, d, e); /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2))
+    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
+        CRUMB2("collideLaser:P2", 1);
         s_origCollideLaser(p2, edx, a, b, c, d, e);        /* P2 */
+    }
     return r;
 }
 
@@ -2168,12 +2301,24 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
 static int __fastcall HookedGraze(void *self, void *edx, float *pos, float *size)
 {
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    CRUMB2("graze", 0);
     int r = (isP1 && s_p1Ghost) ? 0                       /* ghost P1: no grazing */
           : s_origGraze(self, edx, pos, size);            /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
     if (p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
+        CRUMB2("graze:P2", 1);
         int r2 = s_origGraze(p2, edx, pos, size);          /* P2 — param-relative */
-        if (r == 0 && r2 == 1) r = 1;   /* P2 grazed -> mark bullet grazed so its hit test runs */
+        /* FUN_0043e3b0 returns 2 = "bullet sits in one of this player's clear regions"
+         * (P2+0x17dc) — the SAME field check FUN_0043e0a0 the hit test uses. The bullet
+         * loop runs THIS graze test (not the hit test) for every un-grazed older bullet
+         * (PCBdecomp.c:14718), so it is the path that cancels most of a bomb's bullets.
+         * B4 BUG (fixed): we only forwarded r2==1 (graze) and DROPPED r2==2, so P2's
+         * bomb/border field never cancelled bullets that weren't also near P2's graze box
+         * — exactly "P2 balls don't clear bullets, except the rare one P2 also grazed".
+         * Forward the cancel: 2 (cleared) takes priority over 1 (grazed) over 0. Reads
+         * only synced sim state (P2 regions + position), so it stays lockstep-safe. */
+        if (r2 == 2) r = 2;             /* bullet in P2's clear field -> cancel it */
+        else if (r == 0 && r2 == 1) r = 1;   /* P2 grazed -> mark bullet grazed so its hit test runs */
     }
     return r;
 }
@@ -2431,6 +2576,48 @@ static void __fastcall HookedDeclDraw(void *self)
     s_origDeclDraw(self);
 }
 
+/* B5 boss-spell gate — CORRECTED SIGNAL (2026-06-18, via the clean-room EoSD decomp).
+ * The first attempts gated on the score-manager's spell-DECLARATION index
+ * (*(0x0049fbf8)+0x1fbac, ZUN's FUN_0042ad66); in-game that read -1 (no spell) while a P2
+ * bomb was killing a boss spell, so it was the WRONG field. EoSD names the real one:
+ * `g_EnemyManager.spellcardInfo.isActive` (set =1 by the ECL spellcard opcode at spell
+ * start, EclManager.cpp:731; =0 at end) drives the boss damage model in EnemyManager.cpp:
+ *   if (isActive) { if (out==0) dmg/=7; else if (usedBomb) dmg/=3; else dmg=0; }
+ * and the bomb handler does `usedBomb = isActive` (Player.cpp:364). PCB is the same engine:
+ * the damage code at PCBdecomp.c:12867-12899 reads `DAT_009545c8 + param_1` (isActive) and
+ * `DAT_009545dc + param_1` (usedBomb). param_1 is the enemy-manager context base; for the
+ * single active game it is 0, so the fields are the absolute globals 0x009545c8 / 0x009545dc
+ * (the addresses Ghidra resolved). We read isActive directly to gate the bomb armour, and
+ * log both + the old declaration index so one run confirms the signal. (The transform that
+ * "removes the boss hitbox" is the dmg=0 leaf of that same model.) */
+#define SC_OFF_ISACTIVE   0x9545c8   /* enemy-manager spellcardInfo.isActive (from base) */
+#define SC_OFF_USEDBOMB   0x9545dc   /* enemy-manager spellcardInfo.usedBomb             */
+#define ADDR_SPELL_MGR_PTR ((volatile uint32_t *)0x0049fbf8) /* (old decl-index path, diag only) */
+#define SPELL_OFF_INDEX    0x1fbac
+static int SpellcardActive(void)
+{
+    uint32_t b = s_enemyMgr;
+    return b ? (*(volatile int *)(b + SC_OFF_ISACTIVE) != 0) : 0;
+}
+static int SpellcardUsedBomb(void)
+{
+    uint32_t b = s_enemyMgr;
+    return b ? *(volatile int *)(b + SC_OFF_USEDBOMB) : 0;
+}
+static int BossSpellIndexRaw(void)   /* old signal, kept for the diagnostic only */
+{
+    uint32_t mgr = *ADDR_SPELL_MGR_PTR;
+    return mgr ? *(volatile int *)(mgr + SPELL_OFF_INDEX) : 0x7fffffff;
+}
+
+/* Capture the enemy-manager base (ECX = param_1) so SpellcardActive/UsedBomb can read its
+ * spellcardInfo fields. Just records the pointer and forwards — no behaviour change. */
+static int __fastcall HookedEnemyUpdate(void *self)
+{
+    s_enemyMgr = (uint32_t)self;
+    return s_origEnemyUpdate(self);
+}
+
 /* ---- boss/enemy HP scaling detour (damage-side) ----
  * Run the original (side effects — shot consumption, hit sparks — happen once,
  * unchanged), then divide ONLY the returned damage by the active player count,
@@ -2440,6 +2627,7 @@ static void __fastcall HookedDeclDraw(void *self)
 static int __fastcall HookedDamage(void *self, void *edx,
                                    float *pos, float *size, int *out_flag)
 {
+    CRUMB2("damage", 0);
     int r = s_origDamage(self, edx, pos, size, out_flag);
     void *p2 = (void *)s_p2;
 
@@ -2460,37 +2648,87 @@ static int __fastcall HookedDamage(void *self, void *edx,
      * static P1 (bisect-proven), so re-invoke param-relative for a live P2 —
      * its own array's shots, its lasers, and its bomb all get tested. With the
      * shot transfer OFF (the default now), each shot lives in exactly one
-     * array, so nothing is double-counted. */
+     * array, so nothing is double-counted.
+     *
+     * SwapAnm MUST wrap this re-invoke too (not just SwapSelGlobals): the sweep
+     * REBINDS a shot's anm on hit — FUN_0043d9e0 @PCBdecomp.c:25902 does
+     * FUN_0044ea20(shot, *(mgr + 0x28ef0 + (shot[+0x1d8]+0x20)*4)), reading the
+     * 0x400-range script table that SwapAnm owns. Without the swap, a different-
+     * char P2 (e.g. P1 Sakuya / P2 Reimu) indexes P1's table with P2's hit-id and
+     * binds a wrong/garbage script ptr -> intermittent crash a few frames later
+     * when that script runs (the C1 "Reimu bullets/bomb hit an enemy" crash). The
+     * player update + draw already wrap their P2 calls in SwapAnm; this is the one
+     * P2 engine call that was missing it. No-op for a same-char P2 (s_p2AnmActive
+     * == 0 -> SwapAnm returns immediately), so default/same-char play is unchanged. */
     if (p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost) {
         int f2 = 0;
         int r2;
+        CRUMB2("damage:P2-reinvoke", 1);   /* the C1/C2 anm-rebind hotspot */
         SwapSelGlobals(1);
+        SwapAnm(1);
         r2 = s_origDamage(p2, edx, pos, size, &f2);
+        SwapAnm(0);
         SwapSelGlobals(0);
+        CRUMB2("damage", 0);
         if (r2 > 0) r += r2;
         if (f2 && out_flag && !*out_flag) *out_flag = f2;
     }
 
+    /* N2 — 2P team DPS damper, with a launcher-selectable mode:
+     *   FLAT (default): every enemy takes COOP_DAMPER_FLAT (0.75) — a light, uniform
+     *     reduction so 2x DPS doesn't melt everything.
+     *   BOSS-ONLY (damper_boss_only=1): only lifebar enemies (bosses/midbosses,
+     *     enemy+0x2e29 bit6) get COOP_DAMPER_BOSS (0.60); stage popcorn takes FULL
+     *     damage — fixes the "stage enemies feel tanky / can't solo the Extra opening
+     *     ball line" complaint while still pacing boss fights. Boss-ness is read from
+     *     the same enemy snapshot offset HookedDamage already uses (pos - ENEMY_OFF_POS). */
     if (s_bossHpScale && s_p2 && r > 0) {
-        r = (int)(r * 0.6f);                 /* 2P team DPS damper (was /2) */
-        if (r == 0) r = 1;
+        float f = COOP_DAMPER_FLAT;
+        if (s_damperBossOnly) {
+            int isBoss = 0;
+            if (pos) {
+                unsigned char fl = *(unsigned char *)((char *)pos - ENEMY_OFF_POS + ENEMY_OFF_FLAGS);
+                isBoss = (fl & ENEMY_FLAG_BOSS) != 0;
+            }
+            f = isBoss ? COOP_DAMPER_BOSS : 1.0f;
+        }
+        if (f != 1.0f) {
+            r = (int)(r * f);
+            if (r == 0) r = 1;
+        }
     }
 
-    /* B5 (from nightshift's keen-ramanujan branch): Extra/Phantasm boss invincibility
-     * during a bomb. ZUN gates ALL shot damage on DAT_004d44f8==0 (= P1 NOT bombing,
-     * PCBdecomp.c:12829), so during P1's bomb the boss takes nothing — its invincible
-     * spell form. That flag is P1's struct field (P1+0x16a20); P2's bomb never sets it,
-     * so the boss kept taking P1+P2 damage during a P2 bomb, cheesing Extra/Phantasm.
-     * Mirror P1 by zeroing the sweep's damage while P2 is bombing (the sweep already ran,
-     * so shots are still consumed + sparked, exactly like ZUN's gate which blocks only
-     * the APPLY). Scoped to Extra/Phantasm (difficulty 4/5) to leave normal pacing alone.
-     * User's accepted fallback ("full boss invuln during P2 bomb"); the real transform
-     * is a follow-up. Uses main's validated ADDR_DIFFICULTY (0x626280), not the branch's. */
+    /* B5: Extra/Phantasm boss invincibility during a SPELL CARD, mirrored for a P2 bomb.
+     * In vanilla you can't cheese an Extra/Phantasm boss spell with a bomb — the boss
+     * transforms into an invincible ball (the dmg=0 leaf of ZUN's spellcard damage model,
+     * EoSD EnemyManager.cpp / PCBdecomp.c:12867-12899). That model keys off the ENEMY-
+     * MANAGER spellcard flag `spellcardInfo.isActive` (DAT_009545c8) — NOT the score-mgr
+     * declaration index we read before, which is -1 here. So: while P2 is bombing on
+     * Extra/Phantasm and the damaged enemy is a boss whose spellcard is active, zero the
+     * sweep's return (the sweep already ran, so shots are still consumed + sparked, exactly
+     * like ZUN's own apply-gate). Not on nonspell / no-boss / stage popcorn. */
     if (r > 0 && (uint32_t)self == ADDR_PLAYER_BASE && p2 && !s_p2Ghost) {
-        int diff = (int)*ADDR_DIFFICULTY;
-        if ((diff == 4 || diff == 5) &&
-            *(volatile int *)((char *)p2 + OFF_BOMBING) != 0)
-            r = 0;
+        int bombing = *(volatile int *)((char *)p2 + OFF_BOMBING) != 0;  /* cheapest, most selective */
+        int diff    = bombing ? (int)*ADDR_DIFFICULTY : 0;
+        if (bombing && (diff == 4 || diff == 5)) {
+            unsigned char fl = pos ? *(unsigned char *)((char *)pos - ENEMY_OFF_POS + ENEMY_OFF_FLAGS) : 0;
+            int isBoss = (fl & ENEMY_FLAG_BOSS) != 0;
+            /* One-shot per bomb: dump the decision-point state so ONE Extra/Phantasm run
+             * confirms the corrected signal — scActive/usedBomb (0x9545c8/0x9545dc) should
+             * be nonzero on a spell, the old declIdx stays -1. enBase sanity-checks param_1=0. */
+            if (isBoss && !s_b5HitLogged) {
+                s_b5HitLogged = 1;
+                Log("B5 diag@hit: scActive=%d usedBomb=%d declIdx=%d flags=0x%02x "
+                    "(b3invuln=%d b4dmg=%d b6boss=1) r=%d enBase=0x%08x",
+                    SpellcardActive(), SpellcardUsedBomb(), BossSpellIndexRaw(), fl,
+                    (fl >> 3) & 1, (fl >> 4) & 1, r,
+                    pos ? (uint32_t)((char *)pos - ENEMY_OFF_POS) : 0);
+            }
+            if (isBoss && SpellcardActive()) {
+                r = 0;
+                s_b5ZeroCount++;          /* B5 diag: count fires per bomb (see HookedUpdate) */
+            }
+        }
     }
     return r;
 }
@@ -2612,12 +2850,44 @@ static int __fastcall HookedUpdate(void *self)
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
     int p1Fake = 0;
     uint16_t p1GhostSavedIn = 0;
+    CRUMB2("update", 0);
 
     /* B2: refresh the power->cherry suppression flag once per frame (read by the
-     * naked HookedItemSpawn; inert when that hook isn't installed). Suppress while
+     * item-spawner detour; inert when that hook isn't installed). Suppress while
      * P2 is live and below full power — so P1-full alone keeps drops as power. */
     if (isP1)
         g_b2Suppress = (unsigned char)(s_p2 && s_p2Power < COOP_FULL_POWER);
+
+    /* B2 diag: confirm the detour is actually installed AND firing. (It read as "didn't
+     * work" repeatedly: twice the deployed coop.ini had cherry_both_full=0 from the OLD
+     * launcher; then the naked ST0 trampoline was a no-op because the spawner reads power
+     * from memory, not ST0 — now a real thiscall detour.) Log the first kept-as-power. */
+    if (isP1 && !s_b2LoggedFire && g_b2Suppressed) {
+        s_b2LoggedFire = 1;
+        Log("B2: detour FIRING — kept power item(s) as power (suppressed=%u of %u spawner calls)",
+            g_b2Suppressed, g_b2Calls);
+    }
+
+    /* B5 DIAGNOSTIC: P2 "bomb armour" reportedly does nothing on Extra. Log once per
+     * P2 bomb (the 0->1 edge of P2's bombing flag) the two difficulty globals (the
+     * boss-damage code uses 0x62f85c for its own Extra rules; B5 reads 0x626280) and,
+     * at bomb end, how many times B5 zeroed boss damage. count==0 => B5's condition
+     * never matched (difficulty or bombing-flag read is wrong); count>0 but boss still
+     * died => the damage isn't flowing through this return. Cheap (edge-triggered). */
+    if (isP1 && s_p2 && !s_p2Ghost) {
+        int b = (*(volatile int *)((char *)s_p2 + OFF_BOMBING) != 0);
+        if (b && !s_p2PrevBombing) {
+            s_b5ZeroCount = 0;
+            s_b5HitLogged = 0;           /* re-arm the @hit dump for this bomb */
+            Log("B5 diag: P2 bomb START  diff[0x626280]=%u diff[0x62f85c]=%u p2bombing=%d "
+                "scActive=%d usedBomb=%d declIdx=%d",
+                *(volatile uint32_t *)0x00626280, *(volatile uint32_t *)0x0062f85c, b,
+                SpellcardActive(), SpellcardUsedBomb(), BossSpellIndexRaw());
+        } else if (!b && s_p2PrevBombing) {
+            Log("B5 diag: P2 bomb END    times B5 zeroed boss damage this bomb = %d", s_b5ZeroCount);
+        }
+        s_p2PrevBombing = b;
+    }
 
     /* PHANTOM SPARE (P1): while co-op is active, ZUN's death commit must never
      * see 0 lives — the lives==0 path is game-over + full-power items + the
@@ -2732,12 +3002,14 @@ static int __fastcall HookedUpdate(void *self)
             UpdateTeamBorder(p2);
 
             s_inP2Update = 1;               /* effect-spawn detour: redirect slot */
+            CRUMB2("update:P2", 1);
             SwapSelGlobals(1);              /* char/type-gated branches see P2 */
             SwapAnm(1);                     /* 0x400-range tables -> P2's char */
             s_origUpdate(p2);               /* trampoline → no detour re-entry */
             SwapAnm(0);
             SwapSelGlobals(0);
             s_inP2Update = 0;
+            CRUMB2("update", 0);
 
             if (s_p2SepRes && rb) {
                 s_p2Lives = *rl; s_p2Bombs = *rb; s_p2Power = *rp;  /* capture P2's */
@@ -3090,6 +3362,7 @@ static void BuildP2TargetBlock(void *p2)
 
 static int __fastcall HookedDraw(void *self)
 {
+    CRUMB2("draw", 0);
     int r = s_origDraw(self);               /* P1 draw */
 
     if ((uint32_t)self == ADDR_PLAYER_BASE) {
@@ -3111,11 +3384,13 @@ static int __fastcall HookedDraw(void *self)
                 memcpy((char *)p2 + OFF_HOMING_TGT,
                        (char *)ADDR_PLAYER_BASE + OFF_HOMING_TGT, HOMING_TGT_LEN);
             s_enemyCount = 0;
+            CRUMB2("draw:P2", 1);
             SwapSelGlobals(1);
             SwapAnm(1);                     /* P2's char sprites for its draw */
             s_origDraw(p2);
             SwapAnm(0);
             SwapSelGlobals(0);
+            CRUMB2("draw", 0);
             DrawCoopHud(p2);
         }
     }
@@ -3417,6 +3692,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         GetModuleFileNameA((HMODULE)hinst, s_dir, MAX_PATH);
         { char *s = strrchr(s_dir, '\\'); if (s) s[1] = '\0'; }
         { char p[MAX_PATH]; snprintf(p, sizeof(p), "%scoop_log.txt", s_dir); s_log = fopen(p, "w"); }
+        AddVectoredExceptionHandler(1, CoopCrashHandler);   /* dump context on a crash */
         Log("th07_coop attached. Menu char-select: P1 picks, then P2 picks with "
             "WASD move / Space confirm / O cancel; game starts after both. AUTO-spawn "
             "P2 ~3s into the stage. In-stage P2: WASD move, Space shot, U focus, O bomb. "
@@ -3437,8 +3713,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
          * defaults off — this line makes that visible at a glance / lets the friend
          * pre-flight check solo before the netplay round). */
         Log("CONFIG (read from %scoop.ini): suppress_p2=%d  cherry_both_full=%d  "
-            "fpu_guard=%d  proximity_fade=%d | net.enabled=%d role=%s delay=%d seed=0x%04x",
-            s_dir, s_suppressP2, s_b2CherryBothFull, s_fpuGuard, s_proxFade,
+            "fpu_guard=%d  proximity_fade=%d  damper_boss_only=%d | net.enabled=%d role=%s delay=%d seed=0x%04x",
+            s_dir, s_suppressP2, s_b2CherryBothFull, s_fpuGuard, s_proxFade, s_damperBossOnly,
             s_netEnabled, s_netIsHost ? "host" : "guest", s_netDelay, s_netSeed);
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */

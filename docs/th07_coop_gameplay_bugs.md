@@ -229,10 +229,277 @@ The user-accepted fallback ("full boss invul during P2 bomb") is implementable i
 could damage while bombing), so it risks regressing feel — left unimplemented pending
 the proper gate + a play-test.
 
-### ⏸ C1 / C2 — crashes — NEED IN-GAME REPRO
+### ⏸ C2 — crash — NEED IN-GAME REPRO
 No new lead findable without a repro/log. C2's note says a `coop_log.txt` from that
-session is in `build/` — but the committed one is stale (§5b). Capture fresh logs:
-C1 = P1 Sakuya + P2 Reimu, Reimu's bullets hit an enemy; C2 = stage-4 death-fairy.
-Both are plausibly in the per-player shot/aim graft (`BuildP2TargetBlock`, the
-`HookedDamage` P2 re-invoke) — add player/shot identity logging to the hit path and
-bisect by char combo.
+session is in `build/` — but the committed one is stale (§5b). Capture a fresh log:
+C2 = stage-4 death-fairy. Plausibly the same anm-table family as C1 (below) or the
+per-player shot/aim graft (`BuildP2TargetBlock`) — but confirm with a repro.
+
+---
+
+## Status — 2026-06-17
+
+### ✅ C1 — P1 Sakuya + P2 Reimu crash — ROOT CAUSE FOUND + FIXED (needs in-game confirm)
+**Root cause: a missing `SwapAnm` around the P2 damage re-invoke in `HookedDamage`.**
+The shot-damage sweep `FUN_0043d9e0` (which coop re-invokes param-relative for P2,
+since the engine hardwires ECX=P1) **rebinds a shot's anm on hit** at
+`PCBdecomp.c:25902`:
+`FUN_0044ea20(shot, *(anmMgr + 0x28ef0 + (shot[+0x1d8] + 0x20) * 4))` — i.e. it indexes
+the **0x400-range script table that `SwapAnm` owns**, using the shot's hit-variant id.
+coop's P2 re-invoke wrapped that call in `SwapSelGlobals` but **not `SwapAnm`**, so for a
+**different-character P2** the table still held P1's char scripts. P1 Sakuya / P2 Reimu
+then indexes **Sakuya's** table with **Reimu's** hit-id → binds a wrong/garbage script
+pointer into the shot → **intermittent crash a few frames later when that script runs**.
+
+This explains every reported property:
+- **char-combo-specific** — only a *different*-char P2 sets `s_p2AnmActive=1` (same-char ⇒
+  `SwapAnm` is a no-op ⇒ no bug, matching "other combos fine"); the Sakuya-vs-Reimu id
+  layout is what makes Reimu's hit-id land on a fatal entry in Sakuya's table.
+- **intermittent / "crashes eventually"** — the bad bind only detonates when the wrong
+  script does something fatal, which depends on later frames/state.
+- **"sometimes bullet hit, sometimes bomb"** — Reimu's amulets *and* her bomb orbs both
+  damage enemies through this same `FUN_0043d9e0` sweep, so both hit the same rebind.
+
+**Fix (coop.c `HookedDamage`):** wrap the P2 re-invoke in `SwapAnm(1)/SwapAnm(0)` too,
+mirroring the player update + draw (which already wrap their P2 engine calls in both
+`SwapSelGlobals` *and* `SwapAnm`). No-op for a same-char P2, so default play is unchanged.
+Builds clean (6 targets, 32-bit). **Verify in-game (local co-op, no netplay needed):**
+P1 Sakuya + P2 Reimu (either shots), play a stage firing P2 into enemies + bombing —
+the combo that crashed should now be stable. Then spot-check the other different-char
+combos still behave.
+
+### ℹ B2 — cherry-power — IS implemented, but OFF BY DEFAULT (likely why it "wasn't fixed")
+The B2 power→cherry-only-when-both-full fix is present and logic-verified (the spawner
+`FUN_004326f0` calls the lround helper `FUN_0048b8a0()` **once**, using ST0 only for the
+convert test — so the naked trampoline's ST0→0.0 swap is safe). BUT it is **gated behind
+`coop.ini [coop] cherry_both_full` (default 0), and the hook is only *installed* when the
+flag is set** — so a default build does nothing. It was kept off because it reads
+`s_p2Power`, which was desyncing over the network; that desync (x87) is now CONFIRMED
+FIXED (2026-06-17), so the reason to keep it default-off is gone. **Decision (user,
+2026-06-17): flip the default ON.** `cherry_both_full` now defaults to 1 (coop.c static
+init + the `GetPrivateProfileIntA` fallback + the build.ps1 ini template); set it to 0 to
+restore vanilla. Still wants an in-game soak — B2 has never been play-confirmed, only
+reasoned — so verify a full stage of drops while P1 is full / P2 isn't (items stay power)
+and once both are full (drops convert to cherry).
+
+> **⚠️ DEPLOY CAVEAT (the "B2 still doesn't work" report, 2026-06-17):** the default flip
+> only applies if `cherry_both_full` is ABSENT from the deployed `coop.ini` —
+> `GetPrivateProfileIntA` can't tell "absent" from "0". The test logs show
+> `cherry_both_full=0` because the users' deployed `coop.ini` (older template) sets it
+> explicitly. **Action: set `cherry_both_full = 1` (or delete the line) in coop.ini on BOTH
+> machines.** That session was netplay (`net.enabled=1`); B2 reads `s_p2Power`, fine now
+> post-x87-fix.
+
+### ✅ B4 — P2 bomb doesn't clear bullets — ROOT CAUSE FOUND + FIXED (needs in-game confirm)
+The clear-region *registration* (`FUN_004418b0`/`00441800` → `P2+0x17dc`) was already
+working; the gap was on the READ side. The per-bullet loop (`PCBdecomp.c:14718`) runs the
+**graze test `FUN_0043e3b0`** — not the hit test `FUN_0043e260` — for every **un-grazed,
+older bullet**, and that graze test *also* does the clear-region check (`FUN_0043e0a0`) and
+**returns 2 when the bullet is in a clear region**. `HookedGraze` only forwarded P2's result
+when `r2==1` (grazed) and **dropped `r2==2`**, so bullets in P2's bomb field but not near
+P2's graze box were never cancelled. Matches the report exactly: "balls don't clear bullets,
+except the rare one P2 also grazed" (that one took the hit-test path, which DOES handle 2,
+and dropped a scratch item → the "turned into stars once").
+
+**Fix (`HookedGraze`):** forward `r2==2` (cancel), priority 2 > 1 > 0. Reads only synced sim
+state (P2 regions + position) ⇒ lockstep-safe. Builds clean. **Verify in-game:** P2's
+focused-bomb balls now cancel bullets they pass over, like P1's. NB: ZUN's field-cancel drops
+a small type-1 scratch item per bullet for BOTH players — vanilla, not a P2-only artefact.
+
+### 🔬 B5 — P2 bomb armour "does not work at all" (Extra) — INSTRUMENTED, awaiting log
+Logic looks right (zero the damage return while P2 bombing on Extra/Phantasm ⇒ ZUN's
+`if (0 < local_1c)` apply at `:12827` is skipped). Two suspects: (a) the difficulty global —
+B5 reads `0x626280`, but the boss-damage code uses `DAT_0062f85c` for its own Extra/Phantasm
+rules (`:12849`, values 4/5/6/8, not the clean 0–5 ladder `0x626280` holds); (b) P2's bombing
+flag (`P2+0x16a20`) timing. Added an **edge-triggered diagnostic** in `HookedUpdate`: logs
+both difficulty globals + the bombing flag at each P2 bomb START, and at bomb END the count
+of times B5 zeroed boss damage. `count==0` ⇒ condition never matched (difficulty/bombing read
+wrong); `count>0` but boss still died ⇒ damage isn't flowing through this return. **Next: one
+Extra run, P2 bomb on a boss, then read the `B5 diag:` lines in `coop_log.txt`.**
+
+### Confirmed working this session (2026-06-17 test)
+- **C1** (Sakuya+Reimu crash) — no longer crashes. ✅
+- **C2** (stage-4 death-fairy crash) — did not recur. ✅ (likely the same anm-table family as C1)
+- **B1** (shared point-item extend) — works. ✅
+- **B3** (P2 autocollect above the line) — works on a normal stage; Extra not yet confirmed.
+- P2 shots feed the team cherry counter (they live in P1's shot array) — confirmed expected.
+
+### New backlog from the 2026-06-17 test (unprioritised — confirm with user before acting)
+- **N1 — revive/life-transfer depends on shooting state.** User couldn't transfer a life while
+  P1 was shooting, but could while P2 was shooting. Intended (D1/§5f): graze 90f then
+  focus→unfocus, independent of fire. Look at `ReviveByGraze` for any read of the shoot bit /
+  a second confirmation barrier; it may be post-revive-only. Possibly just-after-revive state.
+- **N2 — damage damper feel.** Current `r*=0.6` applies to ALL enemies, making stage popcorn
+  tanky (one player can't solo the Extra opening ball line). User floated boss-only and/or 0.75
+  but is undecided (tankier stage enemies may be fine / even fun). Design call — don't change yet.
+- **N3 — Alice penultimate spell + first Prismriver spell "look different in co-op"** (less
+  structured bullet rings than expected). Could be difficulty confusion (Hard vs Lunatic memory)
+  or a real RNG/object-order effect from the P2 graft. Worth a determinism spot-check; low
+  priority until reproduced deliberately.
+- **N4 — Prismriver fight** currently follows P1 (single boss). User mused about a 2-vs-2 variant
+  later; "make it work first." No action.
+
+## Status — 2026-06-17 (session 3 — retest)
+
+Retest results: **B5 (Extra bomb armour) now WORKS** ✅. **B4 "kinda works"** (the focused-bomb
+clear now fires) — one residual bug below. **B2 STILL off** — found the real cause (launcher).
+
+### ✅ B2 — cherry-power — ROOT CAUSE was the LAUNCHER (fixed)
+The CONFIG log read `cherry_both_full=0` again because **the launcher itself stamped `=0`** into
+every deployed coop.ini: `WriteIni` had a stub that wrote `"0"` when the key was absent
+(`launcher.c`, old lines 105-108). So the DLL default-flip never mattered. **Fix:** replaced the
+stub with a real **"Cherry power" checkbox** (default ON for a fresh ini), written every launch
+like the other boxes. Also added DLL diag counters (`g_b2Calls`/`g_b2Suppressed`) — the detour
+now logs `B2: detour FIRING …` the first time it keeps a drop as power, so install+fire is
+self-evident in the log. **Action for the existing testers:** their ini already has
+`cherry_both_full=0`, so the new checkbox loads UNTICKED — tick it once (or delete the line) and
+relaunch; CONFIG should then show `cherry_both_full=1` and the `B2: detour FIRING` line appear.
+
+### ✅ N2 — damper mode — DONE (launcher checkbox)
+New `coop.ini [coop] damper_boss_only` + launcher box **"Damage cut: bosses only"**. OFF (default)
+= flat `COOP_DAMPER_FLAT` 0.75 on every enemy (was 0.60). ON = only lifebar enemies (boss/midboss,
+`enemy+0x2e29` bit6) take `COOP_DAMPER_BOSS` 0.60; stage popcorn takes full damage. Boss-ness read
+from the snapshot offset HookedDamage already computes (`pos - ENEMY_OFF_POS`). Constants are easy
+to retune. `s_bossHpScale` (F5) still master-gates the whole damper.
+
+### 🐛 B4b — SakuyaB unfocused (timestop) bomb leaves live leftover bullets — FOLLOW-UP
+P2's Sakuya timestop clears most bullets but leaves a few with **active hitboxes after the bomb
+ends**. Mechanism traced: the timestop's bullet wipe is a **screen-wide clear region registered at
+bomb-END** (`FUN_004418b0(player+0x930, r=800, …, timer=0)`, `:7468`) on `player+0x17dc`. That
+region lives ~1 frame (`FUN_00440940` expires timer-0 regions). The player update `FUN_00441fb0`
+runs region-maintenance then the bomb handler, and **early-returns while the timestop flag
+`DAT_0062627c` is set** (`:27212`). The leftover is a P2-vs-P1 timing asymmetry (when P2's
+screen-wide region is registered/expired vs when the global bullet loop tests it, across the
+timestop release) — needs **in-game instrumentation** (log `P2+0x17dc[0]` radius + `DAT_0062627c`
+across a P2 SakuyaB bomb) before a safe fix. Not the common-case B4 path (that's fixed).
+
+### Decisions/Notes this session
+- **B5 diagnostic** left in (edge-triggered, cheap) until armour is confirmed stable across runs.
+- **N1** (revive vs shooting) — user: non-critical, leave for now.
+- **N3/N4** — user attributes N3 to the proximity-aim graft; both tabled (N4 alongside 3P).
+
+## Status — 2026-06-17 (session 4)
+
+Two user reports: (1) **B5 bomb armour over-fires** — it denies damage "anytime": when no
+boss is present, and when the boss is on a *nonspell* attack; it should apply ONLY while the
+boss is on a spell card. (2) **B2 cherry-power "still ongoing — config is right, behaviour is
+the same."** Both root-caused from the binary (not just the decomp) and fixed.
+
+### ✅ B5 — bomb armour now gated on an ACTUAL boss spell card
+The first cut zeroed damage on **any** Extra/Phantasm P2 bomb, so it also nullified stage
+popcorn and a boss between/without cards. Real fix: gate on **(a)** the damaged enemy being a
+boss (`enemy+0x2e29` bit6, the flag the damper already reads off `pos - ENEMY_OFF_POS`) **and
+(b)** a boss spell card actually being active. ZUN's own "spell active?" predicate is
+`FUN_0042ad66(ECX=0x0049fbf0)` → reads the boss spell-card index at `*(0x0049fbf8) + 0x1fbac`;
+active iff index `>= 0` (a card) or `== -2` (the brief setup/transition state). **Verified
+in-binary:** all nine `FUN_0042ad66` call sites do `mov ecx,0x49fbf0`, body reads
+`[[ecx+8]+0x1fbac]`. coop reads the field directly via `BossSpellActive()` (no ZUN call, no
+side effects). The B5 START diag now also logs `spell_active`. **Verify in-game (Extra):** P2
+bomb during a boss **spell** stops boss damage; P2 bomb on a **nonspell**, or with no boss,
+deals normal damage; stage popcorn is never immune.
+
+### ✅ B2 — cherry-power — REAL root cause: the naked ST0 detour was a no-op
+"Config is right, behaviour the same" because the fix never did anything — even with the hook
+installed and firing. The decomp models the convert as `FUN_0048b8a0()` reading `in_ST0`, which
+led to the assumption that the **caller** pushes P1's power on the x87 stack (the "ST0 hazard"),
+hence the naked `fstp/fldz` trampoline. **The disassembly of `FUN_004326f0` disproves it** — the
+function loads P1's power **fresh from memory** and ignores the caller's ST0:
+```
+432710  mov eax,[0x626278]        ; res base (== *ADDR_RES_PTR)
+432715  fld dword ptr [eax+0x7c]  ; ST0 = P1 power (RES_POWER)   <- from MEMORY, not caller
+432718  call 0x48b8a0             ; round(power)
+43271d  cmp eax,0x80 ; (>=128) && type∈{0,2} ⇒ type=7 (cherry)
+```
+So `432715` overwrote whatever the old detour left in ST0 → suppression never happened. **Fix:**
+replaced the naked detour with a **normal thiscall C detour** (safe now — the function takes no
+ST0 input). When suppressing (`g_b2Suppress`: P2 live & below full) and the item is convertible
+(type 0/2), it temporarily writes `*(res+0x7c)=0.0f` around the original call so the engine's own
+`round(power)>=0x80` test fails, then restores it. 0.0f is all-zero bits ⇒ save/zero/restore is a
+plain integer memory copy: **no FPU, no RNG, deterministic**, checksum (`res+0xb0`) untouched
+(restored before any accessor runs). `432715` is the spawner's **sole** power read (verified), so
+nothing else is disturbed. **Verify in-game:** P1 full / P2 below full ⇒ kills keep dropping
+**power** (not cherry); once both full ⇒ cherry as vanilla. The `B2: detour FIRING …` log line
+should now appear (and `cherry_both_full=1` in CONFIG).
+
+> The earlier `docs/.../th07_coop_gameplay_bugs.md` ST0-hazard warning (PR #5 §"CRITICAL FINDING")
+> still holds for `FUN_0042d83a` / `FUN_0048b8a0` *callers* that genuinely push ST0 — but
+> `FUN_004326f0` is **not** one of them; it self-loads from memory.
+
+## Status — 2026-06-18 (session 5)
+
+Retest: **B2 cherry-power CONFIRMED WORKING** ✅ (user: "finally works"). **B5 regressed the
+other way** — now P2 bombs damage the boss *always* (two bombs killed Ran's spell). Plus a
+request: add logging to help debug future cryptic crashes.
+
+### 🔬 B5 — spell gate reads "no spell" during a real spell — instrumented, awaiting a log
+The `B5 diag: P2 bomb START … spell_active=0` line printed **0 on every bomb**, and the
+`bomb END … zeroed = 0` count confirms the gate never engaged across the whole bomb — so
+`BossSpellActive()` returned false even while the boss was visibly mid-spell. The reimplemented
+read (`*(0x0049fbf8)+0x1fbac`) is byte-identical to ZUN's `FUN_0042ad66`, so either (a) a subtle
+difference in our hand-read vs the real call, or (b) the START snapshot is misleading and the
+field genuinely isn't ≥0 at the damage frames. Changes this session:
+- `BossSpellActive()` now **calls ZUN's own `FUN_0042ad66(ECX=0x0049fbf0)`** (a pure predicate,
+  the exact one the boss-healthbar code at PCBdecomp:13065 uses) instead of re-reading the field
+  — removes all doubt about the pointer indirection.
+- Added a **decision-point diagnostic**: the first time a *boss* is damaged during a P2 bomb,
+  `B5 diag@hit:` logs `spellFn` (ZUN's result), `idx` (raw `+0x1fbac`), the enemy flag byte
+  (`b3invuln/b4dmg/b6boss`), and `r`. One Extra/Phantasm run with a P2 bomb on a boss spell will
+  show exactly what the spell index reads at the moment damage flows.
+- Context (user): Extra/Phantasm bosses **transform into an invincible shiny ball when avoiding
+  damage** (you bomb during a spell). That ball-invuln is what P2's bomb must mimic; it's the
+  same spell-active condition, just visualised. **Next:** read the `B5 diag@hit:` line — if
+  `idx >= 0` but `spellFn=0` something's inconsistent; if `idx == -1` at the hit, `+0x1fbac` isn't
+  the live signal for this fight and we need the per-boss invuln state instead.
+
+> NB difficulty in the logs: `diff[0x626280]=5` (=Phantasm per the 0–5 ladder; 4=Extra) and
+> `diff[0x62f85c]=8`. The B5 gate accepts 4||5 so difficulty isn't the blocker.
+
+### ✅ Crash logging — vectored exception handler + hook breadcrumbs (added)
+For the cryptic C1/C2-family crashes (fault lands inside a ZUN fn we re-invoked for P2, frames
+after the cause), added:
+- **`CoopCrashHandler`** via `AddVectoredExceptionHandler` — on a fatal exception (AV, illegal/
+  priv instruction, in-page, div0, stack overflow) it logs to `coop_log.txt`: exception code,
+  faulting **EIP**, read/write/execute **target address**, all GP registers, and the coop
+  breadcrumb, then `EXCEPTION_CONTINUE_SEARCH` (never swallows the crash). No ASLR ⇒ a raw EIP
+  like `0x0043d9e0` greps straight into PCBdecomp/objdump.
+- **Breadcrumbs** (`s_crumb`/`s_crumbWho`/`s_crumbSeq`, `CRUMB()`/`CRUMB2()`): set at each hot
+  hook entry (update/draw/damage/collideBullet/collideLaser/graze) **and around every P2
+  re-invoke** (e.g. `damage:P2-reinvoke` — the C1 anm-rebind hotspot). So the crash line says
+  *which* hook and *which player* (P1 vs P2 re-invoke) was running. Essentially free (a pointer +
+  int per hook entry).
+- Caveat: the VEH fires process-wide; it's filtered to fatal codes, but if PCB/D3D ever raise a
+  *handled* first-chance AV we'd log a spurious `CRASH` block. Old ZUN games don't do that in the
+  game loop, so it should be clean — if noise appears, switch to `SetUnhandledExceptionFilter`.
+- Further logging we could add on demand: per-frame P1/P2 state heartbeat, the SwapAnm id-table
+  mapping at bind time, and enemy/shot pool occupancy. Held back as noisier; add if a crash needs
+  it.
+
+## Status — 2026-06-18 (session 6) — B5 spell signal CORRECTED via the EoSD decomp
+
+The `@hit` diagnostic settled the B5 mystery: during a P2 bomb that killed a boss spell, the log
+read `scActive`/`idx` for the score-manager declaration index as **-1** and ZUN's own
+`FUN_0042ad66` returned **0** — i.e. the field we'd gated on (`*(0x0049fbf8)+0x1fbac`) is the wrong
+one. The user pointed at the clean-room **EoSD decomp** (`d:/PCB Co-op/th06_multi_net`), which
+names the real mechanism:
+
+- `g_EnemyManager.spellcardInfo.isActive` — set `=1` by the ECL spellcard opcode at spell start
+  (`EclManager.cpp:731`), `=0` at end. This is "a boss spellcard is being attacked."
+- `spellcardInfo.usedBomb` — the bomb handler does `usedBomb = isActive` (`Player.cpp:364`),
+  marking "a bomb was used this spell."
+- Boss spellcard **damage model** (`EnemyManager.cpp` ~626, identical to PCBdecomp.c:12867-12899):
+  `if (isActive) { if (out==0) dmg/=7; else if (usedBomb) dmg/=3; else dmg=0; }`. The **`dmg=0`**
+  leaf is exactly the user's "boss transforms into an invincible ball / removes its hitbox."
+
+PCB maps these to `DAT_009545c8` (isActive) and `DAT_009545dc` (usedBomb) at `[param_1 + …]`;
+param_1 (enemy-manager context base) = 0 for the single active game, so the absolute globals
+**0x009545c8 / 0x009545dc** are correct (the addresses Ghidra resolved). coop.c now reads them as
+`SpellcardActive()` / `SpellcardUsedBomb()`.
+
+**B5 now gates on `SpellcardActive()`** (was the dead `+0x1fbac`), still `&& isBoss && P2 bombing
+&& diff∈{4,5}` → zero the sweep return. The `B5 diag@hit:` line now logs `scActive usedBomb declIdx
+flags r enBase`. **Confirm next run:** `scActive` should be nonzero while bombing a boss spell (and
+the armour engages, `bomb END … zeroed > 0`); `declIdx` stays -1. If `scActive` is 0 on a real
+spell, param_1≠0 and we resolve the enemy-manager base from `enBase`.
+
+> The earlier session-5 crash was unrelated to B5 — it was bombing while **P2 killable was off**
+> (a separate bug to chase). The `FUN_0042ad66` call was reverted to a plain memory read regardless.

@@ -2138,3 +2138,37 @@ PR #5.** Full per-bug detail (with the RE) lives in the bugs doc; summary:
 `ST0` set by its caller (`FUN_004326f0`, `FUN_0042d83a`, `FUN_0048b8a0` itself) — the
 detour clobbers ST0 before the trampoline runs. Use a side-channel (B1's tier counter)
 or a binary patch / `fldz`-guarded forward instead.
+
+## 5x. Session 2026-06-18 (pm) — overnight test follow-ups
+
+Three items reported from overnight testing:
+- **Extra boss bomb armour (B5): WORKS** (user-confirmed). No change needed.
+- **Cherry/power on boss spell-capture: ROOT-CAUSED via in-game diag; FIXED (awaiting test).**
+  The both-full gate worked for regular drops but the boss spell-capture reward still
+  gave no power to a below-full P2 — crucial on Extra/Phantasm refuel. Initial theory
+  (boss pre-converts power->cherry/type-7) was WRONG and the un-convert it inspired was a
+  no-op. A broadened `B2 diag spawn` log (every type + spellcard flag + capwin) settled it
+  empirically: **the capture reward is a burst of `type=1` (POINT) items at `p1pow=128`,
+  `sc=0`** — i.e. when P1 is full the boss substitutes point items for the power drop it
+  would give, and the decision is made UPSTREAM of the spawner `FUN_004326f0` (which is why
+  nothing reached our hook as type 0/2/7). User domain note: PCB never drops full-power "F"
+  (type 4) except on continue, so that's not it. **Fix:** detect spell-end
+  (spellcardInfo.isActive 1->0) in `HookedEnemyUpdate` and open a `CAPTURE_WIN_FRAMES`
+  (~240f) refuel window; in `HookedItemSpawn`, while that window is open AND `g_b2Suppress`
+  (P2 below full), convert **type 1 -> type 0** so the reward drops as power for P2.
+  Window-gated so in-stage point items are untouched; the reward lands in the `sc=0` gap
+  after capture (verified — a new spell's `sc=1` only returns for the next phase). P1 (full)
+  collecting the power item still scores points on pickup, so P1 loses nothing meaningful.
+  **Open tuning:** if a capture's reward is ever missed, the window may also need to stay
+  open while `sc=1` (same-frame burst); current evidence says the reward is bonus-delayed.
+- **Proximity focus-hitbox fade: FIXED (awaiting test).** Only the sprite faded; the
+  focus RING/hitbox (type-0x18 effect, colour at effect+0x1b8) did not. Cause: the
+  fade colour was written in the player UPDATE (`ApplyProximityFade`), but the
+  effect-manager's own anm/update task runs in a separate, later task that rewrites
+  effect+0x1b8 — clobbering us before the draw. (The sprite tint survives only because
+  it's written after the player's own anm.) Fix: defer the focus-ring tint and apply
+  it at **draw time** in `HookedDraw` (after all update tasks, just before the effect
+  draws), via the existing `FadePlayerFocusFx` helper + `s_proxFx*` stash. A one-shot
+  `prox-fade: focus-ring tint at draw` log reports the fx ptr/type/tint. If it still
+  does not fade, the effect draws BEFORE the player draw and an effect-draw hook is
+  needed.

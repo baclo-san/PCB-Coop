@@ -332,6 +332,13 @@ typedef int (__fastcall *EnemyUpdateFn_t)(void *self);
 #define ADDR_ENEMY_UPDATE ((LPVOID)0x00420620)
 static EnemyUpdateFn_t s_origEnemyUpdate = NULL;
 static volatile uint32_t s_enemyMgr = 0;
+/* Post-spell-capture refuel window. When P1 is full the boss substitutes POINT items
+ * for the power drop it would give (confirmed in-game: capture reward = a type-1 burst
+ * at p1pow=128, in the sc=0 gap after the spell ends). Co-op wants those as POWER when
+ * P2 is below full, so HookedEnemyUpdate opens this countdown on each boss spell-end and
+ * HookedItemSpawn converts type-1 -> type-0 while it's open and P2 isn't full. */
+static int s_captureWin = 0;
+#define CAPTURE_WIN_FRAMES 240   /* ~4s after a boss spell ends (covers the bonus + fountain) */
 
 /* ---- aim & item-suction: target the NEARER player (coop gameplay) ----
  * FUN_00442370 is Player::AngleToPlayer(this=player, pos): the angle from world
@@ -594,27 +601,66 @@ static volatile void *s_itemMgr = NULL;
  * drops (type 5) — is a clean passthrough. Gated behind coop.ini [coop] cherry_both_full
  * (default ON since the 2026-06-17 x87 desync fix; set it to 0 to restore vanilla).
  * thiscall: ECX=mgr (this), then pos*, type, mode on the stack. */
+static void Log(const char *fmt, ...);  /* defined below; used by the early item-spawn diag */
+static int  SpellcardActive(void);      /* defined below; boss-spell flag for the spawn diag */
 unsigned char g_b2Suppress      = 0;    /* read by the detour: keep this spawn as power */
 void         *g_b2OrigItemSpawn = NULL; /* MinHook trampoline for FUN_004326f0        */
 volatile uint32_t g_b2Calls      = 0;   /* diag: spawner calls seen by the hook        */
 volatile uint32_t g_b2Suppressed = 0;   /* diag: conversions suppressed (kept as power)*/
 static int s_b2LoggedFire = 0;          /* one-shot: logged the first real suppression */
+static int s_b2RefuelLogged = 0;        /* one-shot: logged the first post-capture point->power */
+static int s_b2DiagN      = 0;          /* diag: count of logged convertible/converted spawns */
 
 /* (ItemSpawnFn_t / FUN_004326f0 typedef declared above with the spawner addr.) */
 static int __fastcall HookedItemSpawn(void *self, void *edx, float *pos, int type, int mode)
 {
     g_b2Calls++;
-    if (g_b2Suppress && (type == 0 || type == 2)) {
-        uint32_t res = *ADDR_RES_PTR;
-        if (res) {
-            volatile uint32_t *pw = (volatile uint32_t *)(res + RES_POWER);
-            uint32_t saved = *pw;
-            int rr;
-            *pw = 0;            /* 0.0f ⇒ round(power)=0 ≤ 0x7f ⇒ engine keeps it power */
-            rr = ((ItemSpawnFn_t)g_b2OrigItemSpawn)(self, edx, pos, type, mode);
-            *pw = saved;        /* restore before any accessor checks the checksum     */
+    /* DIAG (cherry/power): user-confirmed the boss spell-capture "skips power drops"
+     * when P1 is full (only point items, no power, no cherry) — and the 0/2/7-only diag
+     * stayed SILENT at capture, so the power items never reach this spawner (skipped
+     * UPSTREAM) OR are a type the old filter missed (notably 4 = full-power "F"). Log
+     * the first ~60 spawns of EVERY type with the spellcard flag so one capture run
+     * shows exactly what the boss emits: a type-4 line at capture => the refill is
+     * full-power items skipped when full; only type 1/6 lines => the reward is genuinely
+     * point-only here; NO line at all during the capture burst => the boss uses a
+     * different spawner / the power drop is decided and dropped entirely upstream. */
+    if (s_b2DiagN < 60) {
+        uint32_t res0 = *ADDR_RES_PTR;
+        float p1pw = res0 ? *(float *)(res0 + RES_POWER) : -1.f;
+        Log("B2 diag spawn #%d: type=%d mode=%d sc=%d capwin=%d suppress=%d p1pow=%.0f p2pow=%.0f diff=%u",
+            s_b2DiagN, type, mode, SpellcardActive(), s_captureWin, g_b2Suppress, p1pw, s_p2Power,
+            *(volatile uint32_t *)0x00626280);
+        s_b2DiagN++;
+    }
+    if (g_b2Suppress) {
+        /* Post-capture refuel (confirmed in-game): when P1 is full the boss substitutes
+         * POINT items (type 1) for the power drop it would otherwise give — the reward
+         * is decided UPSTREAM of this spawner (so the popcorn power-zero below never sees
+         * it). Inside the post-spell-end window, turn that point reward back into power so
+         * a below-full P2 can refuel (crucial on Extra/Phantasm). P1 (full) collecting a
+         * power item still scores points on pickup, so P1 loses nothing meaningful. The
+         * window keeps normal in-stage point items untouched. */
+        if (s_captureWin > 0 && type == 1) {
+            if (!s_b2RefuelLogged) {
+                Log("B2: post-capture point reward -> power (P2 below full, capwin=%d)", s_captureWin);
+                s_b2RefuelLogged = 1;
+            }
+            type = 0;
             g_b2Suppressed++;
-            return rr;
+            return ((ItemSpawnFn_t)g_b2OrigItemSpawn)(self, edx, pos, type, mode);
+        }
+        if (type == 0 || type == 2) {
+            uint32_t res = *ADDR_RES_PTR;
+            if (res) {
+                volatile uint32_t *pw = (volatile uint32_t *)(res + RES_POWER);
+                uint32_t saved = *pw;
+                int rr;
+                *pw = 0;            /* 0.0f ⇒ round(power)=0 ≤ 0x7f ⇒ engine keeps it power */
+                rr = ((ItemSpawnFn_t)g_b2OrigItemSpawn)(self, edx, pos, type, mode);
+                *pw = saved;        /* restore before any accessor checks the checksum     */
+                g_b2Suppressed++;
+                return rr;
+            }
         }
     }
     return ((ItemSpawnFn_t)g_b2OrigItemSpawn)(self, edx, pos, type, mode);
@@ -2009,10 +2055,22 @@ static void MoveGhost(void *p2)
 #define PROX_FAR2   (48.0f * 48.0f)    /* >= this: fully opaque                   */
 #define PROX_FLOOR  0x40u              /* minimum alpha when fully overlapped     */
 
+/* Deferred focus-ring fade (see ApplyProximityFade / HookedDraw). The sprite tint
+ * written in the update phase survives to the draw, but the focus-RING effect's
+ * colour (effect+0x1b8) is rewritten by the effect-manager's own update task —
+ * whose order vs the player update is undefined — so an update-phase write to it
+ * gets clobbered before the draw (this was the "only the sprite fades" bug). We
+ * stash the tint in the update and re-apply it at DRAW time (after ALL updates,
+ * just before the effect draws). */
+static uint32_t s_proxFxTint       = 0xffffffffu;
+static int      s_proxFxRemoteIsP2 = 1;   /* 1 = fade P2's ring (host/single), 0 = P1's (guest) */
+static int      s_proxFxPending    = 0;   /* set each frame the fade is active; consumed in draw */
+static int      s_proxFxLogged     = 0;   /* one-shot diagnostic of the draw-time apply           */
+
 /* Fade a player's FOCUS-mode indicator (the rotating ring + central hitbox dot,
  * effect type 0x18) to match the sprite fade. The handle lives at player+0x9d8;
- * its ARGB tint is at fx+0x1b8 (set once at spawn, never rewritten by the focus
- * updater FUN_0041abe0, so a per-frame write here sticks until the draw). The
+ * its ARGB tint is at fx+0x1b8 (the focus updater FUN_0041abe0 only moves it, but
+ * the effect's anm task may rewrite the colour — hence the draw-time apply). The
  * focused remote player's hitbox is at least as distracting as the sprite when
  * the two overlap, so it gets the same alpha. No-op when that player isn't
  * focusing (no live focus effect). */
@@ -2037,17 +2095,21 @@ static void ApplyProximityFade(void *p2)
         a = PROX_FLOOR + (unsigned int)(t * (float)(0xff - PROX_FLOOR));
     }
     uint32_t tint = (a << 24) | 0x00ffffffu;
+    /* Sprite tint is written here (update phase, after the player's own anm, so it
+     * sticks). The focus-RING tint is DEFERRED to HookedDraw — writing it here gets
+     * clobbered by the effect's anm task before the draw (see s_proxFx* notes). */
     if (s_netActive && !Nc_IsHost()) {
         /* guest: local = P2, so fade the REMOTE P1 (sprite + focus hitbox); keep P2 opaque */
         *(uint32_t *)((char *)ADDR_PLAYER_BASE + OFF_TINT) = tint;
-        FadePlayerFocusFx((void *)ADDR_PLAYER_BASE, tint);
         *(uint32_t *)((char *)p2 + OFF_TINT) = 0xffffffffu;
-        FadePlayerFocusFx(p2, 0xffffffffu);
+        s_proxFxRemoteIsP2 = 0;
     } else {
         /* host / single-machine: local = P1, so fade the REMOTE P2 (sprite + focus hitbox) */
         *(uint32_t *)((char *)p2 + OFF_TINT) = tint;
-        FadePlayerFocusFx(p2, tint);
+        s_proxFxRemoteIsP2 = 1;
     }
+    s_proxFxTint    = tint;
+    s_proxFxPending = 1;
 }
 
 static void Spawn1Up(float *pos3)
@@ -2673,7 +2735,15 @@ static int BossSpellIndexRaw(void)   /* old signal, kept for the diagnostic only
 static int __fastcall HookedEnemyUpdate(void *self)
 {
     s_enemyMgr = (uint32_t)self;
-    return s_origEnemyUpdate(self);
+    int scBefore = SpellcardActive();
+    int r = s_origEnemyUpdate(self);
+    /* Open the refuel window when a boss spell ends (active 1->0): the point-substituted
+     * reward drops in the sc=0 gap that follows. Count it down otherwise. */
+    if (scBefore && !SpellcardActive())
+        s_captureWin = CAPTURE_WIN_FRAMES;
+    else if (s_captureWin > 0)
+        s_captureWin--;
+    return r;
 }
 
 /* ---- boss/enemy HP scaling detour (damage-side) ----
@@ -3443,6 +3513,20 @@ static int __fastcall HookedDraw(void *self)
             if (s_p2FocusFx)
                 memcpy((char *)s_p2FocusFx + OFF_FX_POS,
                        (char *)p2 + OFF_POS_X, 12);
+            /* proximity fade of the REMOTE focus ring — applied HERE (draw phase,
+             * after every update task incl. the effect anm that rewrites the colour)
+             * so it survives to the draw, unlike the clobbered update-phase write. */
+            if (s_proxFxPending) {
+                s_proxFxPending = 0;
+                void *fp = s_proxFxRemoteIsP2 ? p2 : (void *)ADDR_PLAYER_BASE;
+                FadePlayerFocusFx(fp, s_proxFxTint);
+                if (!s_proxFxLogged) {
+                    uint32_t fx = *(uint32_t *)((char *)fp + OFF_PLAYER_FX);
+                    Log("prox-fade: focus-ring tint at draw (fx=0x%08x type=%d tint=0x%08x)",
+                        fx, fx ? *(unsigned char *)(fx + OFF_FX_TYPE) : -1, s_proxFxTint);
+                    s_proxFxLogged = 1;
+                }
+            }
             /* feed P2 this frame's homing + SakuyaA aim targets. With per-player
              * aim on, acquire P2's own targets relative to ITS position (see
              * BuildP2TargetBlock); otherwise mirror P1's block (legacy). Consume

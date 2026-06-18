@@ -1764,18 +1764,27 @@ so the file stays self-consistent and **vanilla PCB still loads it**. Only writt
 when co-op is actually in play (`s_p2Sel>=0 || s_netActive`), so a solo run made with
 the DLL stays a byte-clean vanilla replay.
 
-**Still missing → two-player PLAYBACK (planned, not built).** Watching a co-op replay
-needs three more pieces, all building on the data now in the file: (1) read the
-0x58 block back on load to recover P2's character; (2) recreate the P2 clone at
-stage-start during playback (the menu/char-select is skipped on playback, so drive
-the existing `SpawnP2` auto-spawn from the stored sel); (3) in playback mode source
-P2's input from the replayed word's high bits (`g_InputGameplay`) instead of the
-keyboard/wire — today [coop.c:2255] always reads live input. PCB exposes a
-playback-mode flag (the `DAT_00626274+0x25` / `DAT_00575adc` bit the record/playback
-fns gate on). Determinism is already on our side (live lockstep depends on it).
-Until that lands, a co-op replay played back shows only P1 and (since P2's
-world-effects aren't reproduced) desyncs — so **co-op replays are for archiving now,
-watchable later**. Viewing will require the DLL loaded (vanilla can't render P2).
+**Two-player PLAYBACK — BUILT 2026-06-19 (commit 305c38f); awaiting in-game confirm.**
+All three pieces wired on the data already in the file:
+1. **Recover P2's character** — hook `FUN_00443550` (the playback header-consume task);
+   after it loads the header into `self[1]`, read our `0x58` block back into
+   `s_replayP2Sel`/`s_replayDiffChar`/`s_replayIsCoop`. A solo/vanilla replay has no
+   block ⇒ `s_replayIsCoop=0`, so we never spawn a phantom P2 over a one-player replay.
+2. **Recreate the P2 clone** — the existing ~3s `SpawnP2` auto-spawn now also fires in
+   playback (gated on `s_replayIsCoop`, character pulled from the header). Spawn timing
+   matches the recording: same `AUTO_SPAWN_AFTER`, identical replayed P1 fly-in.
+3. **Source P2's input from the replay** — in playback `p2in = UnpackP2(*ADDR_INPUT_GAMEPLAY)`
+   (PCB's `FUN_00442ee0` writes the recorded merged word into `g_InputGameplay`, so its
+   high bits ARE P2's recorded input), instead of the wire/keyboard at [coop.c:3173].
+
+The **playback-mode detector** is `IsReplayPlayback()`: PCB chooses record vs playback by
+which task it registers (`FUN_00442cd0`/`FUN_00442ee0`, PCBdecomp 27968-28003) and stores
+the mode at `replayMgr+0x44` (`*0x004b9e48 + 0x44`; 0=record, 1=playback). The `+0x25`
+flag first eyed is a pause/advance gate, not playback. Determinism is the same as live
+lockstep, so a faithful recording should replay faithfully. **Test:** play back a saved
+co-op `.rpy` (DLL loaded — vanilla can't render P2) and confirm P2 reproduces its
+movement/shots/bombs/deaths; watch `coop_log.txt` for `replay PLAYBACK: co-op replay —
+P2=…` then `auto-spawn: … (replay playback)`.
 
 **Proximity fade** range tightened (§ misc): `PROX_FAR2` 96px→48px, `PROX_NEAR2`
 24px→16px, so the other player only fades once the ~32px sprites actually overlap,

@@ -46,8 +46,9 @@
 #define IDC_FPUGUARD  1013
 #define IDC_CHERRY    1014
 #define IDC_DAMPERBOSS 1015
+#define IDC_AUTORESYNC 1016
 
-static HWND g_ip, g_port, g_local, g_delay, g_fade, g_suppress, g_fpuguard, g_cherry, g_damperboss, g_exe, g_status;
+static HWND g_ip, g_port, g_local, g_delay, g_fade, g_suppress, g_fpuguard, g_cherry, g_damperboss, g_autoresync, g_exe, g_status;
 static char g_dir[MAX_PATH];      /* launcher's own folder (trailing '\\')   */
 static char g_iniPath[MAX_PATH];  /* g_dir + coop.ini                        */
 static char g_dllPath[MAX_PATH];  /* g_dir + th07_coop.dll                   */
@@ -95,6 +96,7 @@ static void WriteIni(int role)
     int fpg   = (SendMessageA(g_fpuguard, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
     int chy   = (SendMessageA(g_cherry, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
     int dbo   = (SendMessageA(g_damperboss, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+    int ars   = (SendMessageA(g_autoresync, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
     GetEditStr(g_ip, ip, sizeof(ip));
     if (!ip[0]) strcpy(ip, "127.0.0.1");
     if (delay < 0)  delay = 0;
@@ -113,6 +115,10 @@ static void WriteIni(int role)
     /* damper_boss_only (N2): 1 = the 2P DPS damper hits only bosses (stage enemies take
      * full damage); 0 = flat reduction on every enemy. */
     WritePrivateProfileStringA("coop", "damper_boss_only", dbo ? "1" : "0", g_iniPath);
+    /* auto_resync (§8r): auto-recover a sustained in-stage desync (the first-run-after-
+     * launch fork) instead of needing a manual Escape->Give up->Retry. Written every
+     * launch like the rest so the box state is exactly what the DLL reads. */
+    WritePrivateProfileStringA("coop", "auto_resync", ars ? "1" : "0", g_iniPath);
 
     WritePrivateProfileStringA("net", "enabled", role ? "1" : "0", g_iniPath);
     WritePrivateProfileStringA("net", "role", role == 2 ? "guest" : "host", g_iniPath);
@@ -285,6 +291,10 @@ static void Prefill(void)
         SendMessageA(g_cherry,     BM_SETCHECK, chy ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageA(g_damperboss, BM_SETCHECK, dbo ? BST_CHECKED : BST_UNCHECKED, 0);
     }
+    {   /* auto-resync (default ON): automatic recovery from a sustained in-stage desync. */
+        int ars = (int)GetPrivateProfileIntA("coop", "auto_resync", 1, g_iniPath);
+        SendMessageA(g_autoresync, BM_SETCHECK, ars ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
 
     /* th07.exe: prefer the path remembered from a previous run, then one sitting
      * next to the launcher (the intended drop). */
@@ -338,6 +348,9 @@ static void CreateControls(HWND w)
     y += row;
     g_damperboss = mk(w, "BUTTON", "Damage cut: bosses only (stage enemies full damage)",
                 BS_AUTOCHECKBOX, edx, y, 320, 22, IDC_DAMPERBOSS);
+    y += row;
+    g_autoresync = mk(w, "BUTTON", "Auto-resync (recover a desync without a manual retry)",
+                BS_AUTOCHECKBOX, edx, y, 340, 22, IDC_AUTORESYNC);
     y += row;
 
     mk(w, "STATIC", "th07.exe:", WS_VISIBLE, lblx, y+3, 110, 20, 0);
@@ -405,7 +418,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
     sprintf(title, "%s  [net protocol %s]", APP_TITLE, "3.9.5");
     w = CreateWindowA("PcbCoopLauncher", title,
                       WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                      CW_USEDEFAULT, CW_USEDEFAULT, 438, 566,
+                      CW_USEDEFAULT, CW_USEDEFAULT, 438, 600,
                       NULL, NULL, hInst, NULL);
     if (!w) return 1;
     ShowWindow(w, show);

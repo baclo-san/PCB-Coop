@@ -711,6 +711,8 @@ static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch             
 static int   s_suppressP2  = 0;        /* DIAGNOSTIC: never spawn P2 (desync isolation) */
 static int   s_b2CherryBothFull = 1;   /* B2: power->cherry only when BOTH full (FPU asm; default ON since x87 desync fix) */
 static int   s_fpuGuard    = 0;        /* §8o: firewall the netcode's x87 FPU use (desync fix test) */
+static int   s_netAutoResync = 1;      /* §8r: auto-recover a sustained in-stage desync (resync handshake + reseed); default ON */
+#define COOP_RESYNC_THRESHOLD 180      /* sustained desync frames (~3s) before auto-resync fires */
 #define AUTO_SPAWN_AFTER 30            /* frames of P1 in state 0 after the stage
                                           fly-in, then spawn P2 (user: both players
                                           up together at stage start) */
@@ -1188,6 +1190,11 @@ static void LoadNetConfig(void)
      * game's full x87 state around Nc_GetInputNet) so the lockstep wait's timing math
      * can't perturb ZUN's FP differently on the two machines. Candidate desync fix. */
     s_fpuGuard = (int)GetPrivateProfileIntA("coop", "fpu_guard", 1, ini);  /* CONFIRMED FIX — default ON */
+    /* §8r: auto-resync — when an in-stage desync persists ~3s (the first-run-after-launch
+     * fork), the host agrees a frame with the guest and both clear the misaligned peer
+     * buffer + reseed, the AUTOMATIC form of Escape->Give up->Retry. Inert while synced.
+     * Default ON; set auto_resync=0 to require the manual retry instead. */
+    s_netAutoResync = (int)GetPrivateProfileIntA("coop", "auto_resync", 1, ini);
     s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
     if (!s_netEnabled) return;
     GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);
@@ -1205,6 +1212,9 @@ static void StartNet(void)
     if (!s_netEnabled) { Log("netplay: disabled (coop.ini [net] enabled=0) — local P2"); return; }
     Nc_SetCallbacks(NetReadLocalInput, NetReadRngSeed);
     Nc_SetLog(NetLogSink);
+    /* §8r: opt the netcode into auto-resync (off by default in the core so the native
+     * tests stay deterministic). Reseed-on-fire is handled in HookedSceneTick. */
+    Nc_SetAutoResync(s_netAutoResync, COOP_RESYNC_THRESHOLD);
     int ok = s_netIsHost
         ? Nc_StartHost("", s_netPort, 2 /*AF_INET*/)
         : Nc_StartGuest(s_netPeer, s_netPort, s_netLocal, 2 /*AF_INET*/);
@@ -1391,6 +1401,20 @@ static int __fastcall HookedSceneTick(void *self)
         s_fpuCw = FpuCw(); s_fpuSw = FpuSw();   /* x87 words AFTER the netcode ran this frame */
         if (s_fpuGuard) FPU_RESTORE();
         s_netMerged = merged;
+
+        /* §8r AUTO-RESYNC reseed: the netcode just realigned the lockstep at an agreed
+         * frame (cleared the misaligned peer buffer on BOTH machines). Snap the game RNG
+         * to the shared init seed on THIS frame so the two sims re-converge from here —
+         * the automatic equivalent of the scene-reset SEEDFORCE a manual retry performs.
+         * Both machines fire on the same lockstep frame, so they reseed together. */
+        if (Nc_PollResyncFired()) {
+            uint16_t before = *ADDR_RNG_SEED;
+            *ADDR_RNG_SEED = Nc_GetInitSeed();
+            s_seedForced = 1;     /* HookedGameStart already aligned; don't double-force */
+            Log("netplay: AUTO-RESYNC reseed at frame %d seed 0x%04x -> 0x%04x ctr=%u "
+                "(sustained desync recovered without a manual retry)",
+                s_netFrame, before, (unsigned)Nc_GetInitSeed(), (unsigned)*ADDR_RNG_CTR);
+        }
         /* de-merged per-player words for the menu FSM (in menus the local poll is
          * the menu-bit layout, so these are P1's / P2's raw menu words). */
         Nc_GetLastSplit(&s_netP1Menu, &s_netP2Menu);
@@ -3910,8 +3934,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
          * defaults off — this line makes that visible at a glance / lets the friend
          * pre-flight check solo before the netplay round). */
         Log("CONFIG (read from %scoop.ini): suppress_p2=%d  cherry_both_full=%d  "
-            "fpu_guard=%d  proximity_fade=%d  damper_boss_only=%d | net.enabled=%d role=%s delay=%d seed=0x%04x",
-            s_dir, s_suppressP2, s_b2CherryBothFull, s_fpuGuard, s_proxFade, s_damperBossOnly,
+            "fpu_guard=%d  auto_resync=%d  proximity_fade=%d  damper_boss_only=%d | net.enabled=%d role=%s delay=%d seed=0x%04x",
+            s_dir, s_suppressP2, s_b2CherryBothFull, s_fpuGuard, s_netAutoResync, s_proxFade, s_damperBossOnly,
             s_netEnabled, s_netIsHost ? "host" : "guest", s_netDelay, s_netSeed);
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */

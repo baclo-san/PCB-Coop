@@ -37,6 +37,9 @@ void Nc_BeginHandshake(int delay, unsigned short seed) { Netcode_BeginHandshake(
 int  Nc_PumpHandshake(void)       { return Netcode_PumpHandshake() ? 1 : 0; }
 int  Nc_HandshakeVersionBad(void) { return Netcode_HandshakeVersionBad() ? 1 : 0; }
 
+void Nc_SetAutoResync(int enable, int thresholdFrames) { Netcode_SetAutoResync(enable != 0, thresholdFrames); }
+int  Nc_PollResyncFired(void)     { return Netcode_PollResyncFired(); }
+
 unsigned short Nc_GetInputNet(int frame, int is_in_UI, int* out_ctrl)
 {
     int ctrl = 0;

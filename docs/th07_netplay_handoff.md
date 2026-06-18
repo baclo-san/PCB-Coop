@@ -2183,3 +2183,42 @@ Three items reported from overnight testing:
   `prox-fade: focus-ring tint at draw` log reports the fx ptr/type/tint. If it still
   does not fade, the effect draws BEFORE the player draw and an effect-draw hook is
   needed.
+
+### §8r — first-run-after-launch desync: AUTO-RESYNC (completed the th06 handshake) — 2026-06-18
+
+**Target.** The residual netplay issue ([[netplay-desync-x87-fpu]]): with the transport/epoch
+fix + x87 CW pin, every run AFTER the first is bit-perfect; only the FIRST run after process
+launch forks (cold-load timing asymmetry → the two sims one lockstep frame apart). Both control
+words matched (`0x001f`) at the fork, so it's NOT FP precision — it's a one-time frame offset,
+which a manual `Escape → Give up → Retry` already fixes (fresh scene → re-zero + SEEDFORCE).
+
+**Fix — make that recovery AUTOMATIC by completing the dormant `Ctrl_Try_Resync` protocol.**
+The th06 resync handshake was HALF-ported into `netcode.cpp`: the *receive* side (sets
+`g_resync_trigger`/`g_resync_stage_frame`) and the `Reset` clear existed, but nothing SENT the
+request and nothing CONSUMED the trigger. Completed it from the EoSD reference
+(`th06_multi_net/src/Supervisor.cpp:124-164`):
+- **Host initiates** (only after a SUSTAINED desync — `g_resync_desync_run >= threshold`, default
+  180f/~3s, so the ≤15f self-healing blips never trigger it): picks `target = frame + delay*2+2`,
+  arms the trigger, and SENDS `Ctrl_Try_Resync(target)` every frame until it fires.
+- **Guest adopts** the target on receive (the existing window-validated `RcvPacks` branch).
+- **Both EXECUTE** when their own lockstep frame reaches `target`: clear the (misaligned) rcved
+  maps, set `g_is_sync=true`, latch `g_resync_did_fire`. The peer re-sends its recent window
+  (SendKeys re-ping), so the buffers re-fill aligned.
+- **coop.c reseed**: `HookedSceneTick` polls `Nc_PollResyncFired()` right after `Nc_GetInputNet`
+  and, on fire, snaps `*ADDR_RNG_SEED = Nc_GetInitSeed()` on THAT frame — both machines fire on
+  the same lockstep frame, so they reseed together and re-converge (the automatic SEEDFORCE).
+
+**Safety.** Gated IN-STAGE only (menus aren't RNG-locked; `RunResync` early-returns on `is_in_UI`)
+and behind `g_resync_enable` (core default OFF so the native tests stay deterministic; coop.c opts
+in via `Nc_SetAutoResync`). It is **inert while synced** — only counts/acts after 180 unbroken
+desynced in-stage frames — so it cannot perturb the confirmed-good steady state. New
+`[coop] auto_resync` flag (default ON) + launcher checkbox (per [[launcher-owns-coop-ini]]).
+
+**Status: BUILT, native netloop_test green; NEEDS 2-PC TEST.** The resync path can't be unit-tested
+(the netcode globals are a single-process singleton — host and guest can't co-exist in one process).
+Test: host+guest, force a first-run fork (the usual cold start). Watch `coop_log.txt` for
+`RESYNC host-initiated: target frame N`, then `RESYNC #1 executed at frame N`, then
+`AUTO-RESYNC reseed at frame N` — and confirm the game returns to sync WITHOUT a manual retry. If a
+resync fires but it re-desyncs immediately (loops every ~3s), the first-run cause is a deeper state
+divergence than a frame offset — set `auto_resync=0` and capture the trace. Tuning: drop the 180f
+threshold (`COOP_RESYNC_THRESHOLD`) for faster recovery if 3s feels long.

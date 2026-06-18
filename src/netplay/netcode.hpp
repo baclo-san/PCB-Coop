@@ -50,6 +50,16 @@ void Netcode_BeginHandshake(int delay, unsigned short seed);
 bool Netcode_PumpHandshake();
 bool Netcode_HandshakeVersionBad();
 
+// ---- auto-resync (completes th06's Ctrl_Try_Resync handshake) ----
+// Opt-in recovery for a SUSTAINED in-stage desync: the host agrees a future frame with
+// the guest and both clear the misaligned peer-input buffer there, then the host env
+// reseeds the game RNG (poll below) — the automatic form of Escape->Give up->Retry.
+// Inert while synced. enable=false by default so the native tests are unaffected.
+void Netcode_SetAutoResync(bool enable, int thresholdFrames);
+// 1 (and clears the latch) iff a realign EXECUTED since the last poll — the host env
+// then writes the shared init seed into the game's RNG on this frame so both converge.
+int  Netcode_PollResyncFired();
+
 // ---- per-frame entry (the injection point) ----
 // Returns the merged 16-bit word BOTH machines agree on for logic-frame `frame`:
 //   gameplay (is_in_UI=false): P1 = host's low-bit input, P2 = guest's input in high bits.

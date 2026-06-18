@@ -41,6 +41,13 @@ void Nc_BeginHandshake(int delay, unsigned short seed);
 int  Nc_PumpHandshake(void);
 int  Nc_HandshakeVersionBad(void);
 
+/* Auto-resync: opt-in recovery from a sustained in-stage desync. enable!=0 arms it;
+ * thresholdFrames = consecutive desynced frames before the host initiates (<=0 keeps the
+ * current value). Nc_PollResyncFired returns 1 (once) the frame a realign executed, so the
+ * caller reseeds the game RNG to Nc_GetInitSeed() on that frame to converge both sims. */
+void Nc_SetAutoResync(int enable, int thresholdFrames);
+int  Nc_PollResyncFired(void);
+
 /* Per-frame injection point. Returns the merged 16-bit word both machines agree on
  * for logic-frame `frame`; is_in_UI!=0 -> menu merge (self|rcv), else P1-low/P2-high.
  * out_ctrl receives the resolved in-game control action for this frame. */

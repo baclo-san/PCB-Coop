@@ -56,6 +56,24 @@ static int   g_netFrame              = 0;   // replaces g_Supervisor.calcCount
 static bool  g_resync_trigger        = false;
 static int   g_resync_stage_frame    = 0;
 
+// ---- auto-resync (completes the half-ported th06 resync handshake) ----
+// When a SUSTAINED desync is detected, the HOST picks an agreed future frame
+// (cur + delay*2+2) and announces it via Ctrl_Try_Resync (resent every frame until it
+// fires); the guest adopts it on receive (RcvPacks, above). BOTH machines, when their
+// own lockstep frame reaches that target, clear the (misaligned) peer-input buffer and
+// latch g_resync_did_fire so the host environment can reseed the game RNG to a common
+// value — realigning the two sims at the SAME logic frame without a full scene reload.
+// This is the AUTOMATIC form of the manual "Escape->Give up->Retry" recovery. Inert
+// while synced (only counts/acts once g_is_sync has been false for g_resync_threshold
+// consecutive connected frames), so it cannot perturb a healthy run. Default OFF in the
+// core; the host env (coop.c) opts in via Netcode_SetAutoResync so the native tests stay
+// deterministic. Mirrors RUEEE Supervisor.cpp:124-164.
+static bool  g_resync_enable         = false;
+static int   g_resync_threshold      = 180;   // sustained desync frames before host acts
+static int   g_resync_desync_run     = 0;     // consecutive connected & !sync frames
+static bool  g_resync_did_fire       = false; // latched: a realign just executed (env polls)
+static int   g_resync_fire_count     = 0;     // diag: total realigns this session
+
 // Scene generation. The netcode frame index resets to 0 at every scene boundary
 // (the start barrier re-zeroes it so the two machines realign after the asymmetric
 // menu/stage load). That makes frame numbers REUSED across scenes — so a peer's
@@ -328,9 +346,79 @@ static void HandleControlKeys(int frame)
     g_ctrl_self[frame] = IGC_NONE;
 }
 
+// Host announces the agreed resync target to the guest. Resent every frame while the
+// trigger is armed so the guest catches it once its own frame enters the accept window
+// (RcvPacks: target in (g_netFrame, g_netFrame + delay*2+2]). Epoch-stamped like all
+// frame-4 packets so the receiver's epoch guard treats it as current-generation.
+static void SendResyncRequest(int targetFrame)
+{
+    Pack p;
+    p.type     = 4;
+    p.epoch    = g_epoch;
+    p.seq      = 0;
+    p.sendTick = GetTickCount64();
+    p.echoTick = 0;
+    p.ctrl.ctrl_type = Ctrl_Try_Resync;
+    p.ctrl.resync_setting.frame_to_re_sync = targetFrame;
+    if (g_is_host) g_host.SendPack(p); else g_guest.SendPack(p);
+}
+
+// The resync state machine, run at the top of each connected logic frame (mirrors the
+// resync block at the head of EoSD Supervisor::OnUpdate, before GetInput_Net). g_is_sync
+// here reflects the PREVIOUS frame's seed compare, which is what we want to act on.
+static void RunResync(int frame, bool is_in_UI)
+{
+    // Resync is meaningful IN-STAGE only: the front-end menus are not RNG-locked (the two
+    // machines reach a screen from slightly different states), so g_is_sync flaps there and
+    // is not a real fork. Skip entirely in UI — matches coop.c judging desync in-stage only.
+    if (!g_resync_enable || !g_is_connected || is_in_UI) { g_resync_desync_run = 0; return; }
+
+    // sustained-desync counter — transient ≤15-frame blips self-heal at scene/seed
+    // boundaries (handoff §8q), so only a long unbroken run is a real fork worth resyncing.
+    if (g_is_sync) g_resync_desync_run = 0;
+    else           g_resync_desync_run++;
+
+    // EXECUTE — both machines realign when their own frame reaches the agreed target.
+    // Clearing the rcved maps drops the misaligned peer inputs; the peer (executing the
+    // same frame) re-sends its recent window via SendKeys, so the buffers re-fill aligned.
+    if (g_resync_trigger && g_resync_stage_frame <= frame)
+    {
+        RcvPacks();
+        g_ctrl_bits_rcved.clear();
+        g_ctrl_rng_rcved.clear();
+        g_ctrl_rcved.clear();
+        g_ctrl_rcved_src.clear();
+        g_ctrl_rcved_writes.clear();
+        g_is_sync           = true;
+        g_resync_trigger    = false;
+        g_resync_desync_run = 0;
+        g_resync_did_fire   = true;     // env polls Netcode_PollResyncFired -> reseed game RNG
+        g_resync_fire_count++;
+        NcLogf("RESYNC #%d executed at frame %d (cleared peer buffer; reseed pending)",
+               g_resync_fire_count, frame);
+        return;
+    }
+
+    // HOST INITIATE — only after a sustained desync, and only if no resync is pending.
+    // The target is far enough ahead (delay*2+2) that the guest can receive it and reach
+    // it; resent each frame until it fires (the same SendResyncRequest the guest accepts).
+    if (g_is_host && !g_is_sync && g_resync_desync_run >= g_resync_threshold)
+    {
+        if (!g_resync_trigger)
+        {
+            g_resync_stage_frame = frame + g_delay * 2 + 2;
+            g_resync_trigger     = true;
+            NcLogf("RESYNC host-initiated: target frame %d (desync run %d)",
+                   g_resync_stage_frame, g_resync_desync_run);
+        }
+        SendResyncRequest(g_resync_stage_frame);
+    }
+}
+
 unsigned short Netcode_GetInput_Net(int frame, bool is_in_UI, int& cur_ctrl)
 {
     g_netFrame = frame;
+    RunResync(frame, is_in_UI);   // auto-resync handshake (inert unless enabled & sustained-desynced in-stage)
 
     if (!g_is_connected)
     {
@@ -498,9 +586,26 @@ void Netcode_Reset()
     g_netFrame = 0;
     g_is_sync = true;
     g_resync_trigger = false;
+    g_resync_desync_run = 0;   // a scene boundary is its own realign; start the counter fresh
+    g_resync_did_fire = false; // drop any un-polled latch (the reset reseeds anyway)
     g_epoch++;   // new scene generation — older packets are now stale (epoch guard)
     // NB: g_diag_* counters are intentionally NOT reset here — they are cumulative
     // across the whole session so a scene change can't hide a fault.
+}
+
+// ---- auto-resync control / poll (host env opts in; polls the realign latch) ----
+void Netcode_SetAutoResync(bool enable, int thresholdFrames)
+{
+    g_resync_enable = enable;
+    if (thresholdFrames > 0) g_resync_threshold = thresholdFrames;
+}
+// Returns 1 (and clears the latch) iff a realign EXECUTED since the last poll, so the
+// host environment can reseed the game RNG to a common value on that exact frame.
+int Netcode_PollResyncFired()
+{
+    if (!g_resync_did_fire) return 0;
+    g_resync_did_fire = false;
+    return 1;
 }
 
 bool Netcode_IsConnected()        { return g_is_connected; }

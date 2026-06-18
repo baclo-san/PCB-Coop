@@ -2268,3 +2268,31 @@ non-issue in practice:
    and reset `s_menuRepeatCtr` at LINK UP; once linked, the merged word drives both together. Awaiting
    a real-connection confirmation. **Lesson: don't theorize the desync class — separate menu vs
    gameplay, and diff the merged words before blaming the sim.** See [[netplay-desync-x87-fpu]].
+
+### §8t — the REAL killer: divergent STARTING CONFIG (difficulty) — host-authoritative fix (2026-06-19)
+
+The menu-freeze (§8s) was necessary-but-insufficient, and the tester nailed why: the problem isn't
+(only) live menu navigation, it's that the two **installs start with different saved config**. A third
+test settled it — the difficulty global `0x626280` read **`1` (Normal) on the host and `3` (Lunatic) on
+the guest** (`diff=` in the B2 diag, 60 vs 57 lines). No lockstep or resync can reconcile two machines
+running different difficulties (different enemy HP, bullet density, item thresholds). The tester's
+"fairies synced but their bullets weren't" is the precise signature: stage-script fairy spawns are
+difficulty-independent; their bullets are difficulty-scaled. Even a perfect menu-freeze can't fix this —
+each install's difficulty cursor *starts* at its own saved default, so they diverge with nobody touching
+the menu.
+
+**Fix (host-authoritative, in-game selection kept — the tester's chosen UX):** the difficulty global is
+the source of truth. Each machine reports its current difficulty on **every `Ctrl_Key` packet** (new
+`CtrlPack.sender_diff`; `MULTI_NET_VER` 3960→3970 so mismatched builds are rejected at handshake). The
+**guest pins its `0x626280` to the host's value every frame** (`HookedSceneTick`, before the stage init
+reads it), so the guest's menu follows the host and both start identical. Host untouched; out-of-band
+metadata, not part of lockstep input/RNG. One-shot `difficulty pinned to host's` log. Native
+`netloop_test` green; needs a 2-PC confirm.
+
+**Still open (same class, need RE):** the tester also listed **Extra/Phantasm unlock state** and
+**starting lives** as divergent. Follow-ups: (a) **unlock-all at init** so the guest's menu offers the
+same options (needed for the guest to follow the host into Extra/Phantasm), (b) **force starting lives**
+host-authoritative the same way. Both need the unlock-flag / lives globals located first (not trivially
+near `0x626280`). The user is OK treating these pragmatically. Lesson reinforced: a netplay "desync" can
+be **pre-game config divergence between installs**, fixable by pinning the few starting globals — check
+those before any sim-side theory.

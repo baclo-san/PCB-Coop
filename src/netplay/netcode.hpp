@@ -17,6 +17,12 @@
 typedef unsigned short (*ReadLocalInputFn)(void);
 typedef unsigned short (*ReadRngSeedFn)(void);
 
+// DIAGNOSTIC: optional log sink (e.g. coop.c's Log). When set, the netcode emits
+// WIRE SEND / WIRE RECV lines for non-zero inputs so a host-vs-guest diff can tell
+// a wire/transit corruption from a buffer fault.
+typedef void (*NetcodeLogFn)(const char*);
+void Netcode_SetLog(NetcodeLogFn fn);
+
 struct NetcodeCallbacks
 {
     ReadLocalInputFn readLocalInput;
@@ -44,6 +50,23 @@ void Netcode_BeginHandshake(int delay, unsigned short seed);
 bool Netcode_PumpHandshake();
 bool Netcode_HandshakeVersionBad();
 
+// ---- auto-resync (completes th06's Ctrl_Try_Resync handshake) ----
+// Opt-in recovery for a SUSTAINED in-stage desync: the host agrees a future frame with
+// the guest and both clear the misaligned peer-input buffer there, then the host env
+// reseeds the game RNG (poll below) — the automatic form of Escape->Give up->Retry.
+// Inert while synced. enable=false by default so the native tests are unaffected.
+void Netcode_SetAutoResync(bool enable, int thresholdFrames);
+// 1 (and clears the latch) iff a realign EXECUTED since the last poll — the host env
+// then writes the shared init seed into the game's RNG on this frame so both converge.
+int  Netcode_PollResyncFired();
+
+// ---- host-authoritative difficulty (keep both installs' starting config identical) ----
+// The env reports this machine's current difficulty each frame; it rides every Ctrl_Key
+// packet. GetPeerDifficulty returns the most recent value the PEER sent (-1 if none yet);
+// the guest forces its difficulty global to the host's so both start identical.
+void Netcode_SetLocalDifficulty(int diff);
+int  Netcode_GetPeerDifficulty();
+
 // ---- per-frame entry (the injection point) ----
 // Returns the merged 16-bit word BOTH machines agree on for logic-frame `frame`:
 //   gameplay (is_in_UI=false): P1 = host's low-bit input, P2 = guest's input in high bits.
@@ -69,3 +92,20 @@ void Netcode_GetLastSplit(unsigned short& p1, unsigned short& p2);
 // (climbs toward the 5s timeout when the lockstep is stalling).
 int  Netcode_GetNetFrame();
 void Netcode_GetSyncStats(unsigned short& selfRng, unsigned short& rcvRng, int& waitMs);
+
+// DIAGNOSTIC: GetKeys internals from the last frame — the read frame index
+// (frame - delay), the raw self/rcv words it merged, and how the peer's input
+// was obtained (0=immediate, 1=after a wait, 2=timed out/defaulted).
+void Netcode_GetReadStats(int& readFrame, unsigned short& selfKey,
+                          unsigned short& rcvKey, int& rcvStatus);
+
+// DIAGNOSTIC: provenance of the received slot read last frame — the frame field of
+// the packet that wrote it (-1 if never written) and how many packets wrote it.
+void Netcode_GetRcvSrc(int& srcPktFrame, int& writes);
+
+// DIAGNOSTIC: cumulative send-side fault counters + last event. selfRewrites = a
+// self slot recorded twice with different values; sendZfill = SendKeys zero-filled
+// a recent slot (within delay+2) that should have existed.
+void Netcode_GetSendDiag(int& selfRewrites, int& rwFrame,
+                         unsigned short& rwOld, unsigned short& rwNew,
+                         int& sendZfill, int& zfFrame, int& zfSlot);

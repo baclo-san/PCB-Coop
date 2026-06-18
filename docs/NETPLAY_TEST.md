@@ -43,7 +43,8 @@ netplay: transport up role=host ... Handshaking — waiting for the peer ...
 netplay: LINK UP (handshake done). role=host delay=2 seed=0x....
 ```
 Both should log `LINK UP` with the **same seed**. Then a **NET status line** appears
-top-right in-game (see below).
+top-right in-game — and now also **top-left on the menu** (see below), so you can watch
+the front-end sync state before the game even starts.
 
 ## 5. Play
 - **Title / difficulty:** the **host (P1)** drives.
@@ -60,6 +61,12 @@ Top-right during play, e.g. `NET H F1234 d2 SYNC`:
   climbing WAIT with a near-frozen frame number IS a stall** (the other PC fell
   behind or hit a loading hitch).
 - `NET LOST` = the link timed out; you dropped back to local P2.
+
+**On the menu** the same line shows top-left, with the two RNG seeds appended:
+`NET H F1234 d2 SYNC AB12/AB12`. The trailing `self/rcv` pair is the desync oracle — the
+instant they diverge (`… DSYN AB12/CD34`) the front-end has desynced, which is the usual
+precursor to a menu→stage stall. Watch it while navigating: if `Esc+R` / returning to title
+is what diverges them, you'll see it here in real time.
 
 `coop_log.txt` mirrors this: a heartbeat every ~2s (`F#### SYNC wait=…ms rng
 self=… peer=…`), a one-line `STALL` warning when a frame blocks ≥250 ms, and a
@@ -86,8 +93,52 @@ barrier** (both machines begin lockstep frame 0 from the *same* screen, the way
 EoSD's "Start Game" button works), rather than connecting mid-menu. The new sync
 telemetry above is the instrumentation to confirm that before/after.
 
+### Field-test log — 2026-06-17 (P1 `tovrof.zip` / P2 `7454cb.zip`)
+Three back-to-back attempts, same two PCs:
+1. **Total failure** — never synced; repeated `Esc+R` and return-to-menu didn't recover.
+2. **No FPU guard** (`[net] fpu_guard=0`) — synced in **game 3** and stayed synced through
+   everything afterward.
+3. **FPU guard back ON** — synced after **one restart**; "good enough."
+
+Read: the sync is **fragile at start** (needs 1+ restarts) but **stable once locked**, and the
+FPU guard isn't clearly helping/hurting the *start* path. The fragile-start + easy-menu-desync
+both point at the same root cause as the Known issue above — **no shared start barrier**, so the
+two machines begin lockstep from different states and only converge by luck after a restart. The
+menu RNG readout (added this cut) is to catch exactly when/where that divergence happens. **The
+real fix remains the EoSD-style "Start Game" barrier**, not more FPU tweaking. Tracked, not yet
+implemented — it's the next netplay work item.
+
+### Root cause CONFIRMED from those logs + two fixes (2026-06-18)
+Reading `tovrof`/`7454cb` frame-by-frame settled three things — **none of it is the x87 control
+word** (every `control word pinned` line is `was 0x001f` on *both* peers, so the §8q precision
+theory is ruled out for these builds):
+
+1. **The menu "desync" is real and game-breaking — different difficulties.** A live run put one
+   peer on Hard, the other on Phantasm. Traced to ZUN's menu **key-repeat** (hold-to-scroll):
+   `FUN_00437c70` (PCBdecomp.c:22803-22816) derives the repeat counter/flag (`DAT_004b9e60` /
+   `DAT_004b9e5c`) from the **local keyboard poll**, *before* our merged-word overwrite. The
+   cursor's hold-scroll is gated on that flag (PCBdecomp.c:29077), so holding a direction advances
+   the cursor a **machine-dependent** number of steps. Taps already sync (they edge-detect
+   cur/prev, which carry the merged word); only *holds* diverged. **Fix:** `SyncMenuRepeat()` now
+   recomputes the repeat counter/flag from the **merged** word each menu frame, so hold-scroll is
+   deterministic on both peers.
+2. **The menu RNG heartbeat (`ctr=0`) is a different, harmless signal** — the menu draws no RNG,
+   so `self/peer` just differ by an idle seed value. The difficulty fork above is an *input*
+   divergence, not RNG. Both now visible on the menu HUD.
+3. **Esc+R never re-seeded.** `SEEDFORCE` only fired on first stage entry from the menu; the
+   `frame counter reset -> FRESH start` retry path stays in the same scene, so a forked stage
+   could only re-align via a full title round-trip — exactly "couldn't sync no matter how many
+   Esc+R" in attempt 1. **Fix:** the fresh-start retry now re-arms the seed force, so the next
+   `HookedGameStart` re-applies the shared init seed on both peers (the same realign the HARD
+   DESYNC log already names, now reachable from a quick restart).
+
+Still open: the **first** menu→stage transition can still fork from front-end load drift (each PC
+burns a different number of loading ticks); the scene-reset re-zero handles most of it but the
+EoSD-style explicit start barrier remains the proper long-term fix.
+
 ## Notes / known limits (this cut)
 - **Launcher** replaces hand-editing `coop.ini`. Auto-connect; host pushes delay+seed.
 - **Per-player character select** works (host=P1 then guest=P2). Title/difficulty host-led.
+- **Menu hold-to-scroll** is now lockstep-deterministic (difficulty can't fork between peers).
 - **Proximity fade** is ON by default (set `[coop] proximity_fade=0` to disable).
 - Local-keyboard co-op is unchanged — click **Local Co-op** (or `[net] enabled=0`).

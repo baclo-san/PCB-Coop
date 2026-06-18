@@ -87,7 +87,8 @@
  *   (FUN_0043eb90) fires every 6 frames for authentic graze SFX/spark feedback
  *   — with its stat effects (graze counters/score/bonus accumulator)
  *   snapshot-restored so nothing rises. The revive DONATES one of the
- *   survivor's lives — or is FREE when the survivor has no spare extends.
+ *   survivor's lives; with NO spare extend the revive cannot fire (D1,
+ *   user-confirmed 2026-06-16 — no free revives).
  *   Revive values: NO bonus lives (0 spares), bombs = the stock held at death,
  *   power = whatever the normal death drop left. Dying on the LAST life drops
  *   a guaranteed 1-UP at the death spot (tracked last-alive position; ZUN's
@@ -147,6 +148,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <float.h>
 #include "MinHook.h"
 
 /* ---- build-specific addresses (Ghidra db: th07.exe.c ver 1.00b) ---- */
@@ -207,6 +209,22 @@
 #define OFF_BORDER_REQ  0x240d    /* border request/active flag (1 = pressing bomb pops)*/
 #define OFF_BORDER_SPR  0xb7e6c   /* border-ring sprite object ptr                     */
 
+/* B4 — bomb bullet-clear for P2. PCB's bomb clears bullets via per-player CLEAR-REGION
+ * slots at player+0x17dc (96 × 0x20: x,y,w,h,radius,…,type + timer@+0x18). The bullet
+ * HIT test FUN_0043e260 calls FUN_0043e0a0(player, bulletPos) — a bullet inside any of
+ * the player's regions returns "clear" (state 5). coop ALREADY re-invokes FUN_0043e260
+ * for P2, so it reads P2+0x17dc. The regions are registered by FUN_004418b0 (circle) /
+ * FUN_00441800 (box), __thiscall(ECX=player, pos*, …), called only from the per-char
+ * bomb callbacks. The reported bug = P2's bomb registers nothing on P2+0x17dc (its
+ * callback threads the P1 static base for ECX — the documented coop ECX pitfall). Fix:
+ * detour both registrars and, while inside P2's update window, force ECX to P2. This is
+ * safe-by-construction: +0x17dc is bomb-only and during P2's update the only legitimate
+ * region owner is P2, so the redirect is a no-op if ECX was already P2 and the fix
+ * otherwise. */
+#define ADDR_ADD_CLEAR_CIRCLE ((LPVOID)0x004418b0) /* __thiscall(player,pos,r,col,?,type) */
+#define ADDR_ADD_CLEAR_BOX    ((LPVOID)0x00441800) /* __thiscall(player,pos,w,h,type)      */
+#define OFF_CLEAR_REGIONS 0x17dc
+
 /* Tier-1 boss/enemy HP scaling — DAMAGE-side lever. The first attempt scaled
  * the per-phase max-life cap (+0xd30) at the ECL set-life opcode (FUN_00424290),
  * but the 2026-06-12 eclhp diagnostic proved only popcorn (cap 60) ever passes
@@ -233,6 +251,11 @@ typedef void (__fastcall *ItemLoopFn_t)(void *self);
 /* FUN_00441bd0 is __thiscall(player[ECX], int flag[stack]) with `ret 4` (verified vs the
  * binary). Model as __fastcall: ECX=self, EDX unused, flag on the stack. */
 typedef void (__fastcall *BorderBreakFn_t)(void *self, void *edx, int flag);
+/* B4 clear-region registrars (__thiscall(player, pos*, …)). */
+typedef void *(__fastcall *AddClearCircleFn_t)(void *self, void *edx, void *pos,
+                                               uint32_t r, uint32_t col, uint32_t type);
+typedef void *(__fastcall *AddClearBoxFn_t)(void *self, void *edx, void *pos,
+                                            uint32_t w, uint32_t h, uint32_t type);
 
 /* ---- separate resources (lives/bombs/power) ----
  * They live in the struct at *(player+8) == DAT_00626278, stored as floats, and
@@ -293,8 +316,29 @@ static CollideBulletFn_t s_origCollideBullet = NULL;
 static CollideBulletFn_t s_origGraze         = NULL;   /* FUN_0043e3b0, same signature */
 static CollideLaserFn_t  s_origCollideLaser  = NULL;
 static CollectOverlapFn_t s_origCollectOverlap = NULL;
+static AddClearCircleFn_t s_origAddClearCircle = NULL;  /* B4 */
+static AddClearBoxFn_t    s_origAddClearBox    = NULL;  /* B4 */
+static int s_p2BombClear = 1;          /* B4: P2 bomb clears bullets (default on) */
+static int s_p2PrevBombing = 0;        /* B5 diag: P2 bombing-flag edge tracker    */
+static int s_b5ZeroCount   = 0;        /* B5 diag: times B5 zeroed boss damage/bomb */
+static int s_b5HitLogged   = 0;        /* B5 diag: one-shot @hit dump per bomb      */
 static DamageFn_t        s_origDamage        = NULL;
 static ItemLoopFn_t      s_origItemLoop       = NULL;
+
+/* B5: the enemy-manager base (FUN_00420620's param_1/ECX). The boss spellcard flags live
+ * at base+0x9545c8 (isActive) / base+0x9545dc (usedBomb) — param_1 is NOT 0 (the in-game
+ * boss enemy logged at 0x009b3998), so we capture the live base each enemy-update tick. */
+typedef int (__fastcall *EnemyUpdateFn_t)(void *self);
+#define ADDR_ENEMY_UPDATE ((LPVOID)0x00420620)
+static EnemyUpdateFn_t s_origEnemyUpdate = NULL;
+static volatile uint32_t s_enemyMgr = 0;
+/* Post-spell-capture refuel window. When P1 is full the boss substitutes POINT items
+ * for the power drop it would give (confirmed in-game: capture reward = a type-1 burst
+ * at p1pow=128, in the sc=0 gap after the spell ends). Co-op wants those as POWER when
+ * P2 is below full, so HookedEnemyUpdate opens this countdown on each boss spell-end and
+ * HookedItemSpawn converts type-1 -> type-0 while it's open and P2 isn't full. */
+static int s_captureWin = 0;
+#define CAPTURE_WIN_FRAMES 240   /* ~4s after a boss spell ends (covers the bonus + fountain) */
 
 /* ---- aim & item-suction: target the NEARER player (coop gameplay) ----
  * FUN_00442370 is Player::AngleToPlayer(this=player, pos): the angle from world
@@ -371,6 +415,7 @@ static float s_p1AliveBombs = 0.f, s_p2AliveBombs = 0.f;
 #define OFF_FX_KILL       0x1c6    /* u16: 1 = fade out & die                      */
 #define OFF_FX_TYPE       0x2cd    /* u8: effect type byte                         */
 #define OFF_FX_POS        0x24c    /* float[3] world position                      */
+#define OFF_FX_COLOR      0x1b8    /* u32 ARGB tint (param_6 of FUN_0041c610@26415)*/
 #define OFF_PLAYER_FX     0x9d8    /* player: handle of its own focus effect       */
 /* __thiscall(mgr, type, pos, slotArg, a5, color) modelled as __fastcall */
 typedef void *(__fastcall *EffectSpawnFn_t)(void *mgr, void *edx, int type,
@@ -523,9 +568,118 @@ typedef int (__fastcall *ItemSpawnFn_t)(void *self, void *edx,
 #define ITEM_TYPE_1UP   5
 static volatile void *s_itemMgr = NULL;
 
+/* ── B2: power-item → cherry conversion gated on BOTH players full ──────────────
+ * Vanilla PCB turns dropped power items into cherry (point) items as soon as P1 is
+ * at full power — which in co-op starves P2's only power source. We want the
+ * conversion to wait until BOTH players are full.
+ *
+ * The decision lives inside the spawner FUN_004326f0. An EARLIER reading of the
+ * decomp (Ghidra modelled the round as `FUN_0048b8a0()` reading in_ST0) concluded the
+ * caller pushes P1's power on the x87 ST0, so the convert couldn't be wrapped by a C
+ * detour and was attacked with a NAKED ST0 trampoline. That was WRONG, and is exactly
+ * why B2 "never worked regardless of config": the disassembly shows the function loads
+ * P1's power FRESH FROM MEMORY and ignores the caller's ST0 —
+ *     432710  mov eax, [0x626278]          ; res base  == *ADDR_RES_PTR
+ *     432715  fld dword ptr [eax+0x7c]     ; ST0 = P1 power  (RES_POWER)
+ *     432718  call 0x48b8a0                ; round(power)
+ *     43271d  cmp eax, 0x80 ; (>=128) && type∈{0,2} ⇒ type = 7 (cherry)
+ * So the old detour's fstp/fldz mutated a dead ST0 that 432715 immediately overwrote.
+ *
+ * Correct, FPU-free fix: a normal thiscall detour. When we want to keep the drop as a
+ * power item (g_b2Suppress: P2 live and below full) and the item is a convertible type
+ * (0/2), temporarily write P1's power to 0.0f around the original call, so the engine's
+ * own `round(*(res+0x7c)) >= 0x80` test fails and it leaves the type unchanged; then
+ * restore. 0.0f is all-zero bits ⇒ the save/zero/restore is a plain integer memory copy
+ * (no FPU, no RNG, deterministic), and the anti-tamper checksum (res+0xb0) is untouched
+ * because power is restored before any accessor runs. The convert test is the spawner's
+ * SOLE power read (432715 verified), so nothing else is disturbed.
+ *
+ * g_b2Suppress is computed in C, FP-safely, once per frame:
+ *   P2 live && P2 power < full  (i.e. P1 full + P2 not full ⇒ keep it a power item).
+ * When P2 is also full we leave power alone, so vanilla converts (both full). Only the
+ * convertible types (0,2) are touched; every other spawn — including coop's own 1up
+ * drops (type 5) — is a clean passthrough. Gated behind coop.ini [coop] cherry_both_full
+ * (default ON since the 2026-06-17 x87 desync fix; set it to 0 to restore vanilla).
+ * thiscall: ECX=mgr (this), then pos*, type, mode on the stack. */
+static void Log(const char *fmt, ...);  /* defined below; used by the early item-spawn diag */
+static int  SpellcardActive(void);      /* defined below; boss-spell flag for the spawn diag */
+unsigned char g_b2Suppress      = 0;    /* read by the detour: keep this spawn as power */
+void         *g_b2OrigItemSpawn = NULL; /* MinHook trampoline for FUN_004326f0        */
+volatile uint32_t g_b2Calls      = 0;   /* diag: spawner calls seen by the hook        */
+volatile uint32_t g_b2Suppressed = 0;   /* diag: conversions suppressed (kept as power)*/
+static int s_b2LoggedFire = 0;          /* one-shot: logged the first real suppression */
+static int s_b2RefuelLogged = 0;        /* one-shot: logged the first post-capture point->power */
+static int s_b2DiagN      = 0;          /* diag: count of logged convertible/converted spawns */
+
+/* (ItemSpawnFn_t / FUN_004326f0 typedef declared above with the spawner addr.) */
+static int __fastcall HookedItemSpawn(void *self, void *edx, float *pos, int type, int mode)
+{
+    g_b2Calls++;
+    /* DIAG (cherry/power): user-confirmed the boss spell-capture "skips power drops"
+     * when P1 is full (only point items, no power, no cherry) — and the 0/2/7-only diag
+     * stayed SILENT at capture, so the power items never reach this spawner (skipped
+     * UPSTREAM) OR are a type the old filter missed (notably 4 = full-power "F"). Log
+     * the first ~60 spawns of EVERY type with the spellcard flag so one capture run
+     * shows exactly what the boss emits: a type-4 line at capture => the refill is
+     * full-power items skipped when full; only type 1/6 lines => the reward is genuinely
+     * point-only here; NO line at all during the capture burst => the boss uses a
+     * different spawner / the power drop is decided and dropped entirely upstream. */
+    if (s_b2DiagN < 60 && type != 6) {   /* skip the type-6 bullet-cancel star spam */
+        uint32_t res0 = *ADDR_RES_PTR;
+        float p1pw = res0 ? *(float *)(res0 + RES_POWER) : -1.f;
+        Log("B2 diag spawn #%d: type=%d mode=%d sc=%d capwin=%d suppress=%d p1pow=%.0f p2pow=%.0f diff=%u",
+            s_b2DiagN, type, mode, SpellcardActive(), s_captureWin, g_b2Suppress, p1pw, s_p2Power,
+            *(volatile uint32_t *)0x00626280);
+        s_b2DiagN++;
+    }
+    if (g_b2Suppress) {
+        /* Post-capture refuel (confirmed in-game + cross-checked vs EoSD
+         * ECL_OPCODE_DROPITEMS, EclManager.cpp:802-817): the boss spell reward loops
+         * SpawnItem; when P1 power < 128 it drops BIG/SMALL POWER, but when P1 is FULL it
+         * substitutes POINT (type 1) for every power item — the decision is UPSTREAM of
+         * this spawner, so the popcorn power-zero below never sees it as 0/2. Inside the
+         * post-spell window, turn that point reward back into a power item so a below-full
+         * P2 can refuel (crucial on Extra/Phantasm). P1 (full) collecting a power item
+         * still scores on pickup, so P1 loses nothing meaningful; the window keeps normal
+         * in-stage point items untouched.
+         *
+         * CRUCIAL: after type=0 we must FALL THROUGH to the power-zero wrapper, not call
+         * the original directly — otherwise SpawnItem's own full-power->cherry conversion
+         * (FUN_004326f0: round(P1pow)>=0x80 && type in {0,2} => 7) re-converts our type-0
+         * straight into a CHERRY (the regression seen 2026-06-18). */
+        if (s_captureWin > 0 && type == 1) {
+            if (!s_b2RefuelLogged) {
+                Log("B2: post-capture point reward -> power (P2 below full, capwin=%d)", s_captureWin);
+                s_b2RefuelLogged = 1;
+            }
+            type = 0;   /* now flows into the power-zero block below */
+        }
+        if (type == 0 || type == 2) {
+            uint32_t res = *ADDR_RES_PTR;
+            if (res) {
+                volatile uint32_t *pw = (volatile uint32_t *)(res + RES_POWER);
+                uint32_t saved = *pw;
+                int rr;
+                *pw = 0;            /* 0.0f ⇒ round(power)=0 ≤ 0x7f ⇒ engine keeps it power */
+                rr = ((ItemSpawnFn_t)g_b2OrigItemSpawn)(self, edx, pos, type, mode);
+                *pw = saved;        /* restore before any accessor checks the checksum     */
+                g_b2Suppressed++;
+                return rr;
+            }
+        }
+    }
+    return ((ItemSpawnFn_t)g_b2OrigItemSpawn)(self, edx, pos, type, mode);
+}
+
 /* Tier-1: scale enemy/boss HP cap by the active player count. On by default;
  * only takes effect while P2 is live (factor = 1 + (s_p2 != NULL)). F5 toggles. */
 static int   s_bossHpScale = 1;
+/* N2 — team DPS damper tuning + mode (coop.ini [coop] damper_boss_only, launcher box).
+ * FLAT (0): every enemy *= 0.75. BOSS-ONLY (1): only lifebar enemies *= 0.60, popcorn
+ * full damage. Constants are easy to retune from play feel. */
+#define COOP_DAMPER_FLAT 0.75f
+#define COOP_DAMPER_BOSS 0.60f
+static int   s_damperBossOnly = 0;     /* 0 = flat 0.75 all; 1 = boss-only 0.60 */
 
 /* SHARED TEAM BORDER: the automatic Cherry+ supernatural border. P1 keeps the one real
  * ZUN border (single ring slot); P2 rides along in a ringless "shadow" state 4 synced to
@@ -539,8 +693,34 @@ static BorderBreakFn_t s_origBorderBreak = NULL;
 static FILE *s_log = NULL;
 static char  s_dir[MAX_PATH];
 
+/* ── crash breadcrumbs ──────────────────────────────────────────────────────────
+ * A cryptic crash (the C1/C2 family) usually faults INSIDE a ZUN function we re-invoked
+ * for P2, a few frames after the real cause, so the faulting EIP alone says little. We
+ * keep a one-word breadcrumb of the last coop hook/section entered and which player it
+ * was running for; the vectored exception handler (CoopCrashHandler) dumps it together
+ * with the faulting context. Writing a pointer + int each hook entry is essentially free
+ * and is the cheapest "what was coop doing when it died" signal. */
+static volatile const char *s_crumb    = "init";   /* last hook/section reached      */
+static volatile int         s_crumbWho = 0;         /* 0 = P1 / engine, 1 = P2 re-invoke */
+static volatile uint32_t    s_crumbSeq = 0;         /* bumps every breadcrumb (liveness) */
+#define CRUMB(name)       do { s_crumb = (name); s_crumbSeq++; } while (0)
+#define CRUMB2(name, who) do { s_crumb = (name); s_crumbWho = (who); s_crumbSeq++; } while (0)
+
 static int   s_readyFrames = 0;        /* consecutive P1-update frames seen        */
 static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch               */
+static int   s_suppressP2  = 0;        /* DIAGNOSTIC: never spawn P2 (desync isolation) */
+static int   s_b2CherryBothFull = 1;   /* B2: power->cherry only when BOTH full (FPU asm; default ON since x87 desync fix) */
+static int   s_fpuGuard    = 0;        /* §8o: firewall the netcode's x87 FPU use (desync fix test) */
+/* §8r: auto-recover a sustained in-stage desync via the th06 resync handshake + a
+ * mid-stage RNG reseed. DEFAULT OFF — a 2-PC test (2026-06-18) PROVED it does NOT fix
+ * PCB's desync: the handshake fires correctly on both sides but the divergence is an
+ * ongoing GAME-STATE fork (mid-stage, cross-platform Wine↔Windows FP), which a reseed
+ * can't undo, so it re-desyncs within ~200 frames and the friend found it WORSE than the
+ * manual retry. Kept (inert) only because the protocol is a correct building block; the
+ * recovery path that actually works is a full scene RESTART (Escape→Give up→Retry). */
+static int   s_netAutoResync = 0;      /* §8r: OFF by default — proven not to fix PCB's mid-stage fork */
+#define COOP_RESYNC_THRESHOLD 180      /* sustained desync frames (~3s) before auto-resync fires */
+static int   s_diffForcedLogged = 0;   /* §8t: one-shot log when the guest first pins difficulty to host's */
 #define AUTO_SPAWN_AFTER 30            /* frames of P1 in state 0 after the stage
                                           fly-in, then spawn P2 (user: both players
                                           up together at stage start) */
@@ -640,10 +820,17 @@ typedef int (__fastcall *ShtLoadFn_t)(void **out, const char *name); /* 0 = ok *
 #define OFF_SHT_UNFOC     0xb7e70      /* void*: unfocused .sht buffer            */
 #define OFF_SHT_FOC       0xb7e74      /* void*: focused .sht buffer              */
 #define OFF_BOMB_CB       0x16a3c     /* 4 consecutive cb ptrs                    */
-#define OFF_SPD_UNF_CUR   0x990
-#define OFF_SPD_UNF       0x994       /* = sht[+0xc]/2                            */
-#define OFF_SPD_FOC_CUR   0x99c
-#define OFF_SPD_FOC       0x9a0       /* = sht[+0x10]/2                           */
+/* ⚠️ MISNOMER (kept for churn-safety): these four are NOT speed — they are the
+ * player's HIT/GRAZE half-extents (the engine recomputes the AABB edges each
+ * frame from player center ∓ these): +0x990/+0x994 = hit half-X/Y, +0x99c/+0x9a0 =
+ * graze half-X/Y. ApplyP2Selection sets them from the .sht (sht[0xc]/2 hit,
+ * sht[0x10]/2 graze) — semantically correct for P2's hitbox, so behaviour is fine;
+ * only the names mislead. See docs/th07_player_struct.md "Open / unverified".
+ * Do NOT reuse these as a movement-speed field — that field is unconfirmed. */
+#define OFF_SPD_UNF_CUR   0x990       /* hit half-extent X (cur)   */
+#define OFF_SPD_UNF       0x994       /* hit half-extent Y = sht[+0xc]/2   */
+#define OFF_SPD_FOC_CUR   0x99c       /* graze half-extent X (cur) */
+#define OFF_SPD_FOC       0x9a0       /* graze half-extent Y = sht[+0x10]/2 */
 #define OFF_DEATH_TIMER   0x23f8      /* int death/deathbomb-window countdown (NOT
                                        * a hitbox): max while alive, decremented
                                        * while dying, finalizes death at 0. See
@@ -780,6 +967,57 @@ static void Log(const char *fmt, ...)
     fflush(s_log);
 }
 
+/* Vectored exception handler: turn a silent crash into a log line. Fires for the whole
+ * process, so we only report genuinely fatal codes (not the C++ EH / debug-print pseudo
+ * exceptions the game/D3D raise normally), dump the faulting context + our breadcrumb,
+ * then EXCEPTION_CONTINUE_SEARCH so the OS crash path proceeds unchanged (we never
+ * swallow it). Re-entry-guarded in case the handler itself faults. The game has no ASLR
+ * (fixed 0x400000 base), so a raw EIP/target like 0x0043d9e0 is directly greppable
+ * against PCBdecomp / objdump; >= 0x10000000 is typically our DLL or a wild pointer. */
+static LONG WINAPI CoopCrashHandler(EXCEPTION_POINTERS *ep)
+{
+    static volatile LONG s_inHandler = 0;
+    DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    switch (code) {                       /* only the fatal ones — ignore EH/debug noise */
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (InterlockedExchange(&s_inHandler, 1)) return EXCEPTION_CONTINUE_SEARCH;
+
+    if (s_log) {
+        CONTEXT *c = ep->ContextRecord;
+        EXCEPTION_RECORD *r = ep->ExceptionRecord;
+        Log("====================  CRASH  ====================");
+        Log("exception 0x%08lx at EIP=0x%08lx   crumb=\"%s\" who=%s seq=%u frame=%d",
+            (unsigned long)code, (unsigned long)(c ? c->Eip : 0),
+            s_crumb ? s_crumb : "?", s_crumbWho ? "P2" : "P1", s_crumbSeq, s_lastLogicFrame);
+        if (code == EXCEPTION_ACCESS_VIOLATION && r && r->NumberParameters >= 2)
+            Log("  access violation: %s 0x%08lx",
+                r->ExceptionInformation[0] == 1 ? "WRITE to" :
+                r->ExceptionInformation[0] == 8 ? "EXECUTE at" : "READ from",
+                (unsigned long)r->ExceptionInformation[1]);
+        if (c)
+            Log("  EAX=%08lx EBX=%08lx ECX=%08lx EDX=%08lx\n"
+                "  ESI=%08lx EDI=%08lx EBP=%08lx ESP=%08lx",
+                (unsigned long)c->Eax, (unsigned long)c->Ebx, (unsigned long)c->Ecx,
+                (unsigned long)c->Edx, (unsigned long)c->Esi, (unsigned long)c->Edi,
+                (unsigned long)c->Ebp, (unsigned long)c->Esp);
+        Log("  coop: p2=%p ghost=%d anmActive=%d inP2Update=%d  (P1 base=0x%08x)",
+            (void *)s_p2, s_p2Ghost, s_p2AnmActive, s_inP2Update, ADDR_PLAYER_BASE);
+        Log("=================================================");
+    }
+    s_inHandler = 0;
+    return EXCEPTION_CONTINUE_SEARCH;     /* let the real crash path run */
+}
+
 static int P1Ready(void)
 {
     /* a character must be loaded (char-data ptr set) for the clone to be valid */
@@ -791,13 +1029,17 @@ static int P1Ready(void)
  * P2 word; the swap mechanism below is exactly what the netcode will drive. */
 static int Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
+/* P2 local-coop binds: WASD move (left hand), right hand on the actions.
+ * WASD chosen over IJKL per player feedback ("WASD is free real estate"). P1 uses
+ * arrows+Z/X/Shift, so W/A/D don't collide; S/D do alias menu keys (0x400/0x2000)
+ * but gameplay reads only the low 9 bits, and the menu pass is overridden per-player. */
 static uint16_t ReadP2InputLocal(void)
 {
     uint16_t w = 0;
-    if (Down('I'))      w |= IN_UP;
-    if (Down('K'))      w |= IN_DOWN;
-    if (Down('J'))      w |= IN_LEFT;
-    if (Down('L'))      w |= IN_RIGHT;
+    if (Down('W'))      w |= IN_UP;
+    if (Down('S'))      w |= IN_DOWN;
+    if (Down('A'))      w |= IN_LEFT;
+    if (Down('D'))      w |= IN_RIGHT;
     if (Down(VK_SPACE)) w |= IN_SHOOT;
     if (Down('U'))      w |= IN_FOCUS;
     if (Down('O'))      w |= IN_BOMB;
@@ -847,6 +1089,18 @@ static int s_p2InputLogged = 0;
 #define ADDR_GAME_START ((LPVOID)0x00442c60)   /* game/stage-start init (seed snapshot)*/
 #define ADDR_INPUT_MENU ((volatile uint16_t *)0x004b9e4c) /* g_InputMenu (raw poll)    */
 #define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
+#define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
+#define ADDR_DIFFICULTY ((volatile uint32_t *)0x00626280) /* 0..3 main, 4 Extra, 5 Phantasm */
+/* Menu key-REPEAT (hold-to-scroll) state. ZUN's scene-tick (FUN_00437c70 @22803-22816)
+ * derives these from the LOCAL keyboard poll, BEFORE our merged-word overwrite — so the
+ * cursor's hold-scroll (gated on the repeat flag @PCBdecomp.c:29077) advances a machine-
+ * dependent number of steps and the two peers land on DIFFERENT difficulty/cursor rows
+ * (confirmed: one HOST on Hard, one on Phantasm). We recompute both from the MERGED stream
+ * each menu frame so hold-scroll is deterministic. (Taps already sync: they edge-detect
+ * cur/prev, both of which carry the merged word.) */
+#define ADDR_MENU_REPEAT_FLAG ((volatile uint16_t *)0x004b9e5c) /* DAT_004b9e5c: repeat tick */
+#define ADDR_MENU_REPEAT_CTR  ((volatile uint16_t *)0x004b9e60) /* DAT_004b9e60: hold counter */
+static uint16_t s_menuRepeatCtr = 0;   /* our shadow of the repeat counter, merged-driven */
 
 typedef int (__fastcall *SceneTickFn_t)(void *self);
 typedef int (__fastcall *GameStartFn_t)(int self);
@@ -870,6 +1124,11 @@ static int      s_netFrame   = 0;          /* DLL-owned logic-frame index       
 static uint16_t s_netMerged  = 0;          /* this frame's merged word (P2 reads high) */
 static int      s_netSync    = 1;          /* last seen Nc_IsSync()                    */
 static int      s_netDesyncLogged = 0;     /* nonzero = inside a desync episode        */
+static int      s_netDesyncRun = 0;        /* consecutive in-stage sync=0 frames (fork)*/
+static int      s_netHardDesyncLogged = 0; /* latch: sustained (real) desync reported  */
+#define HARD_DESYNC_FRAMES 180             /* ~3s of unbroken in-stage sync=0 = a real
+                                              fork, vs the ≤15-frame blips that self-heal
+                                              at scene/seed-reforce boundaries (§8r) */
 static int      s_netSyncRun  = 0;         /* consecutive in-sync gameplay frames      */
 static int      s_netWaitMs   = 0;         /* last frame's lockstep wait (ms)          */
 static uint16_t s_netSelfRng  = 0;         /* our RNG seed vs the peer's, last compared*/
@@ -877,6 +1136,8 @@ static uint16_t s_netRcvRng   = 0;
 static int      s_netStallLogged = 0;      /* throttle: frames since last STALL log    */
 static int      s_netStatLogged  = 0;      /* throttle: frames since last status log   */
 static int      s_netPeerLost = 0;         /* latched once the lockstep timed out      */
+static FILE    *s_trace = NULL;            /* DIAGNOSTIC: per-frame determinism trace  */
+static int      s_seedForced = 0;          /* seed forced once for the current scene   */
 static int      s_netSceneId  = -1;        /* last top-level scene id (self+0x154); a
                                               change re-zeros the lockstep (start barrier)*/
 static int      s_proxFade   = 1;          /* coop.ini [coop] proximity_fade (default ON) */
@@ -892,6 +1153,9 @@ static uint16_t s_p1MenuPrev = 0;          /* P1's menu prev word (netplay edge 
  * still sees this frame's raw local poll. readRngSeed = the desync oracle. */
 static unsigned short NetReadLocalInput(void) { return *ADDR_INPUT_MENU; }
 static unsigned short NetReadRngSeed(void)    { return *ADDR_RNG_SEED;   }
+
+/* DIAGNOSTIC: sink for the netcode's WIRE SEND/RECV lines into coop_log.txt. */
+static void NetLogSink(const char *msg) { Log("netplay: %s", msg); }
 
 /* Unpack P2 (merged high bits, NB_*2 = bit<<9) into the low-bit gameplay layout
  * the player update reads (the inverse of merge.cpp's host/guest P2 mapping). */
@@ -917,6 +1181,28 @@ static void LoadNetConfig(void)
      * intended co-op look; set proximity_fade=0 in coop.ini to disable. */
     s_proxFade = (int)GetPrivateProfileIntA("coop", "proximity_fade", 1, ini);
     s_disableDemo = (int)GetPrivateProfileIntA("coop", "disable_demo", 1, ini);
+    /* N2: damper mode. 0 = flat 0.75 on all enemies; 1 = boss-only 0.60 (stage full). */
+    s_damperBossOnly = (int)GetPrivateProfileIntA("coop", "damper_boss_only", 0, ini);
+    /* DIAGNOSTIC: suppress the P2 entity entirely (no auto-spawn, F9 no-ops). Lets a
+     * netplay run test whether the residual sim-determinism desync (handoff §8m) comes
+     * from the grafted P2 entity: set suppress_p2=1 on BOTH machines — if the RNG
+     * counter then stays locked, P2's graft is the culprit; if it still desyncs, the
+     * cause is engine-side / a hook. Default 0. */
+    s_suppressP2 = (int)GetPrivateProfileIntA("coop", "suppress_p2", 0, ini);
+    /* B2: gate the power->cherry conversion on BOTH players full (else P1 alone
+     * full starves P2's power). Installs an FP-safe naked detour on the spawner.
+     * Default ON since 2026-06-17: it reads s_p2Power, which is now in sync after
+     * the x87 desync fix, so the prior reason to keep it off is gone. Set
+     * cherry_both_full=0 to restore vanilla (P1-full converts). */
+    s_b2CherryBothFull = (int)GetPrivateProfileIntA("coop", "cherry_both_full", 1, ini);
+    /* §8o follow-up: firewall the per-frame netcode's x87 FPU use (save/restore the
+     * game's full x87 state around Nc_GetInputNet) so the lockstep wait's timing math
+     * can't perturb ZUN's FP differently on the two machines. Candidate desync fix. */
+    s_fpuGuard = (int)GetPrivateProfileIntA("coop", "fpu_guard", 1, ini);  /* CONFIRMED FIX — default ON */
+    /* §8r: auto-resync — DEFAULT OFF. The 2-PC test proved a mid-stage reseed does not fix
+     * PCB's desync (an ongoing cross-platform game-state fork, not a recoverable frame
+     * offset); the manual scene RESTART is the working recovery. Left as an opt-in flag. */
+    s_netAutoResync = (int)GetPrivateProfileIntA("coop", "auto_resync", 0, ini);
     s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
     if (!s_netEnabled) return;
     GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);
@@ -933,6 +1219,10 @@ static void StartNet(void)
 {
     if (!s_netEnabled) { Log("netplay: disabled (coop.ini [net] enabled=0) — local P2"); return; }
     Nc_SetCallbacks(NetReadLocalInput, NetReadRngSeed);
+    Nc_SetLog(NetLogSink);
+    /* §8r: opt the netcode into auto-resync (off by default in the core so the native
+     * tests stay deterministic). Reseed-on-fire is handled in HookedSceneTick. */
+    Nc_SetAutoResync(s_netAutoResync, COOP_RESYNC_THRESHOLD);
     int ok = s_netIsHost
         ? Nc_StartHost("", s_netPort, 2 /*AF_INET*/)
         : Nc_StartGuest(s_netPeer, s_netPort, s_netLocal, 2 /*AF_INET*/);
@@ -946,6 +1236,110 @@ static void StartNet(void)
     Log("netplay: transport up role=%s peer=%s port=%d local=%d. Handshaking — "
         "waiting for the peer to answer (start the other machine)...",
         s_netIsHost ? "host" : "guest", s_netPeer, s_netPort, s_netLocal);
+}
+
+/* ── x87 FPU state probe + firewall (§8o follow-up) ────────────────────────────
+ * Vanilla PCB replays sync across the host (Wine) and guest (Windows), so ZUN's
+ * own FP is deterministic between these machines. Yet our netplay desyncs even
+ * with P2 suppressed — pointing at something OUR per-frame netcode does to the
+ * shared x87 state. The lockstep wait in Nc_GetInputNet busy-spins a
+ * MACHINE-DEPENDENT number of times doing double timing math; if that leaves the
+ * x87 control word / stack different on the two machines, ZUN's subsequent FP
+ * (positions, aim) rounds differently and the sim forks. FpuCw/FpuSw read the
+ * control + status words (status TOP field = stack depth) so we can diff them
+ * host-vs-guest in the trace. FPU_SAVE/RESTORE wrap the netcode call so it can't
+ * touch the game's FPU at all (gated by s_fpuGuard). */
+static inline unsigned short FpuCw(void)
+{ unsigned short w; __asm__ __volatile__("fnstcw %0" : "=m"(w)); return w; }
+static inline unsigned short FpuSw(void)
+{ unsigned short w; __asm__ __volatile__("fnstsw %0" : "=m"(w)); return w; }
+static unsigned char s_fpuState[108] __attribute__((aligned(16)));
+#define FPU_SAVE()    __asm__ __volatile__("fnsave  %0" : "=m"(s_fpuState) : : "memory")
+#define FPU_RESTORE() __asm__ __volatile__("frstor  %0" : : "m"(s_fpuState) : "memory")
+static unsigned short s_fpuCw = 0, s_fpuSw = 0;   /* last-frame x87 words for the trace (s_fpuGuard declared above) */
+
+/* ── x87 FPU control-word PIN (the likely real desync fix — from nightshift's
+ *    keen-ramanujan branch, §8q) ────────────────────────────────────────────────
+ * Direct3D8 sets the x87 to 24-bit single precision at device-create (ZUN omits
+ * D3DCREATE_FPU_PRESERVE), so vanilla PCB — and its replays — run at 24-bit. But the
+ * two players' D3D drivers / wrappers (Wine vs Windows, different GPUs) can leave the
+ * control word in DIFFERENT states, and D3D can RESET it on Present(); so whether the
+ * two machines' precision matches varies run-to-run — exactly the INTERMITTENT desync
+ * (a clean run when they happen to match, "Desync City" when they don't). fnsave/
+ * frstor (s_fpuGuard) can't fix this: it faithfully preserves whatever (wrong) word
+ * the game already had. The pin FORCES precision=24-bit, rounding=nearest each logic
+ * frame so both machines agree regardless of what D3D did. Gated on s_netActive — the
+ * confirmed-good local/replay build never touches the control word. The first pin logs
+ * the PREVIOUS word so a 2-PC test reveals whether host and guest actually differed. */
+static int s_fpuPinned = 0;
+static void PinFpuForNetplay(void)
+{
+    unsigned prev = _controlfp(0, 0);                   /* read current */
+    _controlfp(_PC_24 | _RC_NEAR, _MCW_PC | _MCW_RC);   /* pin 24-bit single, round-nearest */
+    if (!s_fpuPinned) {
+        s_fpuPinned = 1;
+        Log("netplay: x87 control word pinned to 24-bit/round-nearest (was 0x%04x). "
+            "role=%s — if host and guest 'was' values differ, that was the desync.",
+            prev & 0xffff, Nc_IsHost() ? "host" : "guest");
+    }
+}
+
+/* DIAGNOSTIC (det-trace) — one CSV row per logic frame while netplay is active.
+ * Both machines run the SAME frame indices under lockstep, so diffing the host
+ * and guest CSVs by the `frame` column gives the exact frame the sims part ways.
+ * The live RNG counter (0x0049fe24) is monotonic within a stage and is NOT reset
+ * by our seed-force, so it catches divergence the per-frame seed (which the
+ * seed-force pins back to initSeed) would otherwise mask. seed/counter are read
+ * live here at the top of the logic frame (== end of the previous frame's sim),
+ * which is the same relative sample point on both machines. */
+static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sync)
+{
+    if (!s_trace) {
+        char p[MAX_PATH];
+        snprintf(p, sizeof(p), "%scoop_trace_%s.csv", s_dir,
+                 Nc_IsHost() ? "host" : "guest");
+        s_trace = fopen(p, "w");
+        if (!s_trace) return;
+        fputs("frame,inStage,merged,p1,p2,seed,counter,waitMs,sync,"
+              "readFrame,selfKey,rcvKey,rcvStatus,rcvSrc,rcvWrites,fpucw,fpusw\n", s_trace);
+    }
+    /* netcode internals for this frame: the index GetKeys read (readFrame =
+     * netFrame-delay) and the raw self/rcv words it merged. Diffing host vs guest
+     * by readFrame separates a frame-index misalignment (readFrame differs at the
+     * same row) from a stale/mis-delivered peer input (selfKey/rcvKey disagree at
+     * the same readFrame). rcvStatus: 0=immediate 1=after-wait 2=timeout. */
+    int rf = -1, rs = 0; unsigned short sk = 0, rk = 0;
+    int rsrc = -1, rwr = 0;
+    Nc_GetReadStats(&rf, &sk, &rk, &rs);
+    Nc_GetRcvSrc(&rsrc, &rwr);
+    fprintf(s_trace, "%d,%d,%04x,%04x,%04x,%04x,%u,%d,%d,%d,%04x,%04x,%d,%d,%d,%04x,%04x\n",
+            frame, inStage, merged, s_netP1Menu, s_netP2Menu,
+            (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR, waitMs, sync,
+            rf, sk, rk, rs, rsrc, rwr, s_fpuCw, s_fpuSw);
+    fflush(s_trace);                        /* survive the freeze tail */
+}
+
+/* Re-derive ZUN's menu key-repeat (hold-to-scroll) from the MERGED word so it is
+ * identical on both peers. Mirrors FUN_00437c70's own logic (PCBdecomp.c:22806-22816)
+ * verbatim, but with prev = last frame's merged (ZUN already copied it into
+ * ADDR_MENU_IN_PREV) and cur = this frame's merged — instead of the local poll ZUN used.
+ * We keep our own shadow counter (ZUN's was already bumped from the local compare this
+ * frame; we discard that by overwriting both globals). Menu-only — the flag is consumed
+ * solely by the menu cursor; in-stage the merged word is gameplay input. */
+static void SyncMenuRepeat(uint16_t merged)
+{
+    uint16_t prevMerged = *ADDR_MENU_IN_PREV;     /* = last frame's merged word */
+    *ADDR_MENU_REPEAT_FLAG = 0;
+    if (prevMerged == merged) {
+        if (s_menuRepeatCtr > 0x1d) {
+            *ADDR_MENU_REPEAT_FLAG = (uint16_t)(s_menuRepeatCtr % 8 == 0);
+            if (s_menuRepeatCtr > 0x25) s_menuRepeatCtr = 0x1e;
+        }
+        s_menuRepeatCtr++;
+    } else {
+        s_menuRepeatCtr = 0;
+    }
+    *ADDR_MENU_REPEAT_CTR = s_menuRepeatCtr;
 }
 
 /* FUN_00437c70 — per-logic-frame scene input task. Owns the netcode frame
@@ -964,7 +1358,10 @@ static int __fastcall HookedSceneTick(void *self)
              * title menu) so the first active frame doesn't fire a spurious re-zero. */
             s_netSceneId = *(int *)((char *)self + 0x154);
             s_netDesyncLogged = 0; s_netSyncRun = 0; s_netPeerLost = 0;
+            s_netDesyncRun = 0;    s_netHardDesyncLogged = 0;
             s_netStallLogged = 0;  s_netStatLogged = 0;
+            s_seedForced = 0;               /* force the shared seed at the first stage */
+            s_menuRepeatCtr = 0;            /* fresh hold-scroll shadow for lockstep menu */
             Nc_Reset();                     /* fresh lockstep maps from frame 0         */
             Log("netplay: LINK UP (handshake done). role=%s delay=%d seed=0x%04x. "
                 "Both inputs from the WIRE; each player picks its own character.",
@@ -974,9 +1371,40 @@ static int __fastcall HookedSceneTick(void *self)
                 "build. Staying on local P2.");
             s_netVerWarned = 1;
         }
+        /* MENU FREEZE during the handshake: until the link is live, neither machine's
+         * menu may move. ZUN's input task (s_origSceneTick above) already polled the
+         * LOCAL keyboard into g_InputMenu; left alone, each machine navigates on its own
+         * while it waits — and on a real connection that wait is SECONDS (the host sits in
+         * the menu until the guest starts). Whatever each player does in that window moves
+         * only the local cursor and is never reconciled, so when lockstep engages the two
+         * are already on different items/sections (host Normal / guest Lunatic; P1 on the
+         * difficulty list / P2 in Extra). Zeroing g_InputMenu pins BOTH at the identical
+         * startup menu; once LINK UP fires, the merged word (below) drives them together
+         * from a common state. (Loopback links up instantly, so this never bit there.) */
+        *ADDR_INPUT_MENU = 0;
         return r;                           /* no lockstep until connected             */
     }
     if (s_netActive) {
+        PinFpuForNetplay();   /* §8q: force matching x87 precision/rounding before the sim runs */
+        /* HOST-AUTHORITATIVE DIFFICULTY (§8t): the two installs can have DIFFERENT saved
+         * difficulty (confirmed desync: host Normal=1 / guest Lunatic=3 in the trace), which
+         * no lockstep can reconcile — different difficulty = different HP/bullets/thresholds.
+         * Report ours on the wire (sent inside Nc_GetInputNet below) and, on the GUEST, pin
+         * the difficulty global to the HOST's so both start identical. Done every frame so the
+         * guest's menu display follows the host and the value is already correct at game start
+         * (HookedSceneTick runs before the stage init reads it). The host is untouched. */
+        Nc_SetLocalDifficulty((int)*ADDR_DIFFICULTY);
+        if (!s_netIsHost) {
+            int hd = Nc_GetPeerDifficulty();
+            if (hd >= 0 && (uint32_t)hd != *ADDR_DIFFICULTY) {
+                if (!s_diffForcedLogged) {
+                    Log("netplay: difficulty pinned to host's (%d -> %d) — guest follows host",
+                        (int)*ADDR_DIFFICULTY, hd);
+                    s_diffForcedLogged = 1;
+                }
+                *ADDR_DIFFICULTY = (uint32_t)hd;
+            }
+        }
         /* START BARRIER / scene-reset — the th06 Supervisor::OnUpdate "last_frame_a >
          * frame_a" realign (Supervisor.cpp), driven here by PCB's top-level scene id
          * at self+0x154. th06's lockstep clock is the game's per-scene calcCount, which
@@ -995,18 +1423,45 @@ static int __fastcall HookedSceneTick(void *self)
                 s_netSceneId, sceneId, s_netFrame);
             s_netSceneId = sceneId;
             s_netFrame   = 0;
+            s_menuRepeatCtr = 0;        /* fresh hold-scroll state for the new scene  */
+            s_seedForced = 0;           /* re-force the shared seed at the new scene  */
             Nc_Reset();                 /* clear peer buffer + frame index (th06 reset) */
             s_netDesyncLogged = 0; s_netSyncRun = 0;
+            s_netDesyncRun = 0;    s_netHardDesyncLogged = 0;
             s_netStallLogged  = 0; s_netStatLogged = 0;
         }
         int inStage = (int)((*ADDR_MODE_FLAGS >> 2) & 1);  /* recording active = in a stage */
         int ctrl = 0;
+        /* FPU firewall: save ZUN's full x87 state, run the netcode (its lockstep wait
+         * does double timing math + a machine-dependent spin count), then capture what
+         * it left (for the trace) and restore the game's state so its FP is untouched. */
+        if (s_fpuGuard) FPU_SAVE();
         unsigned short merged = Nc_GetInputNet(s_netFrame++, inStage ? 0 : 1, &ctrl);
+        s_fpuCw = FpuCw(); s_fpuSw = FpuSw();   /* x87 words AFTER the netcode ran this frame */
+        if (s_fpuGuard) FPU_RESTORE();
         s_netMerged = merged;
+
+        /* §8r AUTO-RESYNC reseed: the netcode just realigned the lockstep at an agreed
+         * frame (cleared the misaligned peer buffer on BOTH machines). Snap the game RNG
+         * to the shared init seed on THIS frame so the two sims re-converge from here —
+         * the automatic equivalent of the scene-reset SEEDFORCE a manual retry performs.
+         * Both machines fire on the same lockstep frame, so they reseed together. */
+        if (Nc_PollResyncFired()) {
+            uint16_t before = *ADDR_RNG_SEED;
+            *ADDR_RNG_SEED = Nc_GetInitSeed();
+            s_seedForced = 1;     /* HookedGameStart already aligned; don't double-force */
+            Log("netplay: AUTO-RESYNC reseed at frame %d seed 0x%04x -> 0x%04x ctr=%u "
+                "(sustained desync recovered without a manual retry)",
+                s_netFrame, before, (unsigned)Nc_GetInitSeed(), (unsigned)*ADDR_RNG_CTR);
+        }
         /* de-merged per-player words for the menu FSM (in menus the local poll is
          * the menu-bit layout, so these are P1's / P2's raw menu words). */
         Nc_GetLastSplit(&s_netP1Menu, &s_netP2Menu);
         *ADDR_INPUT_MENU = merged;          /* menus together; in-stage -> g_InputGameplay */
+        /* menus only: make hold-to-scroll deterministic by recomputing the key-repeat
+         * from the merged word (ZUN derived it from the local poll above) — fixes the
+         * peers landing on different difficulties. */
+        if (!inStage) SyncMenuRepeat(merged);
 
         /* live telemetry for the overlay + log: the RNG pair we compare and how long
          * this frame blocked on the peer (the direct read on a lockstep stall). */
@@ -1014,6 +1469,29 @@ static int __fastcall HookedSceneTick(void *self)
         int sync = connected ? Nc_IsSync() : 1;
         Nc_GetSyncStats(&s_netSelfRng, &s_netRcvRng, &s_netWaitMs);
         s_netSync = sync;
+
+        NetTrace(s_netFrame, inStage, merged, s_netWaitMs, sync);  /* DIAGNOSTIC */
+
+        /* DIAGNOSTIC: surface the send-side fault detectors the moment they fire.
+         * selfRewrites>0 => a logic frame's input was recorded twice with different
+         * values (the merged word feeding our own buffer is mutating it). sendZfill>0
+         * => SendKeys transmitted a 0 for a recent frame that should have existed.
+         * Either pins the guest->host drop (§8l) to its mechanism. */
+        {
+            static int s_lastRw = 0, s_lastZf = 0;
+            int rw=0, rwf=-1, sz=0, zff=-1, zfs=-1; unsigned short rwo=0, rwn=0;
+            Nc_GetSendDiag(&rw, &rwf, &rwo, &rwn, &sz, &zff, &zfs);
+            if (rw > s_lastRw) {
+                Log("netplay: SELF-REWRITE #%d frame=%d old=0x%04x new=0x%04x (netF=%d)",
+                    rw, rwf, rwo, rwn, s_netFrame);
+                s_lastRw = rw;
+            }
+            if (sz > s_lastZf) {
+                Log("netplay: SEND-ZFILL #%d sendframe=%d missingslot=%d (netF=%d)",
+                    sz, zff, zfs, s_netFrame);
+                s_lastZf = sz;
+            }
+        }
 
         /* DESYNC is only meaningful IN-STAGE. The front-end menus are not RNG-locked
          * (the two machines reach a screen from slightly different states), so a seed
@@ -1024,14 +1502,32 @@ static int __fastcall HookedSceneTick(void *self)
             if (!sync) {
                 s_netSyncRun = 0;
                 if (!s_netDesyncLogged) {
-                    Log("netplay: DESYNC in stage at frame %d (rng self=0x%04x peer=0x%04x)",
-                        s_netFrame, s_netSelfRng, s_netRcvRng);
+                    Log("netplay: DESYNC in stage at frame %d (rng self=0x%04x peer=0x%04x ctr=%u)",
+                        s_netFrame, s_netSelfRng, s_netRcvRng, (unsigned)*ADDR_RNG_CTR);
                     s_netDesyncLogged = 1;
                 }
-            } else if (s_netDesyncLogged && ++s_netSyncRun >= 120) {
-                Log("netplay: back in sync at frame %d (held 120 frames)", s_netFrame);
-                s_netDesyncLogged = 0;
-                s_netSyncRun = 0;
+                /* §8r: a blip (≤15 frames) heals at the next scene/seed-reforce; a SUSTAINED
+                 * run is the real first-run fork. Flag it distinctly, ONCE, with the local
+                 * RNG counter (diff host-vs-guest logs: if the counters differ at the fork,
+                 * one machine drew a different number of times => an FP-codepath divergence,
+                 * not an input divergence) and the live x87 control word (confirm it was
+                 * pinned to 24-bit at the fork — ruling FPU precision in or out). */
+                if (++s_netDesyncRun == HARD_DESYNC_FRAMES && !s_netHardDesyncLogged) {
+                    Log("netplay: *** HARD DESYNC *** sustained %d frames (real fork) at frame %d "
+                        "rng self=0x%04x peer=0x%04x localCtr=%u cw=0x%04x pinned=%d — retry "
+                        "(Escape->Give up->Retry) re-aligns via scene-reset+SEEDFORCE.",
+                        HARD_DESYNC_FRAMES, s_netFrame, s_netSelfRng, s_netRcvRng,
+                        (unsigned)*ADDR_RNG_CTR, _controlfp(0, 0) & 0xffff, s_fpuPinned);
+                    s_netHardDesyncLogged = 1;
+                }
+            } else {
+                s_netDesyncRun = 0;
+                if (s_netDesyncLogged && ++s_netSyncRun >= 120) {
+                    Log("netplay: back in sync at frame %d (held 120 frames)", s_netFrame);
+                    s_netDesyncLogged = 0;
+                    s_netHardDesyncLogged = 0;
+                    s_netSyncRun = 0;
+                }
             }
         }
 
@@ -1045,9 +1541,10 @@ static int __fastcall HookedSceneTick(void *self)
         }
         /* periodic heartbeat so the log carries a sync timeline even outside stages. */
         if (connected && --s_netStatLogged <= 0) {
-            Log("netplay: F%d %s wait=%dms rng self=0x%04x peer=0x%04x%s",
+            Log("netplay: F%d %s wait=%dms rng self=0x%04x peer=0x%04x ctr=%u%s",
                 s_netFrame, sync ? "SYNC" : "DESYNC", s_netWaitMs,
-                s_netSelfRng, s_netRcvRng, inStage ? " [stage]" : " [menu]");
+                s_netSelfRng, s_netRcvRng, (unsigned)*ADDR_RNG_CTR,
+                inStage ? " [stage]" : " [menu]");
             s_netStatLogged = 120;
         }
 
@@ -1065,8 +1562,26 @@ static int __fastcall HookedSceneTick(void *self)
  * snapshots it (idempotent on the documented mid-stage re-fires). */
 static int __fastcall HookedGameStart(int self)
 {
-    if (s_netActive)
+    /* FUN_00442c60 turned out to fire EVERY logic frame (the det-trace showed
+     * ~15k SEEDFORCE lines over ~15k frames), NOT just at game start — so the old
+     * "force the seed on every fire" pinned the live RNG to initSeed every frame.
+     * That (a) makes RNG non-random across frames (Chen's nonspell orbs all flew
+     * the same way) and (b) masked real desyncs (both snap to initSeed => false
+     * SYNC). Force ONCE per scene instead (EoSD's force-at-start semantics): align
+     * the seed at stage start, then let ZUN's RNG evolve naturally — lockstep keeps
+     * both machines identical as long as inputs match. s_seedForced re-arms on each
+     * scene change (HookedSceneTick). */
+    if (s_netActive && !s_seedForced) {
+        uint16_t before = *ADDR_RNG_SEED;
         *ADDR_RNG_SEED = Nc_GetInitSeed();
+        s_seedForced = 1;
+        /* §8r: log the x87 control word at the seeding moment too — if host and guest
+         * differ here on the first stage, FP precision forked before the per-frame pin
+         * settled; if they match (both 0x_01f) the first-run fork is elsewhere. */
+        Log("netplay: SEEDFORCE F%d seed 0x%04x -> 0x%04x ctr=%u cw=0x%04x (once/scene)",
+            s_netFrame, before, (unsigned)Nc_GetInitSeed(), (unsigned)*ADDR_RNG_CTR,
+            _controlfp(0, 0) & 0xffff);
+    }
     return s_origGameStart(self);
 }
 /* ===================== end netplay ===================== */
@@ -1439,6 +1954,7 @@ static void ApplyP2Selection(void *p2)
 
 static void SpawnP2(void)
 {
+    if (s_suppressP2) { Log("spawn: SUPPRESSED (coop.ini suppress_p2=1, desync test)"); return; }
     if (s_p2) return;                       /* already spawned */
     if (!P1Ready()) { Log("spawn: P1 not ready (no char loaded) — ignored"); return; }
 
@@ -1607,6 +2123,32 @@ static void MoveGhost(void *p2)
 #define PROX_FAR2   (48.0f * 48.0f)    /* >= this: fully opaque                   */
 #define PROX_FLOOR  0x40u              /* minimum alpha when fully overlapped     */
 
+/* Deferred focus-ring fade (see ApplyProximityFade / HookedDraw). The sprite tint
+ * written in the update phase survives to the draw, but the focus-RING effect's
+ * colour (effect+0x1b8) is rewritten by the effect-manager's own update task —
+ * whose order vs the player update is undefined — so an update-phase write to it
+ * gets clobbered before the draw (this was the "only the sprite fades" bug). We
+ * stash the tint in the update and re-apply it at DRAW time (after ALL updates,
+ * just before the effect draws). */
+static uint32_t s_proxFxTint       = 0xffffffffu;
+static int      s_proxFxRemoteIsP2 = 1;   /* 1 = fade P2's ring (host/single), 0 = P1's (guest) */
+static int      s_proxFxPending    = 0;   /* set each frame the fade is active; consumed in draw */
+static int      s_proxFxLogged     = 0;   /* one-shot diagnostic of the draw-time apply           */
+
+/* Fade a player's FOCUS-mode indicator (the rotating ring + central hitbox dot,
+ * effect type 0x18) to match the sprite fade. The handle lives at player+0x9d8;
+ * its ARGB tint is at fx+0x1b8 (the focus updater FUN_0041abe0 only moves it, but
+ * the effect's anm task may rewrite the colour — hence the draw-time apply). The
+ * focused remote player's hitbox is at least as distracting as the sprite when
+ * the two overlap, so it gets the same alpha. No-op when that player isn't
+ * focusing (no live focus effect). */
+static void FadePlayerFocusFx(void *player, uint32_t tint)
+{
+    uint32_t fx = *(uint32_t *)((char *)player + OFF_PLAYER_FX);
+    if (fx && *(unsigned char *)(fx + OFF_FX_TYPE) == FX_TYPE_FOCUS)
+        *(uint32_t *)(fx + OFF_FX_COLOR) = tint;
+}
+
 static void ApplyProximityFade(void *p2)
 {
     float *p1pos = (float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X);
@@ -1621,14 +2163,21 @@ static void ApplyProximityFade(void *p2)
         a = PROX_FLOOR + (unsigned int)(t * (float)(0xff - PROX_FLOOR));
     }
     uint32_t tint = (a << 24) | 0x00ffffffu;
+    /* Sprite tint is written here (update phase, after the player's own anm, so it
+     * sticks). The focus-RING tint is DEFERRED to HookedDraw — writing it here gets
+     * clobbered by the effect's anm task before the draw (see s_proxFx* notes). */
     if (s_netActive && !Nc_IsHost()) {
-        /* guest: local = P2, so fade the REMOTE P1; keep P2 opaque */
+        /* guest: local = P2, so fade the REMOTE P1 (sprite + focus hitbox); keep P2 opaque */
         *(uint32_t *)((char *)ADDR_PLAYER_BASE + OFF_TINT) = tint;
         *(uint32_t *)((char *)p2 + OFF_TINT) = 0xffffffffu;
+        s_proxFxRemoteIsP2 = 0;
     } else {
-        /* host / single-machine: local = P1, so fade the REMOTE P2 */
+        /* host / single-machine: local = P1, so fade the REMOTE P2 (sprite + focus hitbox) */
         *(uint32_t *)((char *)p2 + OFF_TINT) = tint;
+        s_proxFxRemoteIsP2 = 1;
     }
+    s_proxFxTint    = tint;
+    s_proxFxPending = 1;
 }
 
 static void Spawn1Up(float *pos3)
@@ -1734,6 +2283,10 @@ static void ReviveByGraze(void *ghost, void *reviver, int reviverIsP1,
             GrazeFeedback(reviver, (float *)((char *)ghost + OFF_POS_X));
         s_reviveFrames++;
         if (s_reviveFrames >= REVIVE_FRAMES && focusRelease) {
+            /* D1 (user-confirmed): NO free revive — the reviver must have a spare
+             * extend to spend. Without one, the confirm does nothing and the
+             * channel stays charged so the revive fires the instant they earn a
+             * life. (The last-life-death 1up drop is unaffected — kept.) */
             if (reviverIsP1) {
                 uint32_t res = *ADDR_RES_PTR;
                 if (res && *(float *)(res + RES_LIVES) >= 1.0f) {
@@ -1741,20 +2294,21 @@ static void ReviveByGraze(void *ghost, void *reviver, int reviverIsP1,
                     ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON); /* re-heal checksum */
                     Log("revive: P1 donated a life (%.0f spare left)",
                         *(float *)(res + RES_LIVES));
+                    ReviveP2();
+                    s_reviveFrames = 0;
                 } else {
-                    Log("revive: P1 has no spare extends -> free revive");
+                    Log("revive: P1 has no spare life -> cannot revive (D1)");
                 }
-                ReviveP2();
             } else {
                 if (s_p2Lives >= 1.0f) {
                     s_p2Lives -= 1.0f;
                     Log("revive: P2 donated a life (%.0f spare left)", s_p2Lives);
+                    ReviveP1();
+                    s_reviveFrames = 0;
                 } else {
-                    Log("revive: P2 has no spare extends -> free revive");
+                    Log("revive: P2 has no spare life -> cannot revive (D1)");
                 }
-                ReviveP1();
             }
-            s_reviveFrames = 0;
         }
     } else {
         s_reviveFrames = 0;
@@ -1899,11 +2453,14 @@ static int P2CollisionSkipped(void *p2)
 static int __fastcall HookedCollideBullet(void *self, void *edx, float *pos, float *size)
 {
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    CRUMB2("collideBullet", 0);
     int r = (isP1 && s_p1Ghost) ? 0                       /* ghost P1: untouchable */
           : s_origCollideBullet(self, edx, pos, size);    /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2))
+    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
+        CRUMB2("collideBullet:P2", 1);
         s_origCollideBullet(p2, edx, pos, size);          /* P2 — param-relative */
+    }
     return r;
 }
 
@@ -1911,11 +2468,14 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
                                          void *a, void *b, void *c, void *d, int e)
 {
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    CRUMB2("collideLaser", 0);
     int r = (isP1 && s_p1Ghost) ? 0
           : s_origCollideLaser(self, edx, a, b, c, d, e); /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
-    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2))
+    if (s_p2Killable && p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
+        CRUMB2("collideLaser:P2", 1);
         s_origCollideLaser(p2, edx, a, b, c, d, e);        /* P2 */
+    }
     return r;
 }
 
@@ -1927,14 +2487,46 @@ static int __fastcall HookedCollideLaser(void *self, void *edx,
 static int __fastcall HookedGraze(void *self, void *edx, float *pos, float *size)
 {
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    CRUMB2("graze", 0);
     int r = (isP1 && s_p1Ghost) ? 0                       /* ghost P1: no grazing */
           : s_origGraze(self, edx, pos, size);            /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
     if (p2 && isP1 && !s_p2Ghost && !P2CollisionSkipped(p2)) {
+        CRUMB2("graze:P2", 1);
         int r2 = s_origGraze(p2, edx, pos, size);          /* P2 — param-relative */
-        if (r == 0 && r2 == 1) r = 1;   /* P2 grazed -> mark bullet grazed so its hit test runs */
+        /* FUN_0043e3b0 returns 2 = "bullet sits in one of this player's clear regions"
+         * (P2+0x17dc) — the SAME field check FUN_0043e0a0 the hit test uses. The bullet
+         * loop runs THIS graze test (not the hit test) for every un-grazed older bullet
+         * (PCBdecomp.c:14718), so it is the path that cancels most of a bomb's bullets.
+         * B4 BUG (fixed): we only forwarded r2==1 (graze) and DROPPED r2==2, so P2's
+         * bomb/border field never cancelled bullets that weren't also near P2's graze box
+         * — exactly "P2 balls don't clear bullets, except the rare one P2 also grazed".
+         * Forward the cancel: 2 (cleared) takes priority over 1 (grazed) over 0. Reads
+         * only synced sim state (P2 regions + position), so it stays lockstep-safe. */
+        if (r2 == 2) r = 2;             /* bullet in P2's clear field -> cancel it */
+        else if (r == 0 && r2 == 1) r = 1;   /* P2 grazed -> mark bullet grazed so its hit test runs */
     }
     return r;
+}
+
+/* B4 — route P2's bomb clear-region registrations onto P2's own +0x17dc array.
+ * While inside P2's update window, force ECX to P2 so a region (circle/box) the bomb
+ * callback would otherwise stamp on the P1 static base lands on P2 instead. No-op when
+ * the call was already P2's; never touches P1's own bomb (s_inP2Update == 0 then). */
+static void *__fastcall HookedAddClearCircle(void *self, void *edx, void *pos,
+                                             uint32_t r, uint32_t col, uint32_t type)
+{
+    if (s_p2BombClear && s_inP2Update && s_p2 && !s_p2Ghost && self != (void *)s_p2)
+        self = (void *)s_p2;
+    return s_origAddClearCircle(self, edx, pos, r, col, type);
+}
+
+static void *__fastcall HookedAddClearBox(void *self, void *edx, void *pos,
+                                          uint32_t w, uint32_t h, uint32_t type)
+{
+    if (s_p2BombClear && s_inP2Update && s_p2 && !s_p2Ghost && self != (void *)s_p2)
+        self = (void *)s_p2;
+    return s_origAddClearBox(self, edx, pos, w, h, type);
 }
 
 /* ---- item collection: P2 collects items, credited to P2's OWN resources ----
@@ -1974,8 +2566,54 @@ static void RestoreHeldRes(void)
         ADDR_HUD_REFRESH(ADDR_SCORE_SINGLETON);       /* re-heal for the restored P1 state */
 }
 
+/* B1 — point-item EXTEND mirrored to the partner.
+ * A point-item threshold extend (PCBdecomp.c case 1, FUN_0042d83a inside the
+ * `+0x2c < +0x30` loop) bumps the extend-TIER counter res+0x2c and grants a
+ * life-or-bomb to whoever collected the triggering point item (the engine writes
+ * the resource struct, which the swap routes to the collector). B1: that extend
+ * should go to BOTH players. We detect it by the tier delta — the 1up ITEM
+ * (case 5) calls FUN_0042d83a WITHOUT touching res+0x2c, so it stays
+ * collector-specific (correct). The extend fn reads x87 ST0 set by its caller, so
+ * it CANNOT be C-hooked (a detour clobbers ST0 before the trampoline reads it);
+ * the tier-delta route is FPU-safe and reuses the existing swap.
+ *
+ * Must run while the triggering item's swap is still in place (BEFORE the next
+ * RestoreHeldRes) so s_p2ResHeld names the collector. The partner gets the extend
+ * appropriate to ITS OWN state (life if <8, else a bomb if <8 — ZUN's overflow). */
+#define COOP_MAX_LIVES 8.0f
+#define COOP_MAX_BOMBS 8.0f
+#define RES_EXTEND_TIER 0x2c
+static int s_lastExtendTier = -1;
+
+static void CheckPartnerExtend(void)
+{
+    uint32_t res = *ADDR_RES_PTR;
+    if (!res) return;
+    int tier = *(int *)(res + RES_EXTEND_TIER);
+    if (s_lastExtendTier < 0) { s_lastExtendTier = tier; return; }
+    if (tier > s_lastExtendTier && s_p2 && s_p2SepRes) {
+        int n = tier - s_lastExtendTier;
+        for (; n > 0; n--) {
+            if (s_p2ResHeld) {
+                /* P2 collected -> already credited to P2; mirror to P1 (its saved
+                 * values, written back + checksum-healed by RestoreHeldRes). */
+                if (s_heldP1Lives < COOP_MAX_LIVES)      s_heldP1Lives += 1.0f;
+                else if (s_heldP1Bombs < COOP_MAX_BOMBS) s_heldP1Bombs += 1.0f;
+            } else {
+                /* P1 collected -> already credited to P1; mirror to P2. */
+                if (s_p2Lives < COOP_MAX_LIVES)      s_p2Lives += 1.0f;
+                else if (s_p2Bombs < COOP_MAX_BOMBS) s_p2Bombs += 1.0f;
+            }
+        }
+        Log("B1: point-item extend mirrored to partner (%s collected, tier=%d)",
+            s_p2ResHeld ? "P2" : "P1", tier);
+    }
+    s_lastExtendTier = tier;
+}
+
 static int __fastcall HookedCollectOverlap(void *self, void *edx, float *pos, float *size)
 {
+    CheckPartnerExtend();                              /* B1: mirror the prev item's extend */
     RestoreHeldRes();                                  /* undo the previous item's P2 swap */
 
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
@@ -2003,13 +2641,73 @@ static int __fastcall HookedCollectOverlap(void *self, void *edx, float *pos, fl
     return r;
 }
 
+/* B3 — P2 autocollect above the point-of-collection line.
+ * ZUN's per-item autocollect trigger (FUN_00432990, PCBdecomp.c:20391) sets an item
+ * to homing-mode when `(P1 full power || Extra/Phantasm) && (P1_Y < line)`, keyed to
+ * P1 ONLY — so P2 never vacuums items by going up top, even on Extra. We replicate
+ * the SAME gate for P2: when P2 is above the line and (P2 full power || difficulty
+ * > Lunatic), set the homing-mode byte on each active item for which P2 is the nearer
+ * player. The engine's next-frame homing then carries it in, and HookedAngleToPlayer
+ * already redirects the homing target to the nearer player (so it lands on P2). We
+ * only ever WRITE the mode byte (no FPU, no RNG) -> determinism- and tamper-safe.
+ * (The full-power half is per-player only with s_p2SepRes on; otherwise P2 shares
+ * P1's power, in which case the engine's own P1 trigger already covers it.) */
+#define ADDR_GAME_CFG_PP ((volatile uint32_t *)0x00575948) /* -> config; +0x20 = collect line Y */
+/* ADDR_DIFFICULTY defined near the top with the other pinned globals */
+#define ITEM_STRIDE      0x288
+#define ITEM_OFF_POSX    0x24c
+#define ITEM_OFF_POSY    0x250
+#define ITEM_OFF_ACTIVE  0x27d
+#define ITEM_OFF_MODE    0x27f      /* 0 pop-fall, 1 homing, 2 scatter */
+#define ITEM_COUNT       1100
+#define COOP_FULL_POWER  128.0f
+static int s_p2Autocollect = 1;     /* B3: P2 line-cross / Extra autocollect (default on) */
+
+static void ApplyP2Autocollect(void *mgr)
+{
+    void *p2 = (void *)s_p2;
+    if (!s_p2Autocollect || !p2 || s_p2Ghost || !mgr) return;
+
+    uint32_t cfg = *ADDR_GAME_CFG_PP;
+    if (!cfg) return;
+    float line = *(float *)(cfg + 0x20);
+    int   diff = (int)*ADDR_DIFFICULTY;
+
+    char *pp = (char *)p2, *p1 = (char *)ADDR_PLAYER_BASE;
+    float p2y  = *(float *)(pp + OFF_POS_Y);
+    float p2pw = s_p2Power;
+    if (!s_p2SepRes) {                            /* shared power: P1's trigger already covers it */
+        uint32_t res = *ADDR_RES_PTR;
+        p2pw = res ? *(float *)(res + RES_POWER) : 0.f;
+    }
+    /* same shape as ZUN's gate, for P2 */
+    if (!((p2pw >= COOP_FULL_POWER || diff > 3) && p2y < line)) return;
+
+    float ax = *(float *)(p1 + OFF_POS_X), ay = *(float *)(p1 + OFF_POS_Y);
+    float bx = *(float *)(pp + OFF_POS_X), by = p2y;
+    int i;
+    for (i = 0; i < ITEM_COUNT; i++) {
+        char *it = (char *)mgr + i * ITEM_STRIDE;
+        if (*(unsigned char *)(it + ITEM_OFF_ACTIVE) == 0) continue;
+        unsigned char mode = *(unsigned char *)(it + ITEM_OFF_MODE);
+        if (mode == 1 || mode == 2) continue;     /* already homing / scattering */
+        float ix = *(float *)(it + ITEM_OFF_POSX), iy = *(float *)(it + ITEM_OFF_POSY);
+        float d1 = (ax - ix) * (ax - ix) + (ay - iy) * (ay - iy);
+        float d2 = (bx - ix) * (bx - ix) + (by - iy) * (by - iy);
+        if (d2 < d1)                              /* P2 is the nearer player -> vacuum to P2 */
+            *(unsigned char *)(it + ITEM_OFF_MODE) = 1;
+    }
+}
+
 /* Bracket the item-update loop so the LAST collected item's P2 swap is undone
  * before anything outside the loop reads the shared resources. */
 static void __fastcall HookedItemLoop(void *self)
 {
     s_itemMgr = self;                   /* captured for DropOneUp */
     s_origItemLoop(self);
+    CheckPartnerExtend();               /* B1: catch the last item's extend (swap still in) */
     RestoreHeldRes();
+    ApplyP2Autocollect(self);           /* B3: P2 line-cross / Extra autocollect */
 }
 
 /* ---- suppress P2's bomb-declaration portrait (different-char P2) ----
@@ -2064,6 +2762,61 @@ static void __fastcall HookedDeclDraw(void *self)
     s_origDeclDraw(self);
 }
 
+/* B5 boss-spell gate — CORRECTED SIGNAL (2026-06-18, via the clean-room EoSD decomp).
+ * The first attempts gated on the score-manager's spell-DECLARATION index
+ * (*(0x0049fbf8)+0x1fbac, ZUN's FUN_0042ad66); in-game that read -1 (no spell) while a P2
+ * bomb was killing a boss spell, so it was the WRONG field. EoSD names the real one:
+ * `g_EnemyManager.spellcardInfo.isActive` (set =1 by the ECL spellcard opcode at spell
+ * start, EclManager.cpp:731; =0 at end) drives the boss damage model in EnemyManager.cpp:
+ *   if (isActive) { if (out==0) dmg/=7; else if (usedBomb) dmg/=3; else dmg=0; }
+ * and the bomb handler does `usedBomb = isActive` (Player.cpp:364). PCB is the same engine:
+ * the damage code at PCBdecomp.c:12867-12899 reads `DAT_009545c8 + param_1` (isActive) and
+ * `DAT_009545dc + param_1` (usedBomb). param_1 is the enemy-manager context base. We first
+ * assumed it was 0 (absolute globals), but an in-game @hit dump read scActive=0 with a real
+ * boss present — param_1 is genuinely NON-ZERO, so 0x9545c8/0x9545dc are DISPLACEMENTS off
+ * that base, not absolute addresses. We capture the live base at runtime (HookedEnemyUpdate,
+ * = ECX of FUN_00420620, verified stored at [ebp-0x1e8] for the read at 0x421387) and read
+ * isActive/usedBomb relative to it (SC_OFF_* below). (The transform that "removes the boss
+ * hitbox" is the dmg=0 leaf of that same model.) */
+#define SC_OFF_ISACTIVE   0x9545c8   /* enemy-manager spellcardInfo.isActive (from base) */
+#define SC_OFF_USEDBOMB   0x9545dc   /* enemy-manager spellcardInfo.usedBomb             */
+#define ADDR_SPELL_MGR_PTR ((volatile uint32_t *)0x0049fbf8) /* (old decl-index path, diag only) */
+#define SPELL_OFF_INDEX    0x1fbac
+static int SpellcardActive(void)
+{
+    uint32_t b = s_enemyMgr;
+    return b ? (*(volatile int *)(b + SC_OFF_ISACTIVE) != 0) : 0;
+}
+static int SpellcardUsedBomb(void)
+{
+    uint32_t b = s_enemyMgr;
+    return b ? *(volatile int *)(b + SC_OFF_USEDBOMB) : 0;
+}
+static int BossSpellIndexRaw(void)   /* old signal, kept for the diagnostic only */
+{
+    uint32_t mgr = *ADDR_SPELL_MGR_PTR;
+    return mgr ? *(volatile int *)(mgr + SPELL_OFF_INDEX) : 0x7fffffff;
+}
+
+/* Capture the enemy-manager base (ECX = param_1) so SpellcardActive/UsedBomb can read its
+ * spellcardInfo fields. Just records the pointer and forwards — no behaviour change. */
+static int __fastcall HookedEnemyUpdate(void *self)
+{
+    s_enemyMgr = (uint32_t)self;
+    int r = s_origEnemyUpdate(self);
+    /* Refuel window: hold it OPEN for the whole boss spell and for CAPTURE_WIN_FRAMES
+     * after it ends. The point-substituted reward (type 1) can land at the capture instant
+     * (sc still 1 mid-update) OR in the sc=0 gap after the bonus animation; spanning both
+     * makes the type-1 -> power conversion fire regardless of which frame it spawns on.
+     * Only the type-1 boss reward is converted (cancel stars are type 6, untouched), and
+     * bosses don't drop type-1 mid-spell, so holding it open across the spell is safe. */
+    if (SpellcardActive())
+        s_captureWin = CAPTURE_WIN_FRAMES;
+    else if (s_captureWin > 0)
+        s_captureWin--;
+    return r;
+}
+
 /* ---- boss/enemy HP scaling detour (damage-side) ----
  * Run the original (side effects — shot consumption, hit sparks — happen once,
  * unchanged), then divide ONLY the returned damage by the active player count,
@@ -2073,6 +2826,7 @@ static void __fastcall HookedDeclDraw(void *self)
 static int __fastcall HookedDamage(void *self, void *edx,
                                    float *pos, float *size, int *out_flag)
 {
+    CRUMB2("damage", 0);
     int r = s_origDamage(self, edx, pos, size, out_flag);
     void *p2 = (void *)s_p2;
 
@@ -2093,20 +2847,89 @@ static int __fastcall HookedDamage(void *self, void *edx,
      * static P1 (bisect-proven), so re-invoke param-relative for a live P2 —
      * its own array's shots, its lasers, and its bomb all get tested. With the
      * shot transfer OFF (the default now), each shot lives in exactly one
-     * array, so nothing is double-counted. */
+     * array, so nothing is double-counted.
+     *
+     * SwapAnm MUST wrap this re-invoke too (not just SwapSelGlobals): the sweep
+     * REBINDS a shot's anm on hit — FUN_0043d9e0 @PCBdecomp.c:25902 does
+     * FUN_0044ea20(shot, *(mgr + 0x28ef0 + (shot[+0x1d8]+0x20)*4)), reading the
+     * 0x400-range script table that SwapAnm owns. Without the swap, a different-
+     * char P2 (e.g. P1 Sakuya / P2 Reimu) indexes P1's table with P2's hit-id and
+     * binds a wrong/garbage script ptr -> intermittent crash a few frames later
+     * when that script runs (the C1 "Reimu bullets/bomb hit an enemy" crash). The
+     * player update + draw already wrap their P2 calls in SwapAnm; this is the one
+     * P2 engine call that was missing it. No-op for a same-char P2 (s_p2AnmActive
+     * == 0 -> SwapAnm returns immediately), so default/same-char play is unchanged. */
     if (p2 && (uint32_t)self == ADDR_PLAYER_BASE && !s_p2Ghost) {
         int f2 = 0;
         int r2;
+        CRUMB2("damage:P2-reinvoke", 1);   /* the C1/C2 anm-rebind hotspot */
         SwapSelGlobals(1);
+        SwapAnm(1);
         r2 = s_origDamage(p2, edx, pos, size, &f2);
+        SwapAnm(0);
         SwapSelGlobals(0);
+        CRUMB2("damage", 0);
         if (r2 > 0) r += r2;
         if (f2 && out_flag && !*out_flag) *out_flag = f2;
     }
 
+    /* N2 — 2P team DPS damper, with a launcher-selectable mode:
+     *   FLAT (default): every enemy takes COOP_DAMPER_FLAT (0.75) — a light, uniform
+     *     reduction so 2x DPS doesn't melt everything.
+     *   BOSS-ONLY (damper_boss_only=1): only lifebar enemies (bosses/midbosses,
+     *     enemy+0x2e29 bit6) get COOP_DAMPER_BOSS (0.60); stage popcorn takes FULL
+     *     damage — fixes the "stage enemies feel tanky / can't solo the Extra opening
+     *     ball line" complaint while still pacing boss fights. Boss-ness is read from
+     *     the same enemy snapshot offset HookedDamage already uses (pos - ENEMY_OFF_POS). */
     if (s_bossHpScale && s_p2 && r > 0) {
-        r = (int)(r * 0.6f);                 /* 2P team DPS damper (was /2) */
-        if (r == 0) r = 1;
+        float f = COOP_DAMPER_FLAT;
+        if (s_damperBossOnly) {
+            int isBoss = 0;
+            if (pos) {
+                unsigned char fl = *(unsigned char *)((char *)pos - ENEMY_OFF_POS + ENEMY_OFF_FLAGS);
+                isBoss = (fl & ENEMY_FLAG_BOSS) != 0;
+            }
+            f = isBoss ? COOP_DAMPER_BOSS : 1.0f;
+        }
+        if (f != 1.0f) {
+            r = (int)(r * f);
+            if (r == 0) r = 1;
+        }
+    }
+
+    /* B5: Extra/Phantasm boss invincibility during a SPELL CARD, mirrored for a P2 bomb.
+     * In vanilla you can't cheese an Extra/Phantasm boss spell with a bomb — the boss
+     * transforms into an invincible ball (the dmg=0 leaf of ZUN's spellcard damage model,
+     * EoSD EnemyManager.cpp / PCBdecomp.c:12867-12899). That model keys off the ENEMY-
+     * MANAGER spellcard flag `spellcardInfo.isActive` (DAT_009545c8) — NOT the score-mgr
+     * declaration index we read before, which is -1 here. So: while P2 is bombing on
+     * Extra/Phantasm and the damaged enemy is a boss whose spellcard is active, zero the
+     * sweep's return (the sweep already ran, so shots are still consumed + sparked, exactly
+     * like ZUN's own apply-gate). Not on nonspell / no-boss / stage popcorn. */
+    if (r > 0 && (uint32_t)self == ADDR_PLAYER_BASE && p2 && !s_p2Ghost) {
+        int bombing = *(volatile int *)((char *)p2 + OFF_BOMBING) != 0;  /* cheapest, most selective */
+        int diff    = bombing ? (int)*ADDR_DIFFICULTY : 0;
+        if (bombing && (diff == 4 || diff == 5)) {
+            unsigned char fl = pos ? *(unsigned char *)((char *)pos - ENEMY_OFF_POS + ENEMY_OFF_FLAGS) : 0;
+            int isBoss = (fl & ENEMY_FLAG_BOSS) != 0;
+            /* One-shot per bomb: dump the decision-point state so ONE Extra/Phantasm run
+             * confirms the corrected signal — scActive/usedBomb (read off the live enemy-mgr
+             * base, mgr=0x%08x) should be nonzero on a spell, the old declIdx stays -1.
+             * enBase is the boss ENEMY base; mgr is the captured enemy-MANAGER base. */
+            if (isBoss && !s_b5HitLogged) {
+                s_b5HitLogged = 1;
+                Log("B5 diag@hit: scActive=%d usedBomb=%d declIdx=%d flags=0x%02x "
+                    "(b3invuln=%d b4dmg=%d b6boss=1) r=%d enBase=0x%08x mgr=0x%08x",
+                    SpellcardActive(), SpellcardUsedBomb(), BossSpellIndexRaw(), fl,
+                    (fl >> 3) & 1, (fl >> 4) & 1, r,
+                    pos ? (uint32_t)((char *)pos - ENEMY_OFF_POS) : 0,
+                    (uint32_t)s_enemyMgr);
+            }
+            if (isBoss && SpellcardActive()) {
+                r = 0;
+                s_b5ZeroCount++;          /* B5 diag: count fires per bomb (see HookedUpdate) */
+            }
+        }
     }
     return r;
 }
@@ -2204,6 +3027,15 @@ static int __fastcall HookedFrameTask(int *self)
             Log("frame counter reset -> FRESH start (score %d < %d) -> P2 reset",
                 score, s_lastScore);
             s_p2Carry = 0;              /* reseed P2 fresh (lives from P1, char bombs) */
+            /* NETPLAY: an Esc+R / continue retry stays in the SAME scene, so the
+             * scene-change re-force (HookedSceneTick) never fires and the restart kept
+             * the old RNG seed — a forked stage could only re-align by a full title
+             * round-trip (the test logs: "couldn't sync no matter how many Esc+R").
+             * Re-arm the seed force here so the next HookedGameStart re-applies the
+             * shared init seed on BOTH peers, exactly like a scene reset does. Both
+             * peers detect this fresh-start on the same merged-input-driven frame, so
+             * the re-arm lands together. */
+            if (s_netActive) s_seedForced = 0;
         } else {
             Log("frame counter reset (stage advance) -> P2 rebuild (resources carried)");
             s_p2Carry = (s_p2 != NULL);
@@ -2228,6 +3060,44 @@ static int __fastcall HookedUpdate(void *self)
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
     int p1Fake = 0;
     uint16_t p1GhostSavedIn = 0;
+    CRUMB2("update", 0);
+
+    /* B2: refresh the power->cherry suppression flag once per frame (read by the
+     * item-spawner detour; inert when that hook isn't installed). Suppress while
+     * P2 is live and below full power — so P1-full alone keeps drops as power. */
+    if (isP1)
+        g_b2Suppress = (unsigned char)(s_p2 && s_p2Power < COOP_FULL_POWER);
+
+    /* B2 diag: confirm the detour is actually installed AND firing. (It read as "didn't
+     * work" repeatedly: twice the deployed coop.ini had cherry_both_full=0 from the OLD
+     * launcher; then the naked ST0 trampoline was a no-op because the spawner reads power
+     * from memory, not ST0 — now a real thiscall detour.) Log the first kept-as-power. */
+    if (isP1 && !s_b2LoggedFire && g_b2Suppressed) {
+        s_b2LoggedFire = 1;
+        Log("B2: detour FIRING — kept power item(s) as power (suppressed=%u of %u spawner calls)",
+            g_b2Suppressed, g_b2Calls);
+    }
+
+    /* B5 DIAGNOSTIC: P2 "bomb armour" reportedly does nothing on Extra. Log once per
+     * P2 bomb (the 0->1 edge of P2's bombing flag) the two difficulty globals (the
+     * boss-damage code uses 0x62f85c for its own Extra rules; B5 reads 0x626280) and,
+     * at bomb end, how many times B5 zeroed boss damage. count==0 => B5's condition
+     * never matched (difficulty or bombing-flag read is wrong); count>0 but boss still
+     * died => the damage isn't flowing through this return. Cheap (edge-triggered). */
+    if (isP1 && s_p2 && !s_p2Ghost) {
+        int b = (*(volatile int *)((char *)s_p2 + OFF_BOMBING) != 0);
+        if (b && !s_p2PrevBombing) {
+            s_b5ZeroCount = 0;
+            s_b5HitLogged = 0;           /* re-arm the @hit dump for this bomb */
+            Log("B5 diag: P2 bomb START  diff[0x626280]=%u diff[0x62f85c]=%u p2bombing=%d "
+                "scActive=%d usedBomb=%d declIdx=%d mgr=0x%08x",
+                *(volatile uint32_t *)0x00626280, *(volatile uint32_t *)0x0062f85c, b,
+                SpellcardActive(), SpellcardUsedBomb(), BossSpellIndexRaw(), (uint32_t)s_enemyMgr);
+        } else if (!b && s_p2PrevBombing) {
+            Log("B5 diag: P2 bomb END    times B5 zeroed boss damage this bomb = %d", s_b5ZeroCount);
+        }
+        s_p2PrevBombing = b;
+    }
 
     /* PHANTOM SPARE (P1): while co-op is active, ZUN's death commit must never
      * see 0 lives — the lives==0 path is game-over + full-power items + the
@@ -2342,12 +3212,14 @@ static int __fastcall HookedUpdate(void *self)
             UpdateTeamBorder(p2);
 
             s_inP2Update = 1;               /* effect-spawn detour: redirect slot */
+            CRUMB2("update:P2", 1);
             SwapSelGlobals(1);              /* char/type-gated branches see P2 */
             SwapAnm(1);                     /* 0x400-range tables -> P2's char */
             s_origUpdate(p2);               /* trampoline → no detour re-entry */
             SwapAnm(0);
             SwapSelGlobals(0);
             s_inP2Update = 0;
+            CRUMB2("update", 0);
 
             if (s_p2SepRes && rb) {
                 s_p2Lives = *rl; s_p2Bombs = *rb; s_p2Power = *rp;  /* capture P2's */
@@ -2700,6 +3572,7 @@ static void BuildP2TargetBlock(void *p2)
 
 static int __fastcall HookedDraw(void *self)
 {
+    CRUMB2("draw", 0);
     int r = s_origDraw(self);               /* P1 draw */
 
     if ((uint32_t)self == ADDR_PLAYER_BASE) {
@@ -2711,6 +3584,20 @@ static int __fastcall HookedDraw(void *self)
             if (s_p2FocusFx)
                 memcpy((char *)s_p2FocusFx + OFF_FX_POS,
                        (char *)p2 + OFF_POS_X, 12);
+            /* proximity fade of the REMOTE focus ring — applied HERE (draw phase,
+             * after every update task incl. the effect anm that rewrites the colour)
+             * so it survives to the draw, unlike the clobbered update-phase write. */
+            if (s_proxFxPending) {
+                s_proxFxPending = 0;
+                void *fp = s_proxFxRemoteIsP2 ? p2 : (void *)ADDR_PLAYER_BASE;
+                FadePlayerFocusFx(fp, s_proxFxTint);
+                if (!s_proxFxLogged) {
+                    uint32_t fx = *(uint32_t *)((char *)fp + OFF_PLAYER_FX);
+                    Log("prox-fade: focus-ring tint at draw (fx=0x%08x type=%d tint=0x%08x)",
+                        fx, fx ? *(unsigned char *)(fx + OFF_FX_TYPE) : -1, s_proxFxTint);
+                    s_proxFxLogged = 1;
+                }
+            }
             /* feed P2 this frame's homing + SakuyaA aim targets. With per-player
              * aim on, acquire P2's own targets relative to ITS position (see
              * BuildP2TargetBlock); otherwise mirror P1's block (legacy). Consume
@@ -2721,11 +3608,13 @@ static int __fastcall HookedDraw(void *self)
                 memcpy((char *)p2 + OFF_HOMING_TGT,
                        (char *)ADDR_PLAYER_BASE + OFF_HOMING_TGT, HOMING_TGT_LEN);
             s_enemyCount = 0;
+            CRUMB2("draw:P2", 1);
             SwapSelGlobals(1);
             SwapAnm(1);                     /* P2's char sprites for its draw */
             s_origDraw(p2);
             SwapAnm(0);
             SwapSelGlobals(0);
+            CRUMB2("draw", 0);
             DrawCoopHud(p2);
         }
     }
@@ -2770,10 +3659,10 @@ static void ResetCoopSession(void)
 static uint16_t ReadP2MenuInput(void)
 {
     uint16_t w = 0;
-    if (Down('I'))      w |= 0x10;          /* up    */
-    if (Down('K'))      w |= 0x20;          /* down  */
-    if (Down('J'))      w |= 0x40;          /* left  */
-    if (Down('L'))      w |= 0x80;          /* right */
+    if (Down('W'))      w |= 0x10;          /* up    */
+    if (Down('S'))      w |= 0x20;          /* down  */
+    if (Down('A'))      w |= 0x40;          /* left  */
+    if (Down('D'))      w |= 0x80;          /* right */
     if (Down(VK_SPACE)) w |= MENU_CONFIRM;  /* confirm */
     if (Down('O'))      w |= MENU_CANCEL;   /* cancel  */
     return w;
@@ -2797,11 +3686,42 @@ static int MenuIsShotState(uint32_t s) { return s == 6 || s == 0xe; }
 static int MenuInCoopFlow(uint32_t s)
 { return s == 4 || s == 5 || s == 6 || s == 0xc || s == 0xd || s == 0xe; }
 
+/* Menu netplay status line (top row). The menu is just as easy to DESYNC as a
+ * stage — HookedSceneTick runs the same lockstep merge on the front-end, so
+ * s_netFrame / s_netSync / the RNG oracle (self vs rcv) are all live here. The
+ * menu scene flushes the global ascii queue every frame (same path as the "P2
+ * SELECT CHARACTER" prompt), so this is a pure draw — no determinism impact.
+ * Shows role, lockstep frame, delay, sync state, the per-frame wait when it
+ * climbs (a stall), and the self/rcv RNG seeds so a menu desync is visible the
+ * instant the two seeds diverge. */
+#define MENU_NET_X   8.f
+#define MENU_NET_Y   12.f
+static void DrawNetMenuStatus(void)
+{
+    float pos[3];
+    pos[0] = MENU_NET_X; pos[1] = MENU_NET_Y; pos[2] = 0.f;
+    if (s_netPeerLost) {
+        ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET LOST");
+    } else if (s_netActive) {
+        if (s_netWaitMs >= 100)
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d WAIT%dms",
+                             Nc_IsHost() ? 'H' : 'G', s_netFrame, s_netWaitMs);
+        else
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d d%d %s %04X/%04X",
+                             Nc_IsHost() ? 'H' : 'G', s_netFrame, Nc_GetDelay(),
+                             s_netSync ? "SYNC" : "DSYN", s_netSelfRng, s_netRcvRng);
+    }
+}
+
 static int __fastcall HookedMenuDispatch(void *menuv)
 {
     char *menu = (char *)menuv;
     uint32_t state = *(uint32_t *)(menu + MENU_OFF_STATE);
     int r;
+
+    /* surface the netplay sync state on the front-end too (top row) — a menu
+     * desync is otherwise invisible until the game won't start in sync */
+    if (s_netActive || s_netPeerLost) DrawNetMenuStatus();
 
     /* The menu dispatcher ONLY runs in the front-end (title/main/char-select),
      * never during gameplay. So if a co-op session is still alive here, the
@@ -2970,12 +3890,18 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_COLLECT_OVERLAP,(LPVOID)&HookedCollectOverlap,(LPVOID*)&s_origCollectOverlap) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_ITEM_LOOP,      (LPVOID)&HookedItemLoop,      (LPVOID*)&s_origItemLoop)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_BORDER_BREAK,   (LPVOID)&HookedBorderBreak,   (LPVOID*)&s_origBorderBreak)   != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_ADD_CLEAR_CIRCLE,(LPVOID)&HookedAddClearCircle,(LPVOID*)&s_origAddClearCircle)!= MH_OK) return 0; /* B4 */
+    if (MH_CreateHook(ADDR_ADD_CLEAR_BOX,  (LPVOID)&HookedAddClearBox,   (LPVOID*)&s_origAddClearBox)   != MH_OK) return 0; /* B4 */
     if (MH_CreateHook(ADDR_MENU_DISPATCH,  (LPVOID)&HookedMenuDispatch,  (LPVOID*)&s_origMenuDispatch)  != MH_OK) return 0;
     if (MH_CreateHook(ADDR_HUD_DRAW,       (LPVOID)&HookedHudDraw,       (LPVOID*)&s_origHudDraw)       != MH_OK) return 0;
     if (MH_CreateHook((LPVOID)ADDR_ANGLE_TO_PLAYER, (LPVOID)&HookedAngleToPlayer, (LPVOID*)&s_origAngleToPlayer) != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DECL_MAKE,      (LPVOID)&HookedDeclMake,      (LPVOID*)&s_origDeclMake)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DECL_DRAW,      (LPVOID)&HookedDeclDraw,      (LPVOID*)&s_origDeclDraw)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_REPLAY_HDR_INIT,(LPVOID)&HookedReplayHdrInit, (LPVOID*)&s_origReplayHdr)     != MH_OK) return 0;
+    /* B5: capture the enemy-manager base (FUN_00420620's ECX/param_1) so the boss-spell
+     * armour gate reads the LIVE spellcardInfo.isActive at param_1+0x9545c8. The base is
+     * non-zero in-game (the absolute-globals assumption was wrong — see HookedEnemyUpdate). */
+    if (MH_CreateHook(ADDR_ENEMY_UPDATE,   (LPVOID)&HookedEnemyUpdate,   (LPVOID*)&s_origEnemyUpdate)   != MH_OK) return 0;
     /* Netplay seams: install ONLY when netplay is enabled in coop.ini. These two
      * addresses are unverified in-game, so with [net] enabled=0 (default) we don't
      * even lay the trampolines — the confirmed-good local build is byte-for-byte
@@ -2983,6 +3909,14 @@ static int InstallHooks(void)
     if (s_netEnabled) {
         if (MH_CreateHook(ADDR_SCENE_TICK, (LPVOID)&HookedSceneTick, (LPVOID*)&s_origSceneTick) != MH_OK) return 0;
         if (MH_CreateHook(ADDR_GAME_START, (LPVOID)&HookedGameStart, (LPVOID*)&s_origGameStart) != MH_OK) return 0;
+    }
+    /* B2: FP-safe naked detour on the item spawner, gated on coop.ini so a default
+     * build is byte-for-byte unchanged. Create+enable together (MinHook allows it). */
+    if (s_b2CherryBothFull) {
+        if (MH_CreateHook((LPVOID)0x004326f0, (LPVOID)&HookedItemSpawn,
+                          (LPVOID*)&g_b2OrigItemSpawn) != MH_OK) return 0;
+        if (MH_EnableHook((LPVOID)0x004326f0) != MH_OK) return 0;
+        Log("B2: power->cherry gated on BOTH players full (cherry_both_full=1)");
     }
     if (MH_EnableHook(ADDR_PLAYER_UPDATE)  != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PLAYER_DRAW)    != MH_OK) return 0;
@@ -3001,6 +3935,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_DECL_MAKE)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_REPLAY_HDR_INIT)!= MH_OK) return 0;
+    if (MH_EnableHook(ADDR_ENEMY_UPDATE)   != MH_OK) return 0;   /* B5: live enemy-manager base */
     if (s_netEnabled) {
         if (MH_EnableHook(ADDR_SCENE_TICK) != MH_OK) return 0;
         if (MH_EnableHook(ADDR_GAME_START) != MH_OK) return 0;
@@ -3017,13 +3952,30 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         GetModuleFileNameA((HMODULE)hinst, s_dir, MAX_PATH);
         { char *s = strrchr(s_dir, '\\'); if (s) s[1] = '\0'; }
         { char p[MAX_PATH]; snprintf(p, sizeof(p), "%scoop_log.txt", s_dir); s_log = fopen(p, "w"); }
+        AddVectoredExceptionHandler(1, CoopCrashHandler);   /* dump context on a crash */
         Log("th07_coop attached. Menu char-select: P1 picks, then P2 picks with "
-            "IJKL move / Space confirm / O cancel; game starts after both. AUTO-spawn "
-            "P2 ~3s into the stage. In-stage P2: IJKL move, Space shot, U focus, O bomb. "
+            "WASD move / Space confirm / O cancel; game starts after both. AUTO-spawn "
+            "P2 ~3s into the stage. In-stage P2: WASD move, Space shot, U focus, O bomb. "
             "F2=cycle P2 char, F3=toggle P2 type, F4=team-border, F5=boss-HP-scale, "
             "F6=sep-resources, F7=shot-damage, F8=killable, F9=spawn, F10=despawn, "
             "F11=revive, F12=HUD-style(icons/text).");
+        Log("*** DIAGNOSTIC BUILD v9: the residual desync is INTERMITTENT (fpu_guard gave one "
+            "bit-perfect run then desync recurred, with/without P2) — the tell that D3D leaves the "
+            "x87 PRECISION control word in different states per machine/run (§8q). This build now "
+            "PINS the x87 control word to 24-bit/round-nearest each frame under netplay (vanilla's "
+            "value) so both machines agree — the likely real fix. fpu_guard (FPU firewall) stays on "
+            "by default as a complement; fpucw/fpusw still logged. Watch the 'control word pinned "
+            "(was 0x__)' line: if host and guest differ, that was the desync. Also B5 (P2 bomb -> "
+            "Extra/Phantasm boss invuln). P2 binds: WASD. ***");
         LoadNetConfig();
+        /* Echo the resolved config so every log self-documents what was actually read
+         * (a hand-added diagnostic flag that lands in the wrong coop.ini copy silently
+         * defaults off — this line makes that visible at a glance / lets the friend
+         * pre-flight check solo before the netplay round). */
+        Log("CONFIG (read from %scoop.ini): suppress_p2=%d  cherry_both_full=%d  "
+            "fpu_guard=%d  auto_resync=%d  proximity_fade=%d  damper_boss_only=%d | net.enabled=%d role=%s delay=%d seed=0x%04x",
+            s_dir, s_suppressP2, s_b2CherryBothFull, s_fpuGuard, s_netAutoResync, s_proxFade, s_damperBossOnly,
+            s_netEnabled, s_netIsHost ? "host" : "guest", s_netDelay, s_netSeed);
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */
         if (!InstallHooks())
@@ -3036,6 +3988,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
                 "border-break @0x441bd0, hud-draw @0x42b603)");
         break;
     case DLL_PROCESS_DETACH:
+        if (s_trace) { fclose(s_trace); s_trace = NULL; }
         if (s_log) { Log("detach"); fclose(s_log); }
         MH_Uninitialize();
         break;

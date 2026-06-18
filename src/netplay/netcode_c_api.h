@@ -21,6 +21,10 @@ extern "C" {
 typedef unsigned short (*NcReadU16Fn)(void);
 void Nc_SetCallbacks(NcReadU16Fn readLocalInput, NcReadU16Fn readRngSeed);
 
+/* DIAGNOSTIC: register a log sink (e.g. coop.c Log). Enables WIRE SEND/RECV lines. */
+typedef void (*NcLogFn)(const char*);
+void Nc_SetLog(NcLogFn fn);
+
 /* Transport bring-up. family = AF_INET (2) or AF_INET6 (23). Returns 1 on success. */
 int  Nc_StartHost(const char* bindIp, int port, int family);
 int  Nc_StartGuest(const char* hostIp, int hostPort, int localPort, int family);
@@ -36,6 +40,19 @@ void Nc_Reset(void);   /* clear per-frame maps (new game / frame-counter reset) 
 void Nc_BeginHandshake(int delay, unsigned short seed);
 int  Nc_PumpHandshake(void);
 int  Nc_HandshakeVersionBad(void);
+
+/* Auto-resync: opt-in recovery from a sustained in-stage desync. enable!=0 arms it;
+ * thresholdFrames = consecutive desynced frames before the host initiates (<=0 keeps the
+ * current value). Nc_PollResyncFired returns 1 (once) the frame a realign executed, so the
+ * caller reseeds the game RNG to Nc_GetInitSeed() on that frame to converge both sims. */
+void Nc_SetAutoResync(int enable, int thresholdFrames);
+int  Nc_PollResyncFired(void);
+
+/* Host-authoritative difficulty: report this machine's difficulty each frame (rides every
+ * key packet); Nc_GetPeerDifficulty returns the peer's latest (-1 if none). The guest
+ * forces its difficulty global to the host's so both installs start the same difficulty. */
+void Nc_SetLocalDifficulty(int diff);
+int  Nc_GetPeerDifficulty(void);
 
 /* Per-frame injection point. Returns the merged 16-bit word both machines agree on
  * for logic-frame `frame`; is_in_UI!=0 -> menu merge (self|rcv), else P1-low/P2-high.
@@ -60,6 +77,25 @@ void Nc_GetLastSplit(unsigned short* p1, unsigned short* p2);
  * the lockstep stalls; ~0 when healthy). */
 int  Nc_GetNetFrame(void);
 void Nc_GetSyncStats(unsigned short* selfRng, unsigned short* rcvRng, int* waitMs);
+
+/* DIAGNOSTIC: last frame's GetKeys internals — readFrame = the index it read
+ * (netcode frame - delay); selfKey/rcvKey = the raw words merged; rcvStatus =
+ * how the peer's input was obtained (0=immediate, 1=after a wait, 2=timeout). */
+void Nc_GetReadStats(int* readFrame, unsigned short* selfKey,
+                     unsigned short* rcvKey, int* rcvStatus);
+
+/* DIAGNOSTIC: provenance of the received slot read last frame — srcPktFrame = the
+ * frame field of the packet that wrote it (-1 if never written); writes = how many
+ * packets wrote it. A stale 0 with srcPktFrame>=0 means the guest SENT a 0 there. */
+void Nc_GetRcvSrc(int* srcPktFrame, int* writes);
+
+/* DIAGNOSTIC: cumulative send-side fault counters + last event. selfRewrites = a
+ * self slot recorded twice with different values; sendZfill = SendKeys zero-filled
+ * a recent slot that should have existed. Either being >0 localizes the guest->host
+ * drop to a buffer mutation (rewrite) vs a missing/erased slot (zfill). */
+void Nc_GetSendDiag(int* selfRewrites, int* rwFrame,
+                    unsigned short* rwOld, unsigned short* rwNew,
+                    int* sendZfill, int* zfFrame, int* zfSlot);
 
 #ifdef __cplusplus
 }

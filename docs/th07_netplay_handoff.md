@@ -1781,6 +1781,323 @@ watchable later**. Viewing will require the DLL loaded (vanilla can't render P2)
 24px→16px, so the other player only fades once the ~32px sprites actually overlap,
 not from across the screen.
 
+### §8l — LAN 2-PC test rounds + desync diagnosis (2026-06-15/16)
+
+First real 2-machine tests (LAN). **The injector + DLL load fine on Linux** (unlike
+the new mahjong game) and the two instances link up cleanly. Three test rounds, each
+with a determinism trace (`det-trace`, `coop_trace_{host,guest}.csv` — one row per
+logic frame; diff by frame/`readFrame` to pinpoint divergence). **Findings, in order:**
+
+**1. STALE BUILD invalidated round 1.** The tester's DLL pre-dated the demo-disable
+fix (`adb34b9`): its log printed `demo-play patch SKIPPED … 0x00455a9c` (the old
+address), so the title attract-demo stayed live and consumed RNG → the menu/difficulty
+desync (one machine on Easy, other on Lunatic). **Lesson: the attach banner now carries
+a build tag; always confirm `demo-play disabled … 0x00455a9a` on both machines first.**
+
+**2. The seed-force was firing EVERY frame (not game-start).** `FUN_00442c60`
+(`HookedGameStart`) turned out to be a *per-frame* function (~15k `SEEDFORCE` lines /
+15k frames), so forcing the seed there pinned the live RNG to `initSeed` every frame.
+That (a) **caused Chen's nonspell to bug out** (all background orbs flew the same way —
+a one-orb-per-frame "random" direction reads the same pinned seed each frame) and
+(b) masked desyncs (both machines snap to `initSeed` ⇒ false SYNC). **Fixed:** force the
+seed **once per scene** (`s_seedForced`, re-armed on each scene change), EoSD's
+force-at-start semantics; ZUN's RNG then evolves naturally and lockstep holds it.
+
+**3. The real desync is a guest→host INPUT-delivery fault (NOT seed/demo/frame-drift).**
+Round 3 trace (seed-force fixed, oracle now honest) pinned it:
+  - `readFrame` is identical on both every frame ⇒ **frame counters are aligned**
+    (the §8j start-barrier works; not a clock-drift bug).
+  - **P1 (host→guest) transports perfectly** for all 7314 frames.
+  - **P2 (guest→host) drops on ~7 frames**: e.g. at `readFrame=1289` the guest sent
+    `selfKey=0040` (left) but the host's `rcvKey=0000`, with `rcvStatus=0` (the host
+    found a value *immediately* and never waited) — so it advanced on a **present-but-
+    wrong** P2 slot. That 3-frame P2 drop seeds the divergence; the RNG counter splits
+    ~40 frames later when the now-different P2 position changes a roll → P1/P2 die in a
+    different order on each screen.
+  - **Timing asymmetry:** host `rcvStatus==1` (waited) on 7110/7313 frames, guest on 0.
+    The host runs a hair ahead and is almost always sub-ms-waiting for the lagging guest;
+    the drops are the rare frames it read a stale slot instead of blocking.
+
+**Seam map for the netcode internals** (added for this hunt, all in `netcode.cpp` /
+exposed via `netcode_c_api.h`): `Nc_GetReadStats(readFrame, selfKey, rcvKey, rcvStatus)`
+— `readFrame = netFrame - delay`; `rcvStatus` 0=immediate / 1=after-wait / 2=timeout.
+The det-trace CSV carries these per frame.
+
+**Round 4 (v3, provenance) — drop is on the SEND side, not reception.** Added per-slot
+provenance: `Nc_GetRcvSrc(srcPktFrame, writes)` — which packet (its frame field) last
+wrote the received slot, and how many packets wrote it (CSV cols `rcvSrc,rcvWrites`). The
+trace pinned the drop hard: 7 drops at `readFrame 844–850`, **all `rcvSrc=850`** (a real
+guest packet wrote them, never `-1` ⇒ NOT host-side staleness), yet the values the host
+got (`0000`/`0001`) **disagree with the guest's own `self[]` readback (`0080`, the guest
+held right)**. The host had **no guest packet newer than 850** while racing to netFrame
+854 (host waits on 5751/5785 frames — well ahead), so it burst-read those stale slots.
+⇒ **The guest is transmitting input values that disagree with its own buffer.** Two
+mechanisms remain: the self slot being **rewritten** (same frame recorded twice, different
+value) or **zero-filled** (recent slot missing at send time). v4 adds detectors for both:
+`Nc_GetSendDiag(...)` + coop.c logs `SELF-REWRITE` / `SEND-ZFILL` the instant either fires.
+**Next run decides it.** (Hypothesis to keep in mind: the merged word is written back to
+`g_InputMenu` after `Nc_GetInputNet`, and `HookedSceneTick`/`FUN_00437c70` may fire >1×
+per logic frame — a second fire would re-`readLocalInput()` the now-merged word and
+re-record the same `s_netFrame`'s self slot with a different value. That is exactly what
+`SELF-REWRITE` is built to catch.)
+
+**Round 5 (v4 detectors) — buffer is CLEAN; the phantom is on the wire.** `SELF-REWRITE`
+and `SEND-ZFILL` both stayed silent, ruling out a buffer rewrite or recent-slot zero-fill.
+Same fault signature: host received `0001` (shoot) for `readFrame 1057` that the guest's
+own `self[]` (and its own sim) read as `0000`. The host got **four consecutive `0001`s**
+(packet 1060's `keys[0..3]` = `self[1057..1060]`), which looks like a genuine 4-frame held
+bit — yet the guest's buffer shows none of it. By code, the guest's `SendKeys` and its own
+`GetKeys` read the *same* `self[]` slot, so they cannot disagree → an assumption is wrong
+somewhere only the wire bytes can settle. Symptom matches the user exactly: P2 "fired" and
+killed a fairy on the host screen, not on the guest ("a fairy died for P2 not P1, neither
+firing"). **v5 logs the wire:** `WIRE SEND frame=F key0=V` (a frame's own input as
+transmitted) and `WIRE RECV pkt=P slot=S val=V` (first non-zero arrival), via a netcode log
+callback (`Nc_SetLog`). **Decision rule next run:** if the guest logs `WIRE SEND
+frame=1057…` then it really recorded+sent the bit and its *own* merge dropped it (a
+read-side bug — instrument `GetKeys` self read); if the guest has NO such SEND but the host
+logs `WIRE RECV …val=0001`, the bit was injected in transit/recv (serialization / a stray
+packet — instrument `RcvPacks` / `ReceiveOnePack`).
+
+**Gameplay bug backlog (separate from this desync):** the user's local-coop Parsec
+sessions surfaced 11 gameplay bugs (2 crashes + resource/bomb/extend issues) — captured
+in `docs/th07_coop_gameplay_bugs.md` for an unattended session. Not transport-related, but
+note a **crash on one machine reads as `peer lost` on the other**, so the two crashes
+(P1-Sakuya+P2-Reimu on hit; stage-4 death-fairy) are worth fixing regardless.
+
+### §8m — DESYNC ROOT-CAUSED + FIXED: stale-scene packet contamination (2026-06-16)
+
+**The v5 wire trace settled it. The "present-but-wrong P2 slot" of §8l is NOT a drop —
+it is the previous scene's input bleeding into the stage through a reused frame index.**
+
+Diagnosis from the friend's two-run logs (`coop_trace_{host,guest}.csv` + `coop_log.txt`,
+host=P1 Reimu / guest=P2):
+- Cross-checked, per read-frame `k`, `host.rcved[k]` (what the host thinks the guest sent)
+  vs `guest.self[k]` (what the guest actually recorded). **Whole-stage totals:**
+  - **Run 2: exactly 3 disagreements** — frames **536, 537, 538**, all `host=0001`,
+    `guest=0000`. Host→guest direction 100% clean.
+  - **Run 1: exactly 3 disagreements** — frames **698, 699, 700**, same shape; host→guest
+    clean.
+- **The disagreeing frame == the char-select length.** The single re-align log reads
+  `scene 1 -> 2 — lockstep re-aligned to frame 0 (was 539)` (run 2) / `(was 701)` (run 1).
+  Run 2's contamination is at 536–538, run 1's at 698–700 — i.e. the **last ~3 frames of
+  the menu scene**, replayed into the stage at the **identically-numbered** stage frames.
+- **The phantom value is `0001` = Z held in char-select.** The guest (P2) holds shot to
+  confirm its character; `WIRE SEND key0=0001` runs through the whole menu. The v5 wire
+  logs are CLEAN: guest `WIRE SEND frame=538 key0=0001` and host `WIRE RECV slot=538
+  val=0001` agree. The provenance columns nail it: all three contaminated host slots have
+  `rcvSrc=538` (last written by guest **packet frame 538** — a *menu* packet, since the
+  menu ended at 539) with `writes` 3/2/1 for slots 536/537/538 — the exact trailing-batch
+  signature of `keys[0..2]` of the last menu packet.
+
+**Mechanism.** The §8j start-barrier resets the netcode frame index to 0 at every scene
+boundary (needed so the two machines realign after the asymmetric menu/stage load). That
+makes frame numbers **reused** across scenes. `Nc_Reset()` clears the *local* maps, but it
+cannot un-send the guest's in-flight/last-window menu packets. Those packets carry frames
+≈524–539 with value `0001`; arriving just after the host's reset, they write the **stage**'s
+`rcved[524..539]=0001`. Lower slots get overwritten in time by fresh stage packets, but the
+slots at the menu's very end (the last ~3) are read by the slightly-leading host in the
+narrow race **before** the lagging guest reaches those stage frames and sends the real
+`0000` — so the host injects ~3 phantom P2 shots. Those shots kill a fairy on the host
+screen only, change an item-drop roll, and the **shared RNG counter splits** (host ctr=0 /
+guest ctr=4 at the first diverged frame) — exactly the user's "fairies spawn/drop
+differently" + "a shot fires on one screen not the other." **Run 1 vs run 2 are the SAME
+bug**; it just lands at char-select-length frames in, so a fast select desyncs "from the
+start" and a slow one desyncs "after Letty's first spell."
+
+**FIX (committed): scene-generation (epoch) tag on the wire.** `Pack` gains a `unsigned int
+epoch`; `g_epoch++` in `Netcode_Reset()` (so it bumps with the per-scene re-zero, in
+lockstep on both machines — both reset on the same scene-id change at `self+0x154`).
+`SendKeys`/`HsSend` stamp the current epoch; `RcvPacks` **drops any `Ctrl_Key` packet with
+`epoch < g_epoch`** (a previous generation). Newer epochs are accepted (a peer that crossed
+the boundary a frame ahead) and cleared by our own imminent reset. `MULTI_NET_VER`
+3950→3960 so a mixed-build pair refuses to connect (the handshake already gates on ver).
+A deduped `EPOCH DROP …` line logs each stale generation dropped, for the next test's
+confirmation. Builds clean (all 6 targets, 32-bit); native merge test 0 failures.
+**Needs the 2-PC re-test:** expect the trace to show **0** host↔guest input disagreements
+across the whole stage and the RNG counter to stay locked through Letty and beyond.
+
+> Note (unchanged, separate): the P1-Sakuya+P2-Reimu crash did NOT reproduce in this build
+> (both reached Cirno). It was last seen on the **Phantasm** stage locally, not main-game
+> stage 1 — still tracked in `docs/th07_coop_gameplay_bugs.md`, unrelated to this transport
+> fix.
+
+### §8n — epoch fix CONFIRMED for transport; RESIDUAL desync is SIM-side (2026-06-16)
+
+The 2-PC re-test of the epoch build (delay=2; guest logged `EPOCH DROP` ×3 — the fix is
+live and catching the stale menu packets). **The input transport is now clean:** diffing
+the two stage traces shows **zero P2-input disagreements** (`host.rcvKey == guest.selfKey`
+every frame) and **`merged` identical on both** at the first divergence. §8m's contamination
+is gone.
+
+**But the run still desynced** (user reached Cirno with different power on each machine).
+The det-trace pins a *new, different* class of bug:
+- Frames are **byte-identical** (same seed AND counter) up to **netFrame 625**, then at
+  **626** — with **identical merged input `0081`**, P2 idle, P2 power 0 on both — the guest
+  makes **24 more RNG calls** than the host (host ctr 64 → seed `727e`; guest ctr 88 → seed
+  `bb83`). So **identical input now produces different RNG consumption** ⇒ a *simulation*
+  determinism divergence, not transport.
+- Vanilla PCB is cross-machine deterministic (its replays are), so the cause is in **our
+  additions** — overwhelmingly the **grafted P2 entity** (the one non-vanilla sim object).
+  Two corroborating signals: the divergence is byte-identical for 625 frames then tips at a
+  discrete event (a slow-accumulating float/state difference crossing an RNG-gated branch,
+  e.g. an item-drop `Rng_Next32()%100<=cherryRatio` roll), and the P2 clone lives at
+  **different addresses** on the two machines (host `res=0x029e79d0` vs guest `0x001e1338`)
+  — any logic keyed on that pointer/order diverges.
+- **Strong mechanism lead: the x87 ST0 / FPU hook hazard** documented in
+  `docs/th07_coop_gameplay_bugs.md` (nightshift). Several ZUN resource/damage/item fns read
+  values off the x87 stack the *caller* pushed; a non-FP-safe C hook (`HookedDamage` on
+  `FUN_0043d9e0`, the collect/item hooks) can leave the x87 stack/control word perturbed,
+  making ZUN's FP — hence damage/positions/item rolls — diverge.
+
+**Diagnostic shipped (v6): `coop.ini [coop] suppress_p2=1`** (gates `SpawnP2`, auto + F9).
+Run a 2-PC test with `suppress_p2=1` on BOTH machines (P1-only co-op-less netplay):
+- **Counter stays locked the whole stage ⇒ the P2 entity graft is the determinism culprit**
+  → next: audit P2's update for FP-stack safety (wrap hooks with `fnsave`/`frstor` or
+  `_control87` save/restore; verify no hook leaves ST0 pushed) and for any address/pointer-
+  ordered logic; bisect by selectively disabling P2 sub-systems (shot, collision, aim).
+- **Still desyncs without P2 ⇒ the cause is a hook that runs even without P2** (e.g. the
+  damage/seed hooks themselves) — instrument those.
+
+This is the current frontier: transport is solved, the remaining desync is sim-determinism
+from the P2 graft (most likely an x87/FP-safety or pointer-order issue).
+
+### §8o — suppress_p2 test: P2 graft RULED OUT; residual desync is CROSS-PLATFORM FP (2026-06-17)
+
+The §8n hypothesis ("the P2 graft is the determinism culprit") is **DISPROVEN.** A clean
+2-PC run with **`suppress_p2=1` confirmed on both machines** (both logs: `spawn: SUPPRESSED`,
+CONFIG echo `suppress_p2=1`) — i.e. **no P2 entity exists at all** — *still desynced*
+(fairies, item drops, death-[P] pattern, then a hard desync at the stage-1 boss from
+divergent power states).
+
+**What the traces show (decisive):**
+- Both machines are **bit-identical** — same `seed` AND `counter` every frame — from stage
+  frame 2 (where the per-scene seed force lands, both → `2915`) through **frame 742**. 740
+  frames (~12.4 s) of perfect lockstep.
+- At **stage frame 743**, with **identical inputs** (P2 suppressed, P1 word identical) and
+  identical RNG state through 742, the **guest makes +24 RNG calls** (host ctr 84 → seed
+  `271b`; guest ctr 108 → seed `b1b3`). From there they cascade apart.
+- The earlier `DESYNC in stage at frame 4` log line is a **false alarm** — it compares the
+  frame-1 *pre-force* seeds (`93b3`/`f880`), before the stage-start force applies at frame 2.
+  Ignore it; the real divergence is frame 743 (and it varies by run — §8n saw 626).
+
+**Why this is NOT our mod:**
+- **coop never calls the game RNG** (it only *reads* `0x0049fe20/24` for the trace). So the
+  +24 calls are entirely inside **ZUN's own code** taking a different branch.
+- **P2 is suppressed** ⇒ every P2-gated path is off; `HookedAngleToPlayer` is a pure
+  passthrough when `s_p2==NULL` (coop.c:2932); no coop hook writes game state or calls RNG.
+- Identical inputs + identical RNG + same code diverging ⇒ the only remaining variable is a
+  **floating-point result differing between the two machines.**
+
+**The machines are different platforms:** host = `Z:\home\muddy\...` (**Wine/Linux**), guest
+= `C:\game\Touhou\...` (**native Windows**). 740 bit-perfect frames then a sudden branch
+divergence is the textbook signature of **subtle x87 FP nondeterminism** — accumulated
+last-bit differences (almost certainly **CPU-vendor-dependent transcendentals**: `fsin`/
+`fcos`/`fpatan`, used by PCB for movement/aim) crossing a decision threshold. A gross
+mismatch (FPU precision/rounding control word) is ruled out — it would diverge at frame 2,
+not 742.
+
+**Implication:** delay-based lockstep requires *bit-identical* simulation. If the two
+machines' x87 math isn't bit-identical, **no fix in our code can hold sync** — the divergence
+is in ZUN's own arithmetic. This is exactly what EoSD's periodic resync window papers over
+(see the resync discussion); pure lockstep does not.
+
+**Next (confirmation, cheap):**
+1. **Same-platform / same-CPU-vendor test** — two native-Windows boxes (ideally same vendor),
+   or two Wine boxes on the same CPU. Expectation: stays synced ⇒ confirms it's the
+   Wine-vs-Windows / Intel-vs-AMD FP gap.
+2. **Vanilla replay cross-test** (no mod): record a PCB replay on machine A, play it on B. If
+   the *vanilla* replay visibly desyncs, PCB itself isn't cross-platform deterministic between
+   these two machines — proves the cause is the platform, not netplay.
+3. Capture both machines' **CPU vendor/model + OS** (Wine version on the Linux side).
+
+**If confirmed cross-platform FP — strategic options (all heavier than a code fix):**
+- **Constrain deployment:** document that lockstep needs matching FP (same CPU vendor / both
+  native or both Wine). Lowest effort; works today between like machines.
+- **Periodic state resync** (EoSD-style): host authoritatively pushes RNG + critical sim state
+  every N frames; guest snaps to it. Hides small divergences but needs real state transfer
+  (enemies/bullets) to avoid visible rubber-banding ⇒ approaches rollback complexity.
+- **Deterministic FP shim:** force identical x87 control word (likely already matching) and
+  replace the divergent transcendentals with a bit-identical software `fsin/fcos/fpatan` on
+  both machines (hook the math or the callers). Most invasive; only route to true
+  cross-CPU lockstep.
+
+### §8p — user reports vanilla replays DO sync cross-OS ⇒ suspect OUR netcode's FPU use (2026-06-17)
+
+User correction: he has received working PCB replays from the Wine-host friend many times, so
+**vanilla PCB is deterministic across these two machines** — the base-game-FP hypothesis (§8o)
+is wrong. Re-frame: the base game is fine; **our netplay additions introduce the divergence**,
+and they must do so in a way that *differs per machine* (else both machines would just change
+identically and stay in sync with each other). Vanilla and replays have **no netcode running**,
+which is exactly why they're immune.
+
+Prime suspect (P2 already ruled out): the **per-frame netcode perturbing the shared x87 FPU**.
+`Nc_GetInputNet` (called from `HookedSceneTick` right before ZUN's player update) runs the
+lockstep wait — double timing math busy-spinning a **machine-dependent number of times**
+(network latency / scheduling differ). If that leaves the x87 control word, rounding, or stack
+depth even slightly different on the two machines, ZUN's subsequent FP forks. Fits the trace:
+bit-identical for ~740 frames, then a sudden branch (a slow-creeping float crossing an RNG-gated
+threshold), and the fork frame varies by run (626 / 743) like a timing-sensitive effect.
+
+**v8 ships the probe + a candidate fix:**
+- **Probe:** trace gains `fpucw,fpusw` columns — the x87 control + status words read right
+  AFTER `Nc_GetInputNet` each frame. Diff host vs guest: if they diverge, the netcode is
+  perturbing the FPU (status-word TOP field = stack depth catches stack leaks; control word
+  catches precision/rounding).
+- **Fix (gated `coop.ini [coop] fpu_guard=1`, launcher checkbox):** `fnsave`/`frstor` the full
+  x87 state around the netcode call — a firewall so the netcode can't touch ZUN's FPU at all.
+
+Test plan: round 1 `fpu_guard=0` (observe `fpucw/fpusw` diverge at/around the fork frame) →
+round 2 `fpu_guard=1` (should hold sync). If it still desyncs with the guard AND fpucw/fpusw
+are identical host-vs-guest throughout, the cause is NOT the FPU and the search moves to other
+per-machine inputs our code might feed the sim (pointer/address-ordered logic, uninitialised
+reads) — though P2-suppressed leaves very little of that surface.
+
+### §8q — fpu_guard gave ONE perfect run but desync is INTERMITTENT ⇒ D3D x87 precision; PIN the control word (2026-06-17)
+
+**Result of the v8 test.** With `suppress_p2=1, fpu_guard=1` the main pair (Ryzen 5800X ↔
+i7-2620M, one on Wine) ran **18,766 stage frames bit-perfect** (seed AND counter identical the
+whole stage, to a Chen death) — `diverging frames: 0`. Proof the netcode WAS a real source and
+the firewall removes it. **BUT** the user reports that was the *only* time it worked: all
+further runs "back to Desync City, with or without P2." A second old-laptop pair (i7-2620M ↔ i5,
+Win7↔8.1) desynced with `fpu_guard` on AND off — its trace shows the x87 **status word differing
+host (`0020`) vs guest (`0000`)** at the fork (frame 936), i.e. the two CPUs handling identical
+FP ops differently.
+
+**The intermittency is the key clue** (the desync fork frame varies: 626 / 743 / 936 / never).
+A deterministic cause (fixed CPU-transcendental gap) would fork at the SAME frame every run.
+Varying ⇒ a per-run variable. The strongest fit, and the correct read (caught by nightshift's
+keen-ramanujan branch, commit 8d09974): **the x87 PRECISION control word set by Direct3D8.**
+ZUN omits `D3DCREATE_FPU_PRESERVE`, so D3D8 sets 24-bit single precision at device-create and can
+RESET it on `Present()`. Two machines' D3D drivers/wrappers (Wine vs Windows, different GPUs)
+can leave it in DIFFERENT states (24- vs 53-bit) — so whether they match **varies run-to-run**:
+a clean run when they happen to agree, desync when they don't. This also corrects §8o (the base
+game IS cross-deterministic — vanilla replays sync; the user confirmed receiving working replays
+many times).
+
+Why `fpu_guard` didn't fix it: `fnsave`/`frstor` faithfully *preserves* whatever control word
+the game already had — if D3D left it at 53-bit on one machine, the guard keeps it 53-bit. The
+guard removes the NETCODE's stack churn (a second, real source — hence the one clean run when the
+control words happened to match) but cannot equalise a D3D-induced precision mismatch.
+
+**v9 fix (ported from the branch, adapted): `PinFpuForNetplay()`** — `_controlfp(_PC_24 |
+_RC_NEAR, _MCW_PC | _MCW_RC)` once per logic frame in `HookedSceneTick` under `s_netActive`, so
+BOTH machines run ZUN's sim at vanilla's 24-bit/round-nearest regardless of what D3D did. It logs
+the PREVIOUS control word on the first pin — **if the host and guest "was 0x____" values differ
+in the next 2-PC test, that was the desync, confirmed.** `fpu_guard` stays on by default as a
+complement (it covers x87 *stack* state, which the CW pin does not). Gated on netplay only, so
+local/replay is byte-identical.
+
+**Branch housekeeping:** `keen-ramanujan-6unds2` (B2+B4) is fully redundant with main. From
+`keen-ramanujan-mrh2n7` only two things were new and were ported to main manually (not merged —
+the branch's B2/B4/D1/§8n duplicate main in conflicting form): the **CW pin** above and **B5**
+(P2 bomb → Extra/Phantasm boss invuln, using main's validated `ADDR_DIFFICULTY 0x626280`, not the
+branch's `0x62f85c`). Both branches can be deleted once this is pushed.
+
+**Next test:** `suppress_p2=1` (keep P2 out to stay minimal), `fpu_guard=1`, run 2-3 stages.
+Read the `control word pinned (was 0x__)` line on each machine — differing values confirm the
+mechanism. If it now holds sync across several runs, re-enable P2 (`suppress_p2=0`) for the real
+full-co-op test.
+
 ### Working-build discipline for the overnight session
 The build on `main` is GOOD (menu select + different char + lasers + bombs +
 retry all confirmed by the user). Before any risky change, note the last-good
@@ -1789,3 +2106,193 @@ refactor the anm swap or the menu FSM. Build with `powershell -File build.ps1`
 and confirm `th07_coop.dll` stays 32-bit (machine 0x014C). Commit incrementally
 with clear messages; leave the tree clean. Anything needing live verification:
 implement + document what to test, don't mark it done.
+
+### 5p — Gameplay-bug backlog pass (2026-06-16, unattended; PR #5)
+Worked `docs/th07_coop_gameplay_bugs.md` (local-co-op bug list). No game this
+session — fixes are reasoned + compile-verified (6 targets, 32-bit; native merge
+test green; CI green), NOT play-tested. **Branch `claude/quirky-heisenberg-znrauh`,
+PR #5.** Full per-bug detail (with the RE) lives in the bugs doc; summary:
+
+- **D1 — no free revives** (DONE): `ReviveByGraze` now needs a spare extend; the
+  last-life-death 1up drop is kept (user-confirmed).
+- **B1 — point-item extend shared** (DONE): mirrored to the partner via the
+  extend-tier counter `res+0x2c` (the 1up *item* doesn't bump it), through the
+  existing collect-time field-swap. FPU-safe.
+- **B3 — P2 autocollect** (DONE): `ApplyP2Autocollect` replicates ZUN's P1-only
+  line-cross / Extra trigger for P2 (sets item homing-mode `+0x27f=1` for items P2
+  is nearer to; existing nearer-player homing carries them in).
+- **B4 — P2 bomb clears bullets** (DONE): bomb clear = per-player region array
+  `player+0x17dc` (tested by `FUN_0043e0a0` inside the bullet hit test coop already
+  re-invokes for P2). `HookedAddClearCircle/Box` force ECX→P2 in P2's update window
+  so P2's bomb fills `P2+0x17dc`. Mechanism now mapped in `th07_player_struct.md`.
+- **B2 — full-power→cherry gate** (DEFERRED): blocked by a **new hazard** —
+  `FUN_004326f0` (item spawner) and `FUN_0042d83a` (extend) read the x87 **ST0** their
+  caller pushed, so a MinHook C detour can't wrap-and-forward them. Routes documented.
+- **B5 — boss invul-during-spell for P2 bomb** (DEFERRED): `+0x1fbac` is the BOSS
+  spell index (`FUN_00429a4f`); `DAT_012fe0c8` = boss-spell-active. The real gate is
+  in the boss-damage path and P2's bomb-damage route isn't confirmed to pass through
+  `FUN_0043d9e0`, so the fallback wasn't shipped blind. Lead documented.
+- **C1/C2 — crashes** (need repro): hit-path identity logging plan in the doc.
+
+**⚠️ Reusable hazard for the next session:** never C-hook a fn that reads the x87
+`ST0` set by its caller (`FUN_004326f0`, `FUN_0042d83a`, `FUN_0048b8a0` itself) — the
+detour clobbers ST0 before the trampoline runs. Use a side-channel (B1's tier counter)
+or a binary patch / `fldz`-guarded forward instead.
+
+## 5x. Session 2026-06-18 (pm) — overnight test follow-ups
+
+Three items reported from overnight testing:
+- **Extra boss bomb armour (B5): WORKS** (user-confirmed). No change needed.
+- **Cherry/power on boss spell-capture: FIXED + USER-CONFIRMED 2026-06-18 (commits fef9f19 WIP, 0ba087d fix).**
+  The both-full gate worked for regular drops but the boss spell-capture reward still
+  gave no power to a below-full P2 — crucial on Extra/Phantasm refuel. Initial theory
+  (boss pre-converts power->cherry/type-7) was WRONG and the un-convert it inspired was a
+  no-op. A broadened `B2 diag spawn` log (every type + spellcard flag + capwin) settled it
+  empirically: **the capture reward is a burst of `type=1` (POINT) items at `p1pow=128`,
+  `sc=0`** — i.e. when P1 is full the boss substitutes point items for the power drop it
+  would give, and the decision is made UPSTREAM of the spawner `FUN_004326f0` (which is why
+  nothing reached our hook as type 0/2/7). User domain note: PCB never drops full-power "F"
+  (type 4) except on continue, so that's not it. **Fix:** detect spell-end
+  (spellcardInfo.isActive 1->0) in `HookedEnemyUpdate` and open a `CAPTURE_WIN_FRAMES`
+  (~240f) refuel window; in `HookedItemSpawn`, while that window is open AND `g_b2Suppress`
+  (P2 below full), convert **type 1 -> type 0** so the reward drops as power for P2.
+  Window-gated so in-stage point items are untouched; the reward lands in the `sc=0` gap
+  after capture (verified — a new spell's `sc=1` only returns for the next phase). P1 (full)
+  collecting the power item still scores points on pickup, so P1 loses nothing meaningful.
+  **Refinement (window):** changed to hold the window open for the WHOLE spell (`sc=1`) plus
+  `CAPTURE_WIN_FRAMES` after, robust whether the reward lands at the capture instant or in the
+  `sc=0` gap.
+  **Cherry REGRESSION + final fix (0ba087d):** the first build dropped CHERRY, not power —
+  `type=1->0` then calling SpawnItem directly re-triggered SpawnItem's OWN full-power->cherry
+  conversion (`FUN_004326f0:20256` — `round(P1pow)>=0x80 && type in {0,2} => 7`) because P1 is
+  full. Fix: after `type=0`, FALL THROUGH to the existing power-zero wrapper (zero `res+0x7c`
+  around the call) so `round(power)=0` and the cherry convert is skipped — identical to the
+  regular-drop path. Cross-checked vs EoSD `ECL_OPCODE_DROPITEMS` (`uth06dos EclManager.cpp:
+  802-817`): boss reward loops SpawnItem, POWER when P1<128, POINT-substituted when full; the
+  power->cherry step is a PCB-only second conversion inside SpawnItem. **User-confirmed working.**
+  The converted reward is SMALL power (type 0); EoSD drops the first as BIG — bump to type 2 if
+  Extra/Phantasm refuel feels too weak.
+- **Proximity focus-hitbox fade: FIXED + USER-CONFIRMED 2026-06-18 (commit fef9f19).** Only the sprite faded; the
+  focus RING/hitbox (type-0x18 effect, colour at effect+0x1b8) did not. Cause: the
+  fade colour was written in the player UPDATE (`ApplyProximityFade`), but the
+  effect-manager's own anm/update task runs in a separate, later task that rewrites
+  effect+0x1b8 — clobbering us before the draw. (The sprite tint survives only because
+  it's written after the player's own anm.) Fix: defer the focus-ring tint and apply
+  it at **draw time** in `HookedDraw` (after all update tasks, just before the effect
+  draws), via the existing `FadePlayerFocusFx` helper + `s_proxFx*` stash. A one-shot
+  `prox-fade: focus-ring tint at draw` log reports the fx ptr/type/tint. If it still
+  does not fade, the effect draws BEFORE the player draw and an effect-draw hook is
+  needed.
+
+### §8r — first-run-after-launch desync: AUTO-RESYNC (completed the th06 handshake) — 2026-06-18
+
+**Target.** The residual netplay issue ([[netplay-desync-x87-fpu]]): with the transport/epoch
+fix + x87 CW pin, every run AFTER the first is bit-perfect; only the FIRST run after process
+launch forks (cold-load timing asymmetry → the two sims one lockstep frame apart). Both control
+words matched (`0x001f`) at the fork, so it's NOT FP precision — it's a one-time frame offset,
+which a manual `Escape → Give up → Retry` already fixes (fresh scene → re-zero + SEEDFORCE).
+
+**Fix — make that recovery AUTOMATIC by completing the dormant `Ctrl_Try_Resync` protocol.**
+The th06 resync handshake was HALF-ported into `netcode.cpp`: the *receive* side (sets
+`g_resync_trigger`/`g_resync_stage_frame`) and the `Reset` clear existed, but nothing SENT the
+request and nothing CONSUMED the trigger. Completed it from the EoSD reference
+(`th06_multi_net/src/Supervisor.cpp:124-164`):
+- **Host initiates** (only after a SUSTAINED desync — `g_resync_desync_run >= threshold`, default
+  180f/~3s, so the ≤15f self-healing blips never trigger it): picks `target = frame + delay*2+2`,
+  arms the trigger, and SENDS `Ctrl_Try_Resync(target)` every frame until it fires.
+- **Guest adopts** the target on receive (the existing window-validated `RcvPacks` branch).
+- **Both EXECUTE** when their own lockstep frame reaches `target`: clear the (misaligned) rcved
+  maps, set `g_is_sync=true`, latch `g_resync_did_fire`. The peer re-sends its recent window
+  (SendKeys re-ping), so the buffers re-fill aligned.
+- **coop.c reseed**: `HookedSceneTick` polls `Nc_PollResyncFired()` right after `Nc_GetInputNet`
+  and, on fire, snaps `*ADDR_RNG_SEED = Nc_GetInitSeed()` on THAT frame — both machines fire on
+  the same lockstep frame, so they reseed together and re-converge (the automatic SEEDFORCE).
+
+**Safety.** Gated IN-STAGE only (menus aren't RNG-locked; `RunResync` early-returns on `is_in_UI`)
+and behind `g_resync_enable` (core default OFF so the native tests stay deterministic; coop.c opts
+in via `Nc_SetAutoResync`). It is **inert while synced** — only counts/acts after 180 unbroken
+desynced in-stage frames — so it cannot perturb the confirmed-good steady state. New
+`[coop] auto_resync` flag (default ON) + launcher checkbox (per [[launcher-owns-coop-ini]]).
+
+**Status: 2-PC TESTED 2026-06-18 — REJECTED, now DEFAULT OFF.** The premise (first-run = a
+recoverable frame offset) was WRONG. Logs from the Wine(host)↔Windows(guest) pair:
+- The handshake works PERFECTLY: host & guest executed every resync at the SAME frame
+  (1160/1368/2297/2749) and reseeded to the same `0xb9f5` together — the protocol is sound.
+- But it did NOT fix the desync: each reseed re-desynced within ~200 frames (fired 4×). The
+  divergence is an ONGOING game-state fork, not an RNG/input-buffer offset, so a mid-stage reseed
+  can't undo it (it can't move already-diverged enemy/bullet positions back into agreement).
+- The REAL desync onset is MID-STAGE, not at the start barrier: both runs start synced (the
+  frame-4 seed blip self-heals by frame 124), then fork deep in-stage (frame 973 / 632 / 2110)
+  after 10-16 s of clean sync. With the x87 CW pinned and MATCHING (`0x001f`) on both, on a
+  cross-platform Wine↔Windows pair → this is ZUN's own FP math diverging across the two libm/x87
+  implementations, intermittently. NOT a frame offset, NOT a precision-CW mismatch.
+- A full scene RESTART recovers it (the OFF run got a clean synced stage; the friend: "synced
+  after a restart or two"); the mid-stage resync does the one thing a restart doesn't — it keeps
+  the diverged stage running. Friend found ON markedly WORSE than OFF across several attempts.
+
+So: `auto_resync` is now **DEFAULT OFF** (DLL + launcher + ini), the manual retry stays the
+recovery path, and the mechanism is kept only as an inert, opt-in building block.
+
+### §8s — the "desync" was mostly the MENU, not gameplay FP — menu-freeze fix (2026-06-18)
+
+A second look (prompted by the tester) overturned the §8r "mid-stage FP" framing as the *main*
+problem. Two things were being conflated under "desync", and the gameplay-FP one is largely a
+non-issue in practice:
+
+1. **Gameplay is actually deterministic across mismatched hardware.** The tester reports stage-1→
+   ending **perfect sync** after a single initial restart, on multiple mismatched pairs (Ryzen+Wine ↔
+   Intel+Win over LAN; Ryzen+Win ↔ Ryzen+Wine over the internet at delay 3). A clean `auto_resync=0`
+   log confirms it: both sides ran a whole stage with **no `DESYNC in stage`** (only the frame-4
+   transient that self-heals by 124). If transcendentals genuinely diverged, EVERY run would fork —
+   they don't. So the `fsin/fcos/fpatan` "fix" (a software-trig rewrite) would harden a non-problem;
+   **dropped.** (The mid-stage forks in the §8r ON-run were the auto-resync reseed churn / run-to-run
+   variance, not a systematic FP fork.)
+
+2. **Cosmetic menu-seed mismatch (harmless).** In the title menu both machines just hold their own
+   leftover startup seed (host `0x7df9`, guest `0x7775`), FROZEN with `ctr=0` (no RNG draws). Nothing
+   aligns them until the first game-start SEEDFORCE, after which they match everywhere (menu included)
+   forever. The tester's "numbers finally matched after a restart" is just that first SEEDFORCE — the
+   game was never desynced. (Optional future polish: SEEDFORCE at LINK-UP so the menu numbers match
+   immediately and stop alarming testers. Not done yet.)
+
+3. **REAL menu-navigation desync — FIXED (commit on main 2026-06-18).** Host on Normal / guest on
+   Lunatic; P1 in the difficulty list while P2 is in Extra. Diffing the tester traces showed the
+   **merged input words are byte-identical** on both machines post-link-up — so the lockstep merge is
+   sound; it's the menu *cursor state* that diverged BEFORE lockstep. Code-confirmed cause: during the
+   handshake (`s_netStarted && !s_netActive`), `HookedSceneTick` returns without overriding
+   `g_InputMenu`, so each machine's menu runs on its LOCAL keyboard until link-up, and link-up never
+   resets the cursor. On a real connection the host waits SECONDS for the guest; any navigation in
+   that window moves only the local cursor and is never reconciled → the two engage lockstep already
+   on different items/sections. Loopback links up instantly, which is why it never reproduced locally.
+   **Fix:** zero `g_InputMenu` while handshaking (freeze both menus at the identical startup state)
+   and reset `s_menuRepeatCtr` at LINK UP; once linked, the merged word drives both together. Awaiting
+   a real-connection confirmation. **Lesson: don't theorize the desync class — separate menu vs
+   gameplay, and diff the merged words before blaming the sim.** See [[netplay-desync-x87-fpu]].
+
+### §8t — the REAL killer: divergent STARTING CONFIG (difficulty) — host-authoritative fix (2026-06-19)
+
+The menu-freeze (§8s) was necessary-but-insufficient, and the tester nailed why: the problem isn't
+(only) live menu navigation, it's that the two **installs start with different saved config**. A third
+test settled it — the difficulty global `0x626280` read **`1` (Normal) on the host and `3` (Lunatic) on
+the guest** (`diff=` in the B2 diag, 60 vs 57 lines). No lockstep or resync can reconcile two machines
+running different difficulties (different enemy HP, bullet density, item thresholds). The tester's
+"fairies synced but their bullets weren't" is the precise signature: stage-script fairy spawns are
+difficulty-independent; their bullets are difficulty-scaled. Even a perfect menu-freeze can't fix this —
+each install's difficulty cursor *starts* at its own saved default, so they diverge with nobody touching
+the menu.
+
+**Fix (host-authoritative, in-game selection kept — the tester's chosen UX):** the difficulty global is
+the source of truth. Each machine reports its current difficulty on **every `Ctrl_Key` packet** (new
+`CtrlPack.sender_diff`; `MULTI_NET_VER` 3960→3970 so mismatched builds are rejected at handshake). The
+**guest pins its `0x626280` to the host's value every frame** (`HookedSceneTick`, before the stage init
+reads it), so the guest's menu follows the host and both start identical. Host untouched; out-of-band
+metadata, not part of lockstep input/RNG. One-shot `difficulty pinned to host's` log. Native
+`netloop_test` green; needs a 2-PC confirm.
+
+**Still open (same class, need RE):** the tester also listed **Extra/Phantasm unlock state** and
+**starting lives** as divergent. Follow-ups: (a) **unlock-all at init** so the guest's menu offers the
+same options (needed for the guest to follow the host into Extra/Phantasm), (b) **force starting lives**
+host-authoritative the same way. Both need the unlock-flag / lives globals located first (not trivially
+near `0x626280`). The user is OK treating these pragmatically. Lesson reinforced: a netplay "desync" can
+be **pre-game config divergence between installs**, fixable by pinning the few starting globals — check
+those before any sim-side theory.

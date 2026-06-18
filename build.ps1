@@ -169,6 +169,13 @@ proximity_fade = 1
 ; disable_demo: when 1 (default), suppress the title-screen attract-mode demo
 ; replay (it would otherwise start on idle and interfere with netplay waiting).
 disable_demo = 1
+; cherry_both_full: when 1 (default), dropped power items only convert to cherry
+; (point) items once BOTH players are at full power — otherwise P1 being full alone
+; would starve P2's only power source (B2). Set 0 for vanilla (convert on P1 full).
+cherry_both_full = 1
+; damper_boss_only: the 2-player DPS damper. 0 (default) = flat 0.75 on every enemy;
+; 1 = reduce only bosses/midbosses (0.60) and leave stage enemies at full damage.
+damper_boss_only = 0
 
 [net]
 enabled = 0

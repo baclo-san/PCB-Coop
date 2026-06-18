@@ -1,5 +1,16 @@
 # Night-shift goals (unsupervised)
 
+## ✅ 2026-06-16 — gameplay-bug backlog pass (PR #5, branch claude/quirky-heisenberg-znrauh)
+Worked `docs/th07_coop_gameplay_bugs.md`. Implemented (compile-verified, CI green,
+NOT play-tested): **D1** no-free-revive, **B1** shared point-item extend, **B3** P2
+autocollect, **B4** P2 bomb bullet-clear (per-player `+0x17dc` clear-region array, now
+mapped in `th07_player_struct.md`). Deferred with full RE + scoped plans: **B2** (x87
+ST0-hook hazard — see below), **B5** (boss damage-deny gate), **C1/C2** (need repro).
+Handoff §5p has the summary. **Next session priorities:** verify D1/B1/B3/B4 in-game;
+then B5's boss-damage gate; C1/C2 need a repro+log. **Hazard:** don't C-hook ST0-reading
+fns (`FUN_004326f0`, `FUN_0042d83a`).
+
+
 Canonical context: `docs/th07_netplay_handoff.md`. Build: relink coop.dll directly
 (execution-policy blocks build.ps1) — see the compiler invocation in chat history /
 `build.ps1` lines 86-90. Verify DLL stays 32-bit (machine 0x014c). Commit

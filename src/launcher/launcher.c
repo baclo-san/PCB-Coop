@@ -291,8 +291,9 @@ static void Prefill(void)
         SendMessageA(g_cherry,     BM_SETCHECK, chy ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageA(g_damperboss, BM_SETCHECK, dbo ? BST_CHECKED : BST_UNCHECKED, 0);
     }
-    {   /* auto-resync (default ON): automatic recovery from a sustained in-stage desync. */
-        int ars = (int)GetPrivateProfileIntA("coop", "auto_resync", 1, g_iniPath);
+    {   /* auto-resync (default OFF — a 2-PC test proved a mid-stage reseed doesn't fix
+         * PCB's desync; the manual scene restart is the working recovery). Opt-in only. */
+        int ars = (int)GetPrivateProfileIntA("coop", "auto_resync", 0, g_iniPath);
         SendMessageA(g_autoresync, BM_SETCHECK, ars ? BST_CHECKED : BST_UNCHECKED, 0);
     }
 
@@ -349,8 +350,8 @@ static void CreateControls(HWND w)
     g_damperboss = mk(w, "BUTTON", "Damage cut: bosses only (stage enemies full damage)",
                 BS_AUTOCHECKBOX, edx, y, 320, 22, IDC_DAMPERBOSS);
     y += row;
-    g_autoresync = mk(w, "BUTTON", "Auto-resync (recover a desync without a manual retry)",
-                BS_AUTOCHECKBOX, edx, y, 340, 22, IDC_AUTORESYNC);
+    g_autoresync = mk(w, "BUTTON", "Auto-resync (experimental; OFF — use Retry to recover a desync)",
+                BS_AUTOCHECKBOX, edx, y, 360, 22, IDC_AUTORESYNC);
     y += row;
 
     mk(w, "STATIC", "th07.exe:", WS_VISIBLE, lblx, y+3, 110, 20, 0);

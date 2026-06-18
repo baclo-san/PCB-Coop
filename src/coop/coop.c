@@ -711,7 +711,14 @@ static int   s_autoSpawned = 0;        /* one-shot auto-spawn latch             
 static int   s_suppressP2  = 0;        /* DIAGNOSTIC: never spawn P2 (desync isolation) */
 static int   s_b2CherryBothFull = 1;   /* B2: power->cherry only when BOTH full (FPU asm; default ON since x87 desync fix) */
 static int   s_fpuGuard    = 0;        /* §8o: firewall the netcode's x87 FPU use (desync fix test) */
-static int   s_netAutoResync = 1;      /* §8r: auto-recover a sustained in-stage desync (resync handshake + reseed); default ON */
+/* §8r: auto-recover a sustained in-stage desync via the th06 resync handshake + a
+ * mid-stage RNG reseed. DEFAULT OFF — a 2-PC test (2026-06-18) PROVED it does NOT fix
+ * PCB's desync: the handshake fires correctly on both sides but the divergence is an
+ * ongoing GAME-STATE fork (mid-stage, cross-platform Wine↔Windows FP), which a reseed
+ * can't undo, so it re-desyncs within ~200 frames and the friend found it WORSE than the
+ * manual retry. Kept (inert) only because the protocol is a correct building block; the
+ * recovery path that actually works is a full scene RESTART (Escape→Give up→Retry). */
+static int   s_netAutoResync = 0;      /* §8r: OFF by default — proven not to fix PCB's mid-stage fork */
 #define COOP_RESYNC_THRESHOLD 180      /* sustained desync frames (~3s) before auto-resync fires */
 #define AUTO_SPAWN_AFTER 30            /* frames of P1 in state 0 after the stage
                                           fly-in, then spawn P2 (user: both players
@@ -1190,11 +1197,10 @@ static void LoadNetConfig(void)
      * game's full x87 state around Nc_GetInputNet) so the lockstep wait's timing math
      * can't perturb ZUN's FP differently on the two machines. Candidate desync fix. */
     s_fpuGuard = (int)GetPrivateProfileIntA("coop", "fpu_guard", 1, ini);  /* CONFIRMED FIX — default ON */
-    /* §8r: auto-resync — when an in-stage desync persists ~3s (the first-run-after-launch
-     * fork), the host agrees a frame with the guest and both clear the misaligned peer
-     * buffer + reseed, the AUTOMATIC form of Escape->Give up->Retry. Inert while synced.
-     * Default ON; set auto_resync=0 to require the manual retry instead. */
-    s_netAutoResync = (int)GetPrivateProfileIntA("coop", "auto_resync", 1, ini);
+    /* §8r: auto-resync — DEFAULT OFF. The 2-PC test proved a mid-stage reseed does not fix
+     * PCB's desync (an ongoing cross-platform game-state fork, not a recoverable frame
+     * offset); the manual scene RESTART is the working recovery. Left as an opt-in flag. */
+    s_netAutoResync = (int)GetPrivateProfileIntA("coop", "auto_resync", 0, ini);
     s_netEnabled = (int)GetPrivateProfileIntA("net", "enabled", 0, ini);
     if (!s_netEnabled) return;
     GetPrivateProfileStringA("net", "role", "host", buf, sizeof(buf), ini);

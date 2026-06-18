@@ -2214,11 +2214,24 @@ in via `Nc_SetAutoResync`). It is **inert while synced** — only counts/acts af
 desynced in-stage frames — so it cannot perturb the confirmed-good steady state. New
 `[coop] auto_resync` flag (default ON) + launcher checkbox (per [[launcher-owns-coop-ini]]).
 
-**Status: BUILT, native netloop_test green; NEEDS 2-PC TEST.** The resync path can't be unit-tested
-(the netcode globals are a single-process singleton — host and guest can't co-exist in one process).
-Test: host+guest, force a first-run fork (the usual cold start). Watch `coop_log.txt` for
-`RESYNC host-initiated: target frame N`, then `RESYNC #1 executed at frame N`, then
-`AUTO-RESYNC reseed at frame N` — and confirm the game returns to sync WITHOUT a manual retry. If a
-resync fires but it re-desyncs immediately (loops every ~3s), the first-run cause is a deeper state
-divergence than a frame offset — set `auto_resync=0` and capture the trace. Tuning: drop the 180f
-threshold (`COOP_RESYNC_THRESHOLD`) for faster recovery if 3s feels long.
+**Status: 2-PC TESTED 2026-06-18 — REJECTED, now DEFAULT OFF.** The premise (first-run = a
+recoverable frame offset) was WRONG. Logs from the Wine(host)↔Windows(guest) pair:
+- The handshake works PERFECTLY: host & guest executed every resync at the SAME frame
+  (1160/1368/2297/2749) and reseeded to the same `0xb9f5` together — the protocol is sound.
+- But it did NOT fix the desync: each reseed re-desynced within ~200 frames (fired 4×). The
+  divergence is an ONGOING game-state fork, not an RNG/input-buffer offset, so a mid-stage reseed
+  can't undo it (it can't move already-diverged enemy/bullet positions back into agreement).
+- The REAL desync onset is MID-STAGE, not at the start barrier: both runs start synced (the
+  frame-4 seed blip self-heals by frame 124), then fork deep in-stage (frame 973 / 632 / 2110)
+  after 10-16 s of clean sync. With the x87 CW pinned and MATCHING (`0x001f`) on both, on a
+  cross-platform Wine↔Windows pair → this is ZUN's own FP math diverging across the two libm/x87
+  implementations, intermittently. NOT a frame offset, NOT a precision-CW mismatch.
+- A full scene RESTART recovers it (the OFF run got a clean synced stage; the friend: "synced
+  after a restart or two"); the mid-stage resync does the one thing a restart doesn't — it keeps
+  the diverged stage running. Friend found ON markedly WORSE than OFF across several attempts.
+
+So: `auto_resync` is now **DEFAULT OFF** (DLL + launcher + ini), the manual retry stays the
+recovery path, and the mechanism is kept only as an inert, opt-in building block. **The real
+frontier is the mid-stage cross-platform FP divergence** (Wine vs Windows transcendental math),
+which is intermittent and recovers on restart — i.e. the [[netplay-desync-x87-fpu]] "mismatched
+setup" hard case, now seen on Wine↔Windows specifically, not just mismatched CPUs.

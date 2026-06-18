@@ -1359,6 +1359,7 @@ static int __fastcall HookedSceneTick(void *self)
             s_netDesyncRun = 0;    s_netHardDesyncLogged = 0;
             s_netStallLogged = 0;  s_netStatLogged = 0;
             s_seedForced = 0;               /* force the shared seed at the first stage */
+            s_menuRepeatCtr = 0;            /* fresh hold-scroll shadow for lockstep menu */
             Nc_Reset();                     /* fresh lockstep maps from frame 0         */
             Log("netplay: LINK UP (handshake done). role=%s delay=%d seed=0x%04x. "
                 "Both inputs from the WIRE; each player picks its own character.",
@@ -1368,6 +1369,17 @@ static int __fastcall HookedSceneTick(void *self)
                 "build. Staying on local P2.");
             s_netVerWarned = 1;
         }
+        /* MENU FREEZE during the handshake: until the link is live, neither machine's
+         * menu may move. ZUN's input task (s_origSceneTick above) already polled the
+         * LOCAL keyboard into g_InputMenu; left alone, each machine navigates on its own
+         * while it waits — and on a real connection that wait is SECONDS (the host sits in
+         * the menu until the guest starts). Whatever each player does in that window moves
+         * only the local cursor and is never reconciled, so when lockstep engages the two
+         * are already on different items/sections (host Normal / guest Lunatic; P1 on the
+         * difficulty list / P2 in Extra). Zeroing g_InputMenu pins BOTH at the identical
+         * startup menu; once LINK UP fires, the merged word (below) drives them together
+         * from a common state. (Loopback links up instantly, so this never bit there.) */
+        *ADDR_INPUT_MENU = 0;
         return r;                           /* no lockstep until connected             */
     }
     if (s_netActive) {

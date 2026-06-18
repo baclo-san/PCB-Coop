@@ -2231,7 +2231,40 @@ recoverable frame offset) was WRONG. Logs from the Wine(host)↔Windows(guest) p
   the diverged stage running. Friend found ON markedly WORSE than OFF across several attempts.
 
 So: `auto_resync` is now **DEFAULT OFF** (DLL + launcher + ini), the manual retry stays the
-recovery path, and the mechanism is kept only as an inert, opt-in building block. **The real
-frontier is the mid-stage cross-platform FP divergence** (Wine vs Windows transcendental math),
-which is intermittent and recovers on restart — i.e. the [[netplay-desync-x87-fpu]] "mismatched
-setup" hard case, now seen on Wine↔Windows specifically, not just mismatched CPUs.
+recovery path, and the mechanism is kept only as an inert, opt-in building block.
+
+### §8s — the "desync" was mostly the MENU, not gameplay FP — menu-freeze fix (2026-06-18)
+
+A second look (prompted by the tester) overturned the §8r "mid-stage FP" framing as the *main*
+problem. Two things were being conflated under "desync", and the gameplay-FP one is largely a
+non-issue in practice:
+
+1. **Gameplay is actually deterministic across mismatched hardware.** The tester reports stage-1→
+   ending **perfect sync** after a single initial restart, on multiple mismatched pairs (Ryzen+Wine ↔
+   Intel+Win over LAN; Ryzen+Win ↔ Ryzen+Wine over the internet at delay 3). A clean `auto_resync=0`
+   log confirms it: both sides ran a whole stage with **no `DESYNC in stage`** (only the frame-4
+   transient that self-heals by 124). If transcendentals genuinely diverged, EVERY run would fork —
+   they don't. So the `fsin/fcos/fpatan` "fix" (a software-trig rewrite) would harden a non-problem;
+   **dropped.** (The mid-stage forks in the §8r ON-run were the auto-resync reseed churn / run-to-run
+   variance, not a systematic FP fork.)
+
+2. **Cosmetic menu-seed mismatch (harmless).** In the title menu both machines just hold their own
+   leftover startup seed (host `0x7df9`, guest `0x7775`), FROZEN with `ctr=0` (no RNG draws). Nothing
+   aligns them until the first game-start SEEDFORCE, after which they match everywhere (menu included)
+   forever. The tester's "numbers finally matched after a restart" is just that first SEEDFORCE — the
+   game was never desynced. (Optional future polish: SEEDFORCE at LINK-UP so the menu numbers match
+   immediately and stop alarming testers. Not done yet.)
+
+3. **REAL menu-navigation desync — FIXED (commit on main 2026-06-18).** Host on Normal / guest on
+   Lunatic; P1 in the difficulty list while P2 is in Extra. Diffing the tester traces showed the
+   **merged input words are byte-identical** on both machines post-link-up — so the lockstep merge is
+   sound; it's the menu *cursor state* that diverged BEFORE lockstep. Code-confirmed cause: during the
+   handshake (`s_netStarted && !s_netActive`), `HookedSceneTick` returns without overriding
+   `g_InputMenu`, so each machine's menu runs on its LOCAL keyboard until link-up, and link-up never
+   resets the cursor. On a real connection the host waits SECONDS for the guest; any navigation in
+   that window moves only the local cursor and is never reconciled → the two engage lockstep already
+   on different items/sections. Loopback links up instantly, which is why it never reproduced locally.
+   **Fix:** zero `g_InputMenu` while handshaking (freeze both menus at the identical startup state)
+   and reset `s_menuRepeatCtr` at LINK UP; once linked, the merged word drives both together. Awaiting
+   a real-connection confirmation. **Lesson: don't theorize the desync class — separate menu vs
+   gameplay, and diff the merged words before blaming the sim.** See [[netplay-desync-x87-fpu]].

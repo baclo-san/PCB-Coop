@@ -1630,6 +1630,54 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
     return r;
 }
 
+/* ---- co-op replay PLAYBACK (§8k) ----------------------------------------------
+ * The record side (above) already tags the header (0x58 block) and the merged input
+ * word carries P2 in its high bits, so a co-op .rpy is complete. Playback needs three
+ * things, all wired here: (1) recover P2's character from the header, (2) auto-spawn the
+ * P2 clone, (3) source P2's input from the REPLAYED word instead of the keyboard/wire.
+ * PCB selects record vs playback by which task it registers (FUN_00442cd0 record /
+ * FUN_00442ee0 playback, PCBdecomp 27968-28003); the chosen mode is stored at
+ * replayMgr+0x44 (0=record, 1=playback). In playback FUN_00442ee0 writes the recorded
+ * 16-bit word into g_InputGameplay, so its HIGH bits ARE P2's recorded input. */
+#define ADDR_REPLAY_MGR  ((void **)0x004b9e48)   /* -> replay manager (NULL until a game)  */
+#define REPLAY_MODE_OFF  0x44                     /* mgr+0x44: 0 record, 1 playback         */
+#define ADDR_REPLAY_LOAD ((LPVOID)0x00443550)     /* FUN_00443550 — playback header consume */
+typedef uint32_t (__fastcall *ReplayLoadFn_t)(void *self);
+static ReplayLoadFn_t s_origReplayLoad = NULL;
+static int s_replayIsCoop   = 0;   /* the loaded replay carries our co-op (0x58) tag       */
+static int s_replayP2Sel    = -1;  /* P2's character recovered from the header             */
+static int s_replayDiffChar = 0;   /* P2 was a different char (header byte 0x5b)           */
+static int s_replayLoadLogged = 0;
+
+static int IsReplayPlayback(void)
+{
+    void *mgr = *ADDR_REPLAY_MGR;
+    return mgr && *(int *)((char *)mgr + REPLAY_MODE_OFF) == 1;
+}
+
+/* FUN_00443550 — playback header-consume task: after it loads the header into self[1],
+ * read our 0x58 co-op block back to recover P2's character. A solo/vanilla replay has no
+ * block -> s_replayIsCoop=0 so we never spawn a phantom P2 over a one-player replay. */
+static uint32_t __fastcall HookedReplayLoad(void *self)
+{
+    uint32_t r = s_origReplayLoad(self);
+    unsigned char *hdr = self ? (unsigned char *)((void **)self)[1] : NULL;
+    if (hdr && hdr[RPY_COOP_OFF] == RPY_COOP_MAG0 && hdr[RPY_COOP_OFF + 1] == RPY_COOP_MAG1) {
+        s_replayIsCoop   = 1;
+        s_replayP2Sel    = (signed char)hdr[RPY_COOP_OFF + 2];
+        s_replayDiffChar = hdr[RPY_COOP_OFF + 3] ? 1 : 0;
+        if (!s_replayLoadLogged) {
+            int n = (s_replayP2Sel >= 0 && s_replayP2Sel <= 5) ? s_replayP2Sel : 0;
+            Log("replay PLAYBACK: co-op replay — P2=%s diffchar=%d (header +0x%02x)",
+                ADDR_SEL_NAMES[n], s_replayDiffChar, RPY_COOP_OFF);
+            s_replayLoadLogged = 1;
+        }
+    } else {
+        s_replayIsCoop = 0;   /* solo/vanilla replay — no phantom P2 */
+    }
+    return r;
+}
+
 /* Move P2's active shots into free slots of P1's authoritative array, then clear
  * them from P2 (ownership transfer). Runs at the END of P2's update each frame,
  * so P2's array is empty by the time the draw chain runs (no double-draw) and
@@ -3149,12 +3197,17 @@ static int __fastcall HookedUpdate(void *self)
 
         PollHotkeys();
 
-        /* auto-spawn shortly after P1 finishes the stage fly-in (state 0) */
+        /* auto-spawn shortly after P1 finishes the stage fly-in (state 0). In replay
+         * PLAYBACK only do so for a co-op replay (header tag present), and pull P2's
+         * character from the header so the clone matches what was recorded. */
         if (!s_autoSpawned && !s_p2) {
-            if (P1Ready() &&
+            int playback = IsReplayPlayback();
+            if ((!playback || s_replayIsCoop) && P1Ready() &&
                 *(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE) == 0) {
                 if (++s_readyFrames == AUTO_SPAWN_AFTER) {
-                    Log("auto-spawn: %d ready frames reached", AUTO_SPAWN_AFTER);
+                    if (playback) { s_p2Sel = s_replayP2Sel; s_allowDiffChar = s_replayDiffChar; }
+                    Log("auto-spawn: %d ready frames reached%s", AUTO_SPAWN_AFTER,
+                        playback ? " (replay playback)" : "");
                     SpawnP2();
                     s_autoSpawned = 1;
                 }
@@ -3168,9 +3221,13 @@ static int __fastcall HookedUpdate(void *self)
             /* INPUT SWAP: P2's update reads g_InputGameplay; point it at P2's
              * own word for the duration, then restore so P1 is unaffected.
              * This is the precise seam the netcode will feed (P2 = high bits). */
-            /* P2's word: from the WIRE under netplay (merged high bits), else
-             * the local keyboard. The swap below is unchanged either way. */
-            uint16_t p2in  = s_netActive ? UnpackP2(s_netMerged) : ReadP2InputLocal();
+            /* P2's word: in replay PLAYBACK from the REPLAYED gameplay word's high bits
+             * (FUN_00442ee0 already wrote the recorded merged word into g_InputGameplay);
+             * under netplay from the WIRE (merged high bits); else the local keyboard.
+             * The swap below is unchanged for all three. */
+            uint16_t p2in  = IsReplayPlayback() ? UnpackP2(*ADDR_INPUT_GAMEPLAY)
+                           : s_netActive        ? UnpackP2(s_netMerged)
+                           : ReadP2InputLocal();
             uint16_t saved = *ADDR_INPUT_GAMEPLAY;
             if (p2in && !s_p2InputLogged) { Log("P2 input read OK: 0x%03x (key path works)", p2in); s_p2InputLogged = 1; }
             if (s_p2Ghost) p2in = 0;    /* ghost: no input at all — MoveGhost drives it */
@@ -3641,6 +3698,8 @@ static void ResetCoopSession(void)
     s_enemyCount    = 0;         /* drop the enemy snapshot (stale ptrs)          */
     s_autoSpawned   = 0;
     s_readyFrames   = 0;
+    s_replayIsCoop  = 0;         /* §8k: forget the last replay's co-op tag        */
+    s_replayLoadLogged = 0;      /* so the next replay re-logs its P2 character     */
     s_p1Ghost       = 0;
     s_p2Ghost       = 0;
     s_runOver       = 0;
@@ -3898,6 +3957,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_DECL_MAKE,      (LPVOID)&HookedDeclMake,      (LPVOID*)&s_origDeclMake)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_DECL_DRAW,      (LPVOID)&HookedDeclDraw,      (LPVOID*)&s_origDeclDraw)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_REPLAY_HDR_INIT,(LPVOID)&HookedReplayHdrInit, (LPVOID*)&s_origReplayHdr)     != MH_OK) return 0;
+    if (MH_CreateHook(ADDR_REPLAY_LOAD,    (LPVOID)&HookedReplayLoad,    (LPVOID*)&s_origReplayLoad)    != MH_OK) return 0; /* §8k playback */
     /* B5: capture the enemy-manager base (FUN_00420620's ECX/param_1) so the boss-spell
      * armour gate reads the LIVE spellcardInfo.isActive at param_1+0x9545c8. The base is
      * non-zero in-game (the absolute-globals assumption was wrong — see HookedEnemyUpdate). */

@@ -4,8 +4,8 @@
 // Winsock + the Pack/CtrlPack structs below, so it ports to th07 verbatim.
 // Link with -lws2_32 (the MSVC #pragma comment(lib) is ignored by mingw ld).
 #pragma once
-#define MULTI_NET_VER 3960
-#define MULTI_NET_VER_S "3.9.6"
+#define MULTI_NET_VER 3970
+#define MULTI_NET_VER_S "3.9.7"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -126,8 +126,14 @@ struct CtrlPack
     };
     InGameCtrlType igc_type[KeyPackFrameNum];
     unsigned short rng_seed[KeyPackFrameNum];
+    // PCB addition: the SENDER's current game difficulty (0..3 main, 4 Extra, 5 Phantasm),
+    // out-of-band metadata carried on every Ctrl_Key packet so the guest can force its own
+    // difficulty global to the HOST's — keeping the two installs' STARTING config identical
+    // (different saved difficulty per install was a confirmed desync: host Normal/guest
+    // Lunatic). -1 = "not set yet". Not part of the lockstep input/RNG; informational only.
+    int sender_diff;
 
-    CtrlPack():frame(0),ctrl_type(Ctrl_No_Ctrl){
+    CtrlPack():frame(0),ctrl_type(Ctrl_No_Ctrl),sender_diff(-1){
         memset(keys,0,sizeof(keys));
     }
 };

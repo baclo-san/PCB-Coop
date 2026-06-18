@@ -720,6 +720,7 @@ static int   s_fpuGuard    = 0;        /* §8o: firewall the netcode's x87 FPU u
  * recovery path that actually works is a full scene RESTART (Escape→Give up→Retry). */
 static int   s_netAutoResync = 0;      /* §8r: OFF by default — proven not to fix PCB's mid-stage fork */
 #define COOP_RESYNC_THRESHOLD 180      /* sustained desync frames (~3s) before auto-resync fires */
+static int   s_diffForcedLogged = 0;   /* §8t: one-shot log when the guest first pins difficulty to host's */
 #define AUTO_SPAWN_AFTER 30            /* frames of P1 in state 0 after the stage
                                           fly-in, then spawn P2 (user: both players
                                           up together at stage start) */
@@ -1089,6 +1090,7 @@ static int s_p2InputLogged = 0;
 #define ADDR_INPUT_MENU ((volatile uint16_t *)0x004b9e4c) /* g_InputMenu (raw poll)    */
 #define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
 #define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
+#define ADDR_DIFFICULTY ((volatile uint32_t *)0x00626280) /* 0..3 main, 4 Extra, 5 Phantasm */
 /* Menu key-REPEAT (hold-to-scroll) state. ZUN's scene-tick (FUN_00437c70 @22803-22816)
  * derives these from the LOCAL keyboard poll, BEFORE our merged-word overwrite — so the
  * cursor's hold-scroll (gated on the repeat flag @PCBdecomp.c:29077) advances a machine-
@@ -1384,6 +1386,25 @@ static int __fastcall HookedSceneTick(void *self)
     }
     if (s_netActive) {
         PinFpuForNetplay();   /* §8q: force matching x87 precision/rounding before the sim runs */
+        /* HOST-AUTHORITATIVE DIFFICULTY (§8t): the two installs can have DIFFERENT saved
+         * difficulty (confirmed desync: host Normal=1 / guest Lunatic=3 in the trace), which
+         * no lockstep can reconcile — different difficulty = different HP/bullets/thresholds.
+         * Report ours on the wire (sent inside Nc_GetInputNet below) and, on the GUEST, pin
+         * the difficulty global to the HOST's so both start identical. Done every frame so the
+         * guest's menu display follows the host and the value is already correct at game start
+         * (HookedSceneTick runs before the stage init reads it). The host is untouched. */
+        Nc_SetLocalDifficulty((int)*ADDR_DIFFICULTY);
+        if (!s_netIsHost) {
+            int hd = Nc_GetPeerDifficulty();
+            if (hd >= 0 && (uint32_t)hd != *ADDR_DIFFICULTY) {
+                if (!s_diffForcedLogged) {
+                    Log("netplay: difficulty pinned to host's (%d -> %d) — guest follows host",
+                        (int)*ADDR_DIFFICULTY, hd);
+                    s_diffForcedLogged = 1;
+                }
+                *ADDR_DIFFICULTY = (uint32_t)hd;
+            }
+        }
         /* START BARRIER / scene-reset — the th06 Supervisor::OnUpdate "last_frame_a >
          * frame_a" realign (Supervisor.cpp), driven here by PCB's top-level scene id
          * at self+0x154. th06's lockstep clock is the game's per-scene calcCount, which
@@ -2632,7 +2653,7 @@ static int __fastcall HookedCollectOverlap(void *self, void *edx, float *pos, fl
  * (The full-power half is per-player only with s_p2SepRes on; otherwise P2 shares
  * P1's power, in which case the engine's own P1 trigger already covers it.) */
 #define ADDR_GAME_CFG_PP ((volatile uint32_t *)0x00575948) /* -> config; +0x20 = collect line Y */
-#define ADDR_DIFFICULTY  ((volatile uint32_t *)0x00626280) /* 0..3 main, 4 Extra, 5 Phantasm    */
+/* ADDR_DIFFICULTY defined near the top with the other pinned globals */
 #define ITEM_STRIDE      0x288
 #define ITEM_OFF_POSX    0x24c
 #define ITEM_OFF_POSY    0x250

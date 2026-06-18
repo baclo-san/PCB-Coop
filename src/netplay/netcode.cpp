@@ -68,6 +68,12 @@ static int   g_resync_stage_frame    = 0;
 // consecutive connected frames), so it cannot perturb a healthy run. Default OFF in the
 // core; the host env (coop.c) opts in via Netcode_SetAutoResync so the native tests stay
 // deterministic. Mirrors RUEEE Supervisor.cpp:124-164.
+// ---- host-authoritative difficulty (keep both installs' STARTING config identical) ----
+// Each machine reports its current difficulty on every Ctrl_Key packet; the guest forces
+// its difficulty global to the host's. Out-of-band metadata, not lockstep state. -1 = none.
+static int   g_local_diff            = -1;     // this machine's difficulty (set by host env each frame)
+static int   g_peer_diff             = -1;     // last difficulty received from the peer
+
 static bool  g_resync_enable         = false;
 static int   g_resync_threshold      = 180;   // sustained desync frames before host acts
 static int   g_resync_desync_run     = 0;     // consecutive connected & !sync frames
@@ -163,6 +169,8 @@ static bool RcvPacks()
                 }
                 continue;   // drain the next datagram; do NOT write rcved slots
             }
+            // peer's current difficulty (out-of-band; the guest forces its global to the host's)
+            if (pack.ctrl.sender_diff >= 0) g_peer_diff = pack.ctrl.sender_diff;
             int frame = pack.ctrl.frame;
             for (int i = 0; i < KeyPackFrameNum; i++)
             {
@@ -203,6 +211,7 @@ static void SendKeys(int frame)
     pack.epoch = g_epoch;                 // stamp the current scene generation
     pack.ctrl.ctrl_type = Ctrl_Key;
     pack.ctrl.frame = frame;
+    pack.ctrl.sender_diff = g_local_diff; // our current difficulty (guest forces to host's)
 
     for (int i = 0; i < KeyPackFrameNum; i++)
     {
@@ -592,6 +601,10 @@ void Netcode_Reset()
     // NB: g_diag_* counters are intentionally NOT reset here — they are cumulative
     // across the whole session so a scene change can't hide a fault.
 }
+
+// ---- host-authoritative difficulty (env sets local each frame; guest reads peer's) ----
+void Netcode_SetLocalDifficulty(int diff) { g_local_diff = diff; }
+int  Netcode_GetPeerDifficulty()          { return g_peer_diff; }
 
 // ---- auto-resync control / poll (host env opts in; polls the realign latch) ----
 void Netcode_SetAutoResync(bool enable, int thresholdFrames)

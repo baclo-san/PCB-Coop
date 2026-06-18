@@ -48,6 +48,12 @@ int  Nc_HandshakeVersionBad(void);
 void Nc_SetAutoResync(int enable, int thresholdFrames);
 int  Nc_PollResyncFired(void);
 
+/* Host-authoritative difficulty: report this machine's difficulty each frame (rides every
+ * key packet); Nc_GetPeerDifficulty returns the peer's latest (-1 if none). The guest
+ * forces its difficulty global to the host's so both installs start the same difficulty. */
+void Nc_SetLocalDifficulty(int diff);
+int  Nc_GetPeerDifficulty(void);
+
 /* Per-frame injection point. Returns the merged 16-bit word both machines agree on
  * for logic-frame `frame`; is_in_UI!=0 -> menu merge (self|rcv), else P1-low/P2-high.
  * out_ctrl receives the resolved in-game control action for this frame. */

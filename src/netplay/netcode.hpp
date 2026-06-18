@@ -60,6 +60,13 @@ void Netcode_SetAutoResync(bool enable, int thresholdFrames);
 // then writes the shared init seed into the game's RNG on this frame so both converge.
 int  Netcode_PollResyncFired();
 
+// ---- host-authoritative difficulty (keep both installs' starting config identical) ----
+// The env reports this machine's current difficulty each frame; it rides every Ctrl_Key
+// packet. GetPeerDifficulty returns the most recent value the PEER sent (-1 if none yet);
+// the guest forces its difficulty global to the host's so both start identical.
+void Netcode_SetLocalDifficulty(int diff);
+int  Netcode_GetPeerDifficulty();
+
 // ---- per-frame entry (the injection point) ----
 // Returns the merged 16-bit word BOTH machines agree on for logic-frame `frame`:
 //   gameplay (is_in_UI=false): P1 = host's low-bit input, P2 = guest's input in high bits.

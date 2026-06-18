@@ -624,7 +624,7 @@ static int __fastcall HookedItemSpawn(void *self, void *edx, float *pos, int typ
      * full-power items skipped when full; only type 1/6 lines => the reward is genuinely
      * point-only here; NO line at all during the capture burst => the boss uses a
      * different spawner / the power drop is decided and dropped entirely upstream. */
-    if (s_b2DiagN < 60) {
+    if (s_b2DiagN < 60 && type != 6) {   /* skip the type-6 bullet-cancel star spam */
         uint32_t res0 = *ADDR_RES_PTR;
         float p1pw = res0 ? *(float *)(res0 + RES_POWER) : -1.f;
         Log("B2 diag spawn #%d: type=%d mode=%d sc=%d capwin=%d suppress=%d p1pow=%.0f p2pow=%.0f diff=%u",
@@ -633,21 +633,26 @@ static int __fastcall HookedItemSpawn(void *self, void *edx, float *pos, int typ
         s_b2DiagN++;
     }
     if (g_b2Suppress) {
-        /* Post-capture refuel (confirmed in-game): when P1 is full the boss substitutes
-         * POINT items (type 1) for the power drop it would otherwise give — the reward
-         * is decided UPSTREAM of this spawner (so the popcorn power-zero below never sees
-         * it). Inside the post-spell-end window, turn that point reward back into power so
-         * a below-full P2 can refuel (crucial on Extra/Phantasm). P1 (full) collecting a
-         * power item still scores points on pickup, so P1 loses nothing meaningful. The
-         * window keeps normal in-stage point items untouched. */
+        /* Post-capture refuel (confirmed in-game + cross-checked vs EoSD
+         * ECL_OPCODE_DROPITEMS, EclManager.cpp:802-817): the boss spell reward loops
+         * SpawnItem; when P1 power < 128 it drops BIG/SMALL POWER, but when P1 is FULL it
+         * substitutes POINT (type 1) for every power item — the decision is UPSTREAM of
+         * this spawner, so the popcorn power-zero below never sees it as 0/2. Inside the
+         * post-spell window, turn that point reward back into a power item so a below-full
+         * P2 can refuel (crucial on Extra/Phantasm). P1 (full) collecting a power item
+         * still scores on pickup, so P1 loses nothing meaningful; the window keeps normal
+         * in-stage point items untouched.
+         *
+         * CRUCIAL: after type=0 we must FALL THROUGH to the power-zero wrapper, not call
+         * the original directly — otherwise SpawnItem's own full-power->cherry conversion
+         * (FUN_004326f0: round(P1pow)>=0x80 && type in {0,2} => 7) re-converts our type-0
+         * straight into a CHERRY (the regression seen 2026-06-18). */
         if (s_captureWin > 0 && type == 1) {
             if (!s_b2RefuelLogged) {
                 Log("B2: post-capture point reward -> power (P2 below full, capwin=%d)", s_captureWin);
                 s_b2RefuelLogged = 1;
             }
-            type = 0;
-            g_b2Suppressed++;
-            return ((ItemSpawnFn_t)g_b2OrigItemSpawn)(self, edx, pos, type, mode);
+            type = 0;   /* now flows into the power-zero block below */
         }
         if (type == 0 || type == 2) {
             uint32_t res = *ADDR_RES_PTR;
@@ -2735,11 +2740,14 @@ static int BossSpellIndexRaw(void)   /* old signal, kept for the diagnostic only
 static int __fastcall HookedEnemyUpdate(void *self)
 {
     s_enemyMgr = (uint32_t)self;
-    int scBefore = SpellcardActive();
     int r = s_origEnemyUpdate(self);
-    /* Open the refuel window when a boss spell ends (active 1->0): the point-substituted
-     * reward drops in the sc=0 gap that follows. Count it down otherwise. */
-    if (scBefore && !SpellcardActive())
+    /* Refuel window: hold it OPEN for the whole boss spell and for CAPTURE_WIN_FRAMES
+     * after it ends. The point-substituted reward (type 1) can land at the capture instant
+     * (sc still 1 mid-update) OR in the sc=0 gap after the bonus animation; spanning both
+     * makes the type-1 -> power conversion fire regardless of which frame it spawns on.
+     * Only the type-1 boss reward is converted (cancel stars are type 6, untouched), and
+     * bosses don't drop type-1 mid-spell, so holding it open across the spell is safe. */
+    if (SpellcardActive())
         s_captureWin = CAPTURE_WIN_FRAMES;
     else if (s_captureWin > 0)
         s_captureWin--;

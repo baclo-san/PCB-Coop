@@ -2143,7 +2143,7 @@ or a binary patch / `fldz`-guarded forward instead.
 
 Three items reported from overnight testing:
 - **Extra boss bomb armour (B5): WORKS** (user-confirmed). No change needed.
-- **Cherry/power on boss spell-capture: ROOT-CAUSED via in-game diag; FIXED (awaiting test).**
+- **Cherry/power on boss spell-capture: FIXED + USER-CONFIRMED 2026-06-18 (commits fef9f19 WIP, 0ba087d fix).**
   The both-full gate worked for regular drops but the boss spell-capture reward still
   gave no power to a below-full P2 — crucial on Extra/Phantasm refuel. Initial theory
   (boss pre-converts power->cherry/type-7) was WRONG and the un-convert it inspired was a
@@ -2159,9 +2159,20 @@ Three items reported from overnight testing:
   Window-gated so in-stage point items are untouched; the reward lands in the `sc=0` gap
   after capture (verified — a new spell's `sc=1` only returns for the next phase). P1 (full)
   collecting the power item still scores points on pickup, so P1 loses nothing meaningful.
-  **Open tuning:** if a capture's reward is ever missed, the window may also need to stay
-  open while `sc=1` (same-frame burst); current evidence says the reward is bonus-delayed.
-- **Proximity focus-hitbox fade: FIXED (awaiting test).** Only the sprite faded; the
+  **Refinement (window):** changed to hold the window open for the WHOLE spell (`sc=1`) plus
+  `CAPTURE_WIN_FRAMES` after, robust whether the reward lands at the capture instant or in the
+  `sc=0` gap.
+  **Cherry REGRESSION + final fix (0ba087d):** the first build dropped CHERRY, not power —
+  `type=1->0` then calling SpawnItem directly re-triggered SpawnItem's OWN full-power->cherry
+  conversion (`FUN_004326f0:20256` — `round(P1pow)>=0x80 && type in {0,2} => 7`) because P1 is
+  full. Fix: after `type=0`, FALL THROUGH to the existing power-zero wrapper (zero `res+0x7c`
+  around the call) so `round(power)=0` and the cherry convert is skipped — identical to the
+  regular-drop path. Cross-checked vs EoSD `ECL_OPCODE_DROPITEMS` (`uth06dos EclManager.cpp:
+  802-817`): boss reward loops SpawnItem, POWER when P1<128, POINT-substituted when full; the
+  power->cherry step is a PCB-only second conversion inside SpawnItem. **User-confirmed working.**
+  The converted reward is SMALL power (type 0); EoSD drops the first as BIG — bump to type 2 if
+  Extra/Phantasm refuel feels too weak.
+- **Proximity focus-hitbox fade: FIXED + USER-CONFIRMED 2026-06-18 (commit fef9f19).** Only the sprite faded; the
   focus RING/hitbox (type-0x18 effect, colour at effect+0x1b8) did not. Cause: the
   fade colour was written in the player UPDATE (`ApplyProximityFade`), but the
   effect-manager's own anm/update task runs in a separate, later task that rewrites

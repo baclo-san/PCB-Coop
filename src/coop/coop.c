@@ -1192,6 +1192,17 @@ static int      s_debugKeys  = 0;          /* coop.ini [coop] debug_keys (item 5
                                               uninitiated player can't fork the sim by accident. */
 static int      s_forceReplayP2 = -1;      /* coop.ini [coop] force_replay_p2: force co-op
                                               playback of a pre-tag-fix replay (-1 = off). */
+static int      s_replayFpuPin = -1;       /* coop.ini [coop] replay_fpu_pin: pin x87 to 24-bit/
+                                              round-nearest during co-op replay PLAYBACK so the sim
+                                              matches the netplay recording's pinned FP environment
+                                              (§8aa). -1 = auto (pin iff the replay was recorded under
+                                              netplay, header 0x5c bit0); 0 = never; 1 = always (for
+                                              old netplay replays that predate the header flag). */
+/* Replay-playback flags read in HookedReplayLoad; declared here (before HookedSceneTick, which
+ * reads them for the §8aa playback FPU pin). IsReplayPlayback() is forward-declared for the same. */
+static int      s_replayIsCoop = 0;        /* the loaded replay carries our co-op (0x58) tag    */
+static int      s_replayNetRecorded = 0;   /* §8aa: recorded under netplay (header 0x5c bit0)   */
+static int      IsReplayPlayback(void);
 /* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
  * per-player char-select FSM under netplay. Both machines compute the same pair. */
 static uint16_t s_netP1Menu  = 0;
@@ -1261,6 +1272,8 @@ static void LoadNetConfig(void)
     s_debugKeys = (int)GetPrivateProfileIntA("coop", "debug_keys", 0, ini);
     /* play back a co-op replay recorded before the tag fix (-1 = off). */
     s_forceReplayP2 = (int)GetPrivateProfileIntA("coop", "force_replay_p2", -1, ini);
+    /* §8aa: pin x87 during co-op replay playback to match a netplay recording's FP env. */
+    s_replayFpuPin = (int)GetPrivateProfileIntA("coop", "replay_fpu_pin", -1, ini);
     /* item 4: per-key overrides for the local-coop P2 binds (blank => keep default). */
     {
         static const char *p2KeyIni[P2K_COUNT] = {
@@ -1376,6 +1389,25 @@ static void PinFpuForNetplay(void)
     }
 }
 
+/* §8aa: same pin, applied during co-op replay PLAYBACK. A netplay .rpy was recorded with
+ * the FPU pinned (above), so its input stream only re-simulates faithfully if playback runs
+ * in the same 24-bit/round-nearest environment. Without it, D3D can leave the control word in
+ * a different precision/rounding than the recording used, so trig-driven aimed enemy shots
+ * drift and the run desyncs after a while ("resembles the moves but not accurately"). Gated by
+ * the header net-recorded flag (or replay_fpu_pin override) so solo/vanilla replays — recorded
+ * WITHOUT a pin — keep their native FP and are never perturbed. */
+static int s_fpuPinnedReplay = 0;
+static void PinFpuForReplay(void)
+{
+    unsigned prev = _controlfp(0, 0);
+    _controlfp(_PC_24 | _RC_NEAR, _MCW_PC | _MCW_RC);
+    if (!s_fpuPinnedReplay) {
+        s_fpuPinnedReplay = 1;
+        Log("replay PLAYBACK: x87 control word pinned to 24-bit/round-nearest (was 0x%04x) — "
+            "matching the netplay recording's FP environment (§8aa).", prev & 0xffff);
+    }
+}
+
 /* DIAGNOSTIC (det-trace) — one CSV row per logic frame while netplay is active.
  * Both machines run the SAME frame indices under lockstep, so diffing the host
  * and guest CSVs by the `frame` column gives the exact frame the sims part ways.
@@ -1439,6 +1471,17 @@ static void SyncMenuRepeat(uint16_t merged)
 static int __fastcall HookedSceneTick(void *self)
 {
     int r = s_origSceneTick(self);          /* ZUN: g_InputMenu = Input_Poll() */
+    /* §8aa: co-op replay PLAYBACK runs with s_netActive=0, so the netplay FPU pin below never
+     * fires — but a NETPLAY .rpy was recorded pinned, so re-simulate it pinned too or it drifts.
+     * Auto (replay_fpu_pin=-1): pin iff the header says it was net-recorded. =1 forces it on (old
+     * netplay replays predating the flag, e.g. th7_10); =0 disables. Solo/local replays (not pinned
+     * at record) stay native. Runs before the sim this frame, same timing as PinFpuForNetplay. */
+    if (IsReplayPlayback()) {
+        int pin = (s_replayFpuPin == 1) ? 1
+                : (s_replayFpuPin == 0) ? 0
+                : (s_replayIsCoop && s_replayNetRecorded);   /* auto (-1) */
+        if (pin) PinFpuForReplay();
+    }
     if (s_netStarted && !s_netActive) {
         /* connection handshake at the front-end: keep pinging until the peer answers,
          * then the link is live (guest has adopted the host's delay+seed). */
@@ -1739,6 +1782,11 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
         hdr[RPY_COOP_OFF + 1] = RPY_COOP_MAG1;
         hdr[RPY_COOP_OFF + 2] = (unsigned char)p2sel;
         hdr[RPY_COOP_OFF + 3] = (unsigned char)(s_allowDiffChar ? 1 : 0);
+        /* §8aa byte 0x5c bit0: this run was recorded UNDER NETPLAY, where the x87 control word
+         * was pinned to 24-bit/round-nearest every frame (PinFpuForNetplay). Playback must
+         * reproduce that FP environment or the sim drifts (trig-driven aimed shots diverge) —
+         * "resembles the moves but desyncs". Local/solo runs leave this 0 (vanilla FP). */
+        hdr[RPY_COOP_OFF + 4] = (unsigned char)(s_netActive ? 0x01 : 0x00);
         if (!s_rpyTagLogged) {
             int n = (p2sel >= 0 && p2sel <= 5) ? p2sel : 0;
             Log("replay: tagged co-op header — P2=%s diff=%d (+0x%02x)",
@@ -1763,7 +1811,7 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
 #define ADDR_REPLAY_LOAD ((LPVOID)0x00443550)     /* FUN_00443550 — playback header consume */
 typedef uint32_t (__fastcall *ReplayLoadFn_t)(void *self);
 static ReplayLoadFn_t s_origReplayLoad = NULL;
-static int s_replayIsCoop   = 0;   /* the loaded replay carries our co-op (0x58) tag       */
+/* s_replayIsCoop + s_replayNetRecorded are declared earlier (before HookedSceneTick). */
 static int s_replayP2Sel    = -1;  /* P2's character recovered from the header             */
 static int s_replayDiffChar = 0;   /* P2 was a different char (header byte 0x5b)           */
 static int s_replayLoadLogged = 0;
@@ -1792,10 +1840,11 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
         s_replayIsCoop   = 1;
         s_replayP2Sel    = (signed char)hdr[RPY_COOP_OFF + 2];
         s_replayDiffChar = hdr[RPY_COOP_OFF + 3] ? 1 : 0;
+        s_replayNetRecorded = (hdr[RPY_COOP_OFF + 4] & 0x01) ? 1 : 0;   /* §8aa */
         if (!s_replayLoadLogged) {
             int n = (s_replayP2Sel >= 0 && s_replayP2Sel <= 5) ? s_replayP2Sel : 0;
-            Log("replay PLAYBACK: co-op replay — P2=%s diffchar=%d (header +0x%02x)",
-                ADDR_SEL_NAMES[n], s_replayDiffChar, RPY_COOP_OFF);
+            Log("replay PLAYBACK: co-op replay — P2=%s diffchar=%d netRec=%d (header +0x%02x)",
+                ADDR_SEL_NAMES[n], s_replayDiffChar, s_replayNetRecorded, RPY_COOP_OFF);
             s_replayLoadLogged = 1;
         }
     } else if (IsReplayPlayback() && s_forceReplayP2 >= 0 && hdr) {
@@ -1805,6 +1854,7 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
         s_replayIsCoop   = 1;
         s_replayP2Sel    = s_forceReplayP2;
         s_replayDiffChar = ((s_forceReplayP2 / 2) != (int)hdr[RPY_P1CHAR_OFF]) ? 1 : 0;
+        s_replayNetRecorded = 0;   /* §8aa: untagged/forced — flag unknown; use replay_fpu_pin=1 */
         if (!s_replayLoadLogged) {
             int n = (s_forceReplayP2 <= 5) ? s_forceReplayP2 : 0;
             Log("replay PLAYBACK: FORCED co-op (force_replay_p2=%d -> P2=%s diffchar=%d, "
@@ -1814,6 +1864,7 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
         }
     } else {
         s_replayIsCoop = 0;   /* solo/vanilla replay — no phantom P2 */
+        s_replayNetRecorded = 0;
         if (IsReplayPlayback() && !s_replayLoadLogged) {  /* why a replay didn't recover P2 */
             Log("replay PLAYBACK: NO co-op tag at +0x%02x (bytes %02x %02x) — solo/vanilla "
                 "or recorded pre-fix (set [coop] force_replay_p2 to spawn P2 anyway)",
@@ -4052,6 +4103,8 @@ static void ResetCoopSession(void)
     s_autoSpawned   = 0;
     s_readyFrames   = 0;
     s_replayIsCoop  = 0;         /* §8k: forget the last replay's co-op tag        */
+    s_replayNetRecorded = 0;     /* §8aa: forget last replay's net-recorded/FPU flag */
+    s_fpuPinnedReplay = 0;       /* re-log the replay FPU pin for the next replay    */
     s_replayLoadLogged = 0;      /* so the next replay re-logs its P2 character     */
     s_p1Ghost       = 0;
     s_p2Ghost       = 0;

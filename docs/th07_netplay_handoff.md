@@ -2507,7 +2507,37 @@ same static instead of re-polling — so the word saved to the `.rpy` is byte-id
 this frame (**record == live == playback**). `HookedFrameTask` always runs before the player update (the
 record task must copy `g_InputMenu`→`g_InputGameplay` before the player reads it), so the static is fresh.
 
-**Important:** old `.rpy` files (incl. the tester's `th7_10.rpy` / the round-2 MarisaB recording) were made
-*before* this seam existed, so they still hold no P2 input — they can't be rescued. **A replay recorded with
-THIS build will carry P2.** Test: record a fresh local co-op run, play it back, confirm P2 reproduces its run
-to the end without desync. Build green, native test green (16/16).
+**Important:** old LOCAL `.rpy` files made *before* this seam existed hold no P2 input — they can't be
+rescued. **A LOCAL replay recorded with THIS build will carry P2.** (NETPLAY replays already carried P2 —
+see §8aa.) Build green, native test green (16/16).
+
+### §8aa — NETPLAY replay playback desync: the FPU wasn't pinned on playback (2026-06-19)
+
+Tester correction: `th7_10.rpy` is a **NETPLAY** replay, and on playback **P2 does move and bomb matching
+the real P2** — so P2's input IS recorded (netplay merges it into `g_InputMenu` via `HookedSceneTick`, as
+designed; §8z was the *local* gap). The symptom is subtler: "resembles his moves but **not as accurately**,
+desyncs and doesn't go far." That's **simulation FP drift**, not missing input.
+
+**Root cause:** the §8q x87 control-word pin (`PinFpuForNetplay`, 24-bit/round-nearest every frame) is
+gated on `s_netActive`. A netplay run is recorded **with the pin active**, so its input stream only
+re-simulates faithfully in that same FP environment. On **replay playback `s_netActive`==0**, so nothing
+pins the FPU — D3D can leave the control word in a different precision/rounding than the recording used.
+Player movement is FP-robust (tracks the recorded input), but **trig-driven aimed enemy shots diverge**, so
+the run forks once aimed enemies appear — exactly "resembles but not accurate, doesn't go far." Verified the
+other netplay determinism measures (seed force line 1666, host-authoritative difficulty) ARE correctly
+gated on `s_netActive` and so the replay's own header values drive them on playback — the FPU pin was the
+sole gap.
+
+**Fix (coop.c):** (1) record a flag in the co-op header **byte 0x5c bit0 = "recorded under netplay"**
+(`s_netActive` at record time) in `HookedReplayHdrInit`; (2) read it back in `HookedReplayLoad` →
+`s_replayNetRecorded`; (3) in `HookedSceneTick`, during `IsReplayPlayback()`, call `PinFpuForReplay()`
+(same 24-bit/round-nearest pin) when the replay was net-recorded. New coop.ini knob
+**`replay_fpu_pin`** (-1 auto = follow the header flag [default]; 0 never; 1 always) — `=1` plays back an
+OLD netplay replay that predates the flag (e.g. `th7_10`). Solo/local replays write 0x5c=0 and are never
+pinned (recorded native). NOT added to the launcher: it writes coop.ini per-key (`WritePrivateProfileString`),
+so a hand-set `replay_fpu_pin=1` survives launches, and AUTO needs no ini entry.
+
+**Tests:** (a) cleanest — record a FRESH netplay co-op replay with this build, play it back: header flag
+auto-pins, run should reproduce to the end. Log: `replay PLAYBACK: ... netRec=1` then `x87 control word
+pinned ... (§8aa)`. (b) the existing `th7_10`: set `[coop] replay_fpu_pin = 1`, play it back, confirm it
+holds together far longer. Build green, native test green (16/16).

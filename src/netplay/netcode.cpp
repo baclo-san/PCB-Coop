@@ -106,6 +106,13 @@ static unsigned short g_stat_self_rng = 0;
 static unsigned short g_stat_rcv_rng  = 0;
 static int            g_stat_wait_ms   = 0;
 
+// Ping / RTT (item 3). Echo model, no clock sync needed: every outgoing pack carries
+// sendTick = our GetTickCount64() and echoTick = the peer's most-recent sendTick we saw.
+// When a pack comes back carrying echoTick, that value is OUR earlier sendTick, so
+// rtt = now - echoTick is the full round-trip measured entirely in our own clock.
+static unsigned long long g_peer_last_sendTick = 0;   // peer tick to echo back
+static int                g_stat_ping_ms       = -1;  // smoothed RTT, ms (-1 = unknown)
+
 // DIAGNOSTIC: the exact frame index GetKeys read this tick and the raw self/rcv
 // words it merged, plus how the peer's input was obtained (0=present immediately,
 // 1=arrived after a wait, 2=timed out / defaulted to 0). A host-vs-guest diff of
@@ -149,6 +156,19 @@ static bool RcvPacks()
         hasdata_all |= hasdata;
         if (!hasdata)
             return hasdata_all;
+
+        // PING/RTT (item 3): remember the peer's clock to echo, and if this pack echoes
+        // OUR tick back, the round-trip is now - echoTick (our clock). EWMA-smooth it.
+        // Out-of-band — never touches the lockstep input/RNG. Done for ALL packs so the
+        // readout stays live even across scene-stale (epoch-dropped) key packets.
+        if (pack.sendTick) g_peer_last_sendTick = pack.sendTick;
+        if (pack.echoTick) {
+            unsigned long long now = GetTickCount64();
+            if (now >= pack.echoTick) {
+                int rtt = (int)(now - pack.echoTick);
+                g_stat_ping_ms = (g_stat_ping_ms < 0) ? rtt : (g_stat_ping_ms * 3 + rtt) / 4;
+            }
+        }
 
         if (pack.ctrl.ctrl_type == Ctrl_Key)
         {
@@ -209,6 +229,8 @@ static void SendKeys(int frame)
     Pack pack;
     pack.type = 4;
     pack.epoch = g_epoch;                 // stamp the current scene generation
+    pack.sendTick = GetTickCount64();     // ping (item 3): our clock now
+    pack.echoTick = g_peer_last_sendTick; // ...and echo the peer's latest tick back
     pack.ctrl.ctrl_type = Ctrl_Key;
     pack.ctrl.frame = frame;
     pack.ctrl.sender_diff = g_local_diff; // our current difficulty (guest forces to host's)
@@ -632,6 +654,7 @@ void Netcode_GetLastSplit(unsigned short& p1, unsigned short& p2)
 int Netcode_GetNetFrame() { return g_netFrame; }
 void Netcode_GetSyncStats(unsigned short& selfRng, unsigned short& rcvRng, int& waitMs)
 { selfRng = g_stat_self_rng; rcvRng = g_stat_rcv_rng; waitMs = g_stat_wait_ms; }
+int Netcode_GetPing() { return g_stat_ping_ms; }   // smoothed RTT ms (item 3); -1 = unknown
 
 void Netcode_GetReadStats(int& readFrame, unsigned short& selfKey,
                           unsigned short& rcvKey, int& rcvStatus)

@@ -92,6 +92,7 @@ void Netcode_GetLastSplit(unsigned short& p1, unsigned short& p2);
 // (climbs toward the 5s timeout when the lockstep is stalling).
 int  Netcode_GetNetFrame();
 void Netcode_GetSyncStats(unsigned short& selfRng, unsigned short& rcvRng, int& waitMs);
+int  Netcode_GetPing();   // smoothed round-trip latency in ms (-1 until measured)
 
 // DIAGNOSTIC: GetKeys internals from the last frame — the read frame index
 // (frame - delay), the raw self/rcv words it merged, and how the peer's input

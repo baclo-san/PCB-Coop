@@ -77,6 +77,8 @@ void Nc_GetLastSplit(unsigned short* p1, unsigned short* p2);
  * the lockstep stalls; ~0 when healthy). */
 int  Nc_GetNetFrame(void);
 void Nc_GetSyncStats(unsigned short* selfRng, unsigned short* rcvRng, int* waitMs);
+/* Smoothed round-trip latency in ms for the in-game ping readout (-1 until measured). */
+int  Nc_GetPing(void);
 
 /* DIAGNOSTIC: last frame's GetKeys internals — readFrame = the index it read
  * (netcode frame - delay); selfKey/rcvKey = the raw words merged; rcvStatus =

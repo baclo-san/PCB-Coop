@@ -787,6 +787,10 @@ static int   s_perPlayerAim = 1;       /* per-player homing/aim source (default 
 static int   s_hideP2Portrait   = 1;   /* hide P2's wrong bomb face (default on)   */
 static int   s_declSuppressFace = 0;   /* live declaration is a different-char P2's*/
 static int   s_declSuppressLogged = 0;
+/* §8b diagnostic: instrumented P2 face-anm load (coop.ini [coop] p2_face_diag).
+ * Default off; when on, probes the correct-face load once per P2 char and logs
+ * who corrupts the 0x400 player window (see LoadP2FaceDiag). Pure read-only. */
+static int   s_p2FaceDiag       = 0;
 
 /* ---- P2 SHOT-TYPE SELECT (charselect stage 1: same character, own A/B) ----
  * The engine keeps the chosen loadout in three globals and a per-player cache:
@@ -1181,6 +1185,11 @@ static void LoadNetConfig(void)
      * intended co-op look; set proximity_fade=0 in coop.ini to disable. */
     s_proxFade = (int)GetPrivateProfileIntA("coop", "proximity_fade", 1, ini);
     s_disableDemo = (int)GetPrivateProfileIntA("coop", "disable_demo", 1, ini);
+    /* §8b: instrumented diagnostic for the open correct-P2-face goal. Default OFF —
+     * when 1, a different-char P2's stage-start loads its face anm into a spare slot,
+     * logs the 0x400-corruption fingerprint §8b needs, then fully restores + frees.
+     * The shipped suppression baseline is untouched whether this is on or off. */
+    s_p2FaceDiag = (int)GetPrivateProfileIntA("coop", "p2_face_diag", 0, ini);
     /* N2: damper mode. 0 = flat 0.75 on all enemies; 1 = boss-only 0.60 (stage full). */
     s_damperBossOnly = (int)GetPrivateProfileIntA("coop", "damper_boss_only", 0, ini);
     /* DIAGNOSTIC: suppress the P2 entity entirely (no auto-spawn, F9 no-ops). Lets a
@@ -1852,6 +1861,155 @@ static void FreeP2CharAnm(void)
     s_anmSwapped = 0;
 }
 
+/* ---- §8b DIAGNOSTIC: instrumented P2 face-anm load (default off) ----
+ * The open §8b goal is the CORRECT bomb-declaration face for a different-char P2.
+ * Two prior blind attempts loaded data/face_{rm,mr,sk}00.anm and corrupted the
+ * 0x400 player table (P1 -> glyph sprites, P2 invisible, crash on fire) even though
+ * the face id window [0x4a0,0x4ad) is disjoint from the player's [0x400,0x4a0).
+ * Static analysis of the loader (FUN_0044df90) shows a base-0x4a0 load can only
+ * write RISING ids/slots, so it cannot touch 0x400 directly — the corruption must
+ * arrive through the slot FREE's recursive zero + global sprite-cache reset
+ * (FUN_0044e4e0, mgr+0x2e4cc/0x2e4d0..2). The handoff (§8b) is explicit: do NOT
+ * retry the swap blind; first INSTRUMENT the load to catch who writes 0x400.
+ *
+ * This does exactly that and nothing else. Behind coop.ini [coop] p2_face_diag=1,
+ * once per P2 character, at the clean stage-start point (right after the proven
+ * char-anm load, tables in P1's rest state), it loads P2's face into a spare
+ * non-engine slot at base 0x4a0 and logs the three §8b data points:
+ *   (1) the slot's consumed chain span (does the face chain past [0x4a0,0x4ad)?),
+ *   (2) the player window 0x400.. script/rev/sprite BEFORE vs AFTER the load — the
+ *       smoking gun for the corruption, and whether it's the load or only the free,
+ *   (3) the actual id span the face anm defines.
+ * It then FULLY restores every touched table and frees the slot — a pure read-only
+ * probe that leaves engine state pristine, so the shipped suppression baseline is
+ * unaffected whether this flag is on or off. Once the log pins the 0x400 writer,
+ * the real correct-face swap (LoadP2FaceAnm + SwapFace, mirroring LoadP2CharAnm/
+ * SwapAnm) can be built against a known cause instead of guessing. */
+#define FACE_ID_LO    0x4a0
+#define FACE_ID_HI    0x4e0           /* > P1's [0x4a0,0x4ad): catches any chaining  */
+#define FACE_MAX_IDS  (FACE_ID_HI - FACE_ID_LO)
+#define PLY_ID_LO     0x400           /* the window §8b reports getting corrupted    */
+#define PLY_ID_HI     0x410
+#define PLY_MAX_IDS   (PLY_ID_HI - PLY_ID_LO)
+
+static int s_p2FaceDiagDone = -1;     /* charId already probed this game; -1 = none  */
+
+static void LoadP2FaceDiag(int charId)
+{
+    static const char *const faceNames[3] =
+        { "data/face_rm00.anm", "data/face_mr00.anm", "data/face_sk00.anm" };
+    uint32_t mgr = *ADDR_ANM_MGR_PP;
+    char *scr, *spr, *rev, *slt;
+    int slot, i, rc;
+    uint32_t fScript[FACE_MAX_IDS], fRev[FACE_MAX_IDS];
+    uint32_t pScriptB[PLY_MAX_IDS], pRevB[PLY_MAX_IDS];
+    static unsigned char pSprB[PLY_MAX_IDS][ANM_SPRITE_STRIDE];
+    static unsigned char fSprS[FACE_MAX_IDS][ANM_SPRITE_STRIDE];
+
+    if (charId < 0 || charId > 2 || !mgr) return;
+
+    scr = (char *)(mgr + ANM_SCRIPT_TBL);
+    spr = (char *)(mgr + ANM_SPRITE_TBL);
+    rev = (char *)(mgr + ANM_REV_TBL);
+    slt = (char *)(mgr + ANM_SLOT_TBL);
+
+    /* a free slot the ENGINE never loads into (the face's own engine slot is 0x19;
+     * reusing any engine slot would be yanked out from under us — see kGameAnmSlots) */
+    slot = -1;
+    for (i = 0x30; i >= 0x02; i--) {
+        if (IsGameAnmSlot(i)) continue;
+        if (*(uint32_t *)(slt + i * 0xc) == 0) { slot = i; break; }
+    }
+    if (slot < 0) { Log("[face-diag] no free non-engine slot"); return; }
+
+    /* (2-before) snapshot the player window + the whole face window */
+    for (i = 0; i < PLY_MAX_IDS; i++) {
+        pScriptB[i] = *(uint32_t *)(scr + (PLY_ID_LO + i) * 4);
+        pRevB[i]    = *(uint32_t *)(rev + (PLY_ID_LO + i) * 4);
+        memcpy(pSprB[i], spr + (PLY_ID_LO + i) * ANM_SPRITE_STRIDE, ANM_SPRITE_STRIDE);
+    }
+    for (i = 0; i < FACE_MAX_IDS; i++) {
+        fScript[i] = *(uint32_t *)(scr + (FACE_ID_LO + i) * 4);
+        fRev[i]    = *(uint32_t *)(rev + (FACE_ID_LO + i) * 4);
+        memcpy(fSprS[i], spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE, ANM_SPRITE_STRIDE);
+    }
+
+    rc = ADDR_ANM_LOAD_FN((void *)mgr, slot, faceNames[charId], FACE_ID_LO);
+
+    /* (1) consumed-chain span for our slot vs the engine's own face slot 0x19
+     * (the per-slot span the loader writes at mgr+0x2def8+slot*0xc, = ANM_SLOT_TBL+8) */
+    Log("[face-diag] %s -> slot %d rc=%d  chain-span=%u (engine slot0x19 span=%u)",
+        faceNames[charId], slot, rc,
+        *(uint32_t *)(slt + slot * 0xc + 8),
+        *(uint32_t *)(slt + 0x19 * 0xc + 8));
+
+    /* (2-after) re-read the player window — report exactly who/what the load moved */
+    {
+        int changed = 0;
+        for (i = 0; i < PLY_MAX_IDS; i++) {
+            uint32_t curS = *(uint32_t *)(scr + (PLY_ID_LO + i) * 4);
+            uint32_t curR = *(uint32_t *)(rev + (PLY_ID_LO + i) * 4);
+            int sprChg = memcmp(spr + (PLY_ID_LO + i) * ANM_SPRITE_STRIDE,
+                                pSprB[i], ANM_SPRITE_STRIDE) != 0;
+            if (curS != pScriptB[i] || curR != pRevB[i] || sprChg) {
+                Log("[face-diag] !! PLAYER id 0x%x CHANGED by face LOAD: "
+                    "script %08x->%08x  rev %08x->%08x  spr %s",
+                    PLY_ID_LO + i, pScriptB[i], curS, pRevB[i], curR,
+                    sprChg ? "DIFF" : "same");
+                changed++;
+            }
+        }
+        if (!changed)
+            Log("[face-diag] player window 0x%x..0x%x UNCHANGED by the LOAD "
+                "(=> corruption, if any, is the slot FREE)", PLY_ID_LO, PLY_ID_HI - 1);
+    }
+
+    /* (3) the actual id span the face anm defines (diff vs the pre-load snapshot) */
+    {
+        int lo = -1, hi = -1, n = 0;
+        for (i = 0; i < FACE_MAX_IDS; i++) {
+            uint32_t curS = *(uint32_t *)(scr + (FACE_ID_LO + i) * 4);
+            int sprChg = memcmp(spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE,
+                                fSprS[i], ANM_SPRITE_STRIDE) != 0;
+            if (curS != fScript[i] || sprChg) {
+                if (lo < 0) lo = FACE_ID_LO + i;
+                hi = FACE_ID_LO + i;
+                n++;
+            }
+        }
+        Log("[face-diag] face defines %d ids in [0x%x..0x%x] (P1 face uses 0x4a0..0x4ac)",
+            n, lo < 0 ? 0 : lo, hi < 0 ? 0 : hi);
+    }
+
+    /* restore the face + player windows (memory) ... */
+    for (i = 0; i < FACE_MAX_IDS; i++) {
+        *(uint32_t *)(scr + (FACE_ID_LO + i) * 4) = fScript[i];
+        *(uint32_t *)(rev + (FACE_ID_LO + i) * 4) = fRev[i];
+        memcpy(spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE, fSprS[i], ANM_SPRITE_STRIDE);
+    }
+    for (i = 0; i < PLY_MAX_IDS; i++) {
+        *(uint32_t *)(scr + (PLY_ID_LO + i) * 4) = pScriptB[i];
+        *(uint32_t *)(rev + (PLY_ID_LO + i) * 4) = pRevB[i];
+        memcpy(spr + (PLY_ID_LO + i) * ANM_SPRITE_STRIDE, pSprB[i], ANM_SPRITE_STRIDE);
+    }
+    /* ... then free our slot and restore once more (the free zeroes the slot's ids
+     * and resets the global sprite caches — the same proven order FreeP2CharAnm uses). */
+    if (rc == 0) {
+        ADDR_ANM_FREE_FN((void *)mgr, slot);
+        for (i = 0; i < FACE_MAX_IDS; i++) {
+            *(uint32_t *)(scr + (FACE_ID_LO + i) * 4) = fScript[i];
+            *(uint32_t *)(rev + (FACE_ID_LO + i) * 4) = fRev[i];
+            memcpy(spr + (FACE_ID_LO + i) * ANM_SPRITE_STRIDE, fSprS[i], ANM_SPRITE_STRIDE);
+        }
+        for (i = 0; i < PLY_MAX_IDS; i++) {
+            *(uint32_t *)(scr + (PLY_ID_LO + i) * 4) = pScriptB[i];
+            *(uint32_t *)(rev + (PLY_ID_LO + i) * 4) = pRevB[i];
+            memcpy(spr + (PLY_ID_LO + i) * ANM_SPRITE_STRIDE, pSprB[i], ANM_SPRITE_STRIDE);
+        }
+        Log("[face-diag] slot %d freed; face + player windows restored", slot);
+    }
+}
+
 /* Exchange the 0x400-range table entries between P1's (live) and P2's captured
  * char for exactly the ids P2 defines. enter=1 installs P2, enter=0 restores
  * P1. Re-entrancy-guarded; only acts while P2 has a different-char anm.
@@ -1946,6 +2104,12 @@ static void ApplyP2Selection(void *p2)
     if (sel / 2 != p1sel / 2) {
         if (LoadP2CharAnm(sel / 2)) {
             s_p2AnmActive = 1;
+            /* §8b probe (opt-in, once per char): log the correct-face load's
+             * 0x400-corruption fingerprint, then self-restore. No gameplay effect. */
+            if (s_p2FaceDiag && s_p2FaceDiagDone != sel / 2) {
+                LoadP2FaceDiag(sel / 2);
+                s_p2FaceDiagDone = sel / 2;
+            }
         } else {
             Log("P2 loadout: char anm load failed -> falling back to P1's char");
             sel = (p1sel & ~1) | (sel & 1);
@@ -3830,6 +3994,7 @@ static int __fastcall HookedMenuDispatch(void *menuv)
                 if (s_p1Type < 0 || s_p1Type > 1) s_p1Type = 0;
                 *ADDR_TYPE_ID = (unsigned char)s_p1Type;   /* what orig would store  */
                 s_p2Sel = -1;                 /* fresh P2 selection for this game    */
+                s_p2FaceDiagDone = -1;        /* re-run the §8b face probe this game */
                 s_allowDiffChar = 0;
                 MenuGotoState(menu, state - 1);            /* 6->5, 0xe->0xd          */
                 s_coopMenu = CM_P2_CHAR;

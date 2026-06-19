@@ -1550,7 +1550,7 @@ Implementation pointers (RE first, don't guess offsets):
   sprite ids; the icons live in the front/HUD anm (`front.anm`, slot 0x15, base
   0x600 — see the FUN_0044df90 table). Resolve the real ids from the decomp.
 
-### 8b — Bomb-declaration portrait for a different-char P2  **[RESOLVED via SUPPRESSION 2026-06-15 (commit ec1955f); correct-face load still open]**
+### 8b — Bomb-declaration portrait for a different-char P2  **[SUPPRESSION SHIPPED 2026-06-15 (ec1955f); correct-face load: INSTRUMENTED PROBE wired 2026-06-19, awaiting one live run]**
 **Shipped fallback (user-accepted): hide the wrong face instead of loading P2's.**
 A different-char P2's bomb declaration showed P1's face; rather than load P2's face
 (the unsolved glyph problem below), we now HIDE just the face for a P2 declaration
@@ -1615,6 +1615,32 @@ by GLOBAL char id `DAT_0062f645`; player face id window starts 0x4a0; created by
 `FUN_0042868d` (bomb cb, sets sprite + UV at set-time, sets `DAT_00575ab4`); drawn by
 `FUN_0042c577`; ownership attributable by hooking `FUN_0042868d`. LOW priority / polish;
 needs live iteration — do not retry blind.
+
+**INSTRUMENTED PROBE SHIPPED (2026-06-19, branch `claude/p2-bomb-portrait-m72hf7`) — the
+"don't retry blind" step is now wired; awaiting one live run.** `LoadP2FaceDiag` (coop.c,
+right after `FreeP2CharAnm`) is the exact instrumentation this note asks for, gated behind
+`coop.ini [coop] p2_face_diag=1` (default 0) and run **once per P2 character** at the clean
+stage-start point (right after the proven `LoadP2CharAnm`, tables in P1's rest state).
+It is a **pure read-only probe**: loads `data/face_{rm,mr,sk}00.anm` into a spare non-engine
+slot at base 0x4a0, logs the three data points, then fully restores the face *and* player
+windows and frees the slot — so the shipped suppression baseline is untouched on or off, and
+even with the flag on the visible behaviour is unchanged (wrong face still suppressed). The
+log lines (`coop_log.txt`, prefix `[face-diag]`) give:
+  1. `chain-span=N (engine slot0x19 span=M)` — whether `face_*00.anm` chains past
+     [0x4a0,0x4ad) (per-slot count the loader writes at `mgr+0x2def8+slot*0xc`, confirmed
+     via `FUN_0044df90` 32762-32772);
+  2. per-id `!! PLAYER id 0x40N CHANGED by face LOAD: script .. rev .. spr ..`, or
+     `player window 0x400..0x40f UNCHANGED by the LOAD (=> corruption, if any, is the slot
+     FREE)` — this **disambiguates load-vs-free as the 0x400 corruptor**, the open question;
+  3. `face defines N ids in [0x4a0..0x4??]` — the true face id span (sizes the capture window).
+Static read of the loader already says a base-0x4a0 load can only write RISING ids/slots, so
+the prime suspect is the slot FREE's recursive zero + global sprite-cache reset
+(`FUN_0044e4e0`, `mgr+0x2e4cc/0x2e4d0..2`). The probe confirms or refutes that on the next
+run. **Next step (once the log is in hand):** if the LOAD line shows 0x400 untouched and the
+FREE is the culprit, the real fix is to snapshot+restore the global sprite caches
+(`0x2e4cc/0x2e4d0..2`) around the face slot free (and widen the capture window to the logged
+span), then build `LoadP2FaceAnm` + `SwapFace` mirroring `LoadP2CharAnm`/`SwapAnm`. Do NOT
+enable the swap until that one diagnostic run is read.
 
 ### 8c — SakuyaA cross-char per-player aim source  **[IMPLEMENTED + USER-CONFIRMED 2026-06-15 (§5j, commit 1789e0e)]**
 SakuyaA's aimed shot used an aim target filled by the enemy update keyed off the

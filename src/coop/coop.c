@@ -721,9 +721,13 @@ static int   s_fpuGuard    = 0;        /* §8o: firewall the netcode's x87 FPU u
 static int   s_netAutoResync = 0;      /* §8r: OFF by default — proven not to fix PCB's mid-stage fork */
 #define COOP_RESYNC_THRESHOLD 180      /* sustained desync frames (~3s) before auto-resync fires */
 static int   s_diffForcedLogged = 0;   /* §8t: one-shot log when the guest first pins difficulty to host's */
-#define AUTO_SPAWN_AFTER 30            /* frames of P1 in state 0 after the stage
-                                          fly-in, then spawn P2 (user: both players
-                                          up together at stage start) */
+#define AUTO_SPAWN_AFTER 2             /* frames of P1 in state 0 after the stage
+                                          fly-in, then spawn P2 (item 2: spawn P2
+                                          as good as immediately with P1 — was 30).
+                                          Stays frame-counted, so it's deterministic
+                                          on both machines under netplay. (True
+                                          co-fly-in would need P2 its own fly-in;
+                                          deferred — this just removes the ~0.5s gap.) */
 
 /* HOMING TARGET: the per-enemy update writes the frame's chosen homing target
  * position ONLY into the static P1's field (absolute DAT_004bff00/04 =
@@ -1033,20 +1037,56 @@ static int P1Ready(void)
  * P2 word; the swap mechanism below is exactly what the netcode will drive. */
 static int Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-/* P2 local-coop binds: WASD move (left hand), right hand on the actions.
+/* P2 local-coop binds (item 4): WASD move (left hand), right hand on the actions.
  * WASD chosen over IJKL per player feedback ("WASD is free real estate"). P1 uses
  * arrows+Z/X/Shift, so W/A/D don't collide; S/D do alias menu keys (0x400/0x2000)
- * but gameplay reads only the low 9 bits, and the menu pass is overridden per-player. */
+ * but gameplay reads only the low 9 bits, and the menu pass is overridden per-player.
+ *
+ * Each bind is a Win32 virtual-key code, overridable per-key from coop.ini [coop]
+ * (p2_up/p2_down/p2_left/p2_right/p2_shoot/p2_focus/p2_bomb — see ParseVk). The
+ * SHIPPED DEFAULTS move FOCUS+BOMB to the adjacent O/P pair (was U/O, split by I)
+ * so a two-finger right hand reaches both, per the user's "OP" ask. */
+enum { P2K_UP, P2K_DOWN, P2K_LEFT, P2K_RIGHT, P2K_SHOOT, P2K_FOCUS, P2K_BOMB, P2K_COUNT };
+static int s_p2Keys[P2K_COUNT] = { 'W', 'S', 'A', 'D', VK_SPACE, 'O', 'P' };
+
+/* Parse a coop.ini key token into a virtual-key code, falling back to `def` on an
+ * empty/unknown token. Accepts: a single letter/digit (VK == uppercase ASCII for
+ * A-Z/0-9), a friendly name (SPACE, COMMA, PERIOD, SEMICOLON, SLASH, LBRACKET,
+ * RBRACKET, MINUS, PLUS, SHIFT, CTRL, ALT, ENTER, TAB, UP/DOWN/LEFT/RIGHT), or a
+ * raw number ("0xBC" / "188") for any VK not otherwise named. */
+static int ParseVk(const char *s, int def)
+{
+    static const struct { const char *n; int vk; } tbl[] = {
+        {"SPACE",VK_SPACE},{"COMMA",VK_OEM_COMMA},{"PERIOD",VK_OEM_PERIOD},
+        {"SEMICOLON",VK_OEM_1},{"SLASH",VK_OEM_2},{"LBRACKET",VK_OEM_4},
+        {"RBRACKET",VK_OEM_6},{"MINUS",VK_OEM_MINUS},{"PLUS",VK_OEM_PLUS},
+        {"SHIFT",VK_SHIFT},{"CTRL",VK_CONTROL},{"ALT",VK_MENU},{"ENTER",VK_RETURN},
+        {"TAB",VK_TAB},{"UP",VK_UP},{"DOWN",VK_DOWN},{"LEFT",VK_LEFT},{"RIGHT",VK_RIGHT},
+    };
+    int i;
+    if (!s || !s[0]) return def;
+    if (!s[1]) {                                   /* single character */
+        char c = s[0];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        return (unsigned char)c;                   /* A-Z / 0-9 / SPACE map VK==ASCII */
+    }
+    if (s[0] >= '0' && s[0] <= '9')                /* multi-char number -> raw VK */
+        return (int)strtol(s, NULL, 0);
+    for (i = 0; i < (int)(sizeof(tbl)/sizeof(tbl[0])); i++)
+        if (_stricmp(s, tbl[i].n) == 0) return tbl[i].vk;
+    return def;
+}
+
 static uint16_t ReadP2InputLocal(void)
 {
     uint16_t w = 0;
-    if (Down('W'))      w |= IN_UP;
-    if (Down('S'))      w |= IN_DOWN;
-    if (Down('A'))      w |= IN_LEFT;
-    if (Down('D'))      w |= IN_RIGHT;
-    if (Down(VK_SPACE)) w |= IN_SHOOT;
-    if (Down('U'))      w |= IN_FOCUS;
-    if (Down('O'))      w |= IN_BOMB;
+    if (Down(s_p2Keys[P2K_UP]))    w |= IN_UP;
+    if (Down(s_p2Keys[P2K_DOWN]))  w |= IN_DOWN;
+    if (Down(s_p2Keys[P2K_LEFT]))  w |= IN_LEFT;
+    if (Down(s_p2Keys[P2K_RIGHT])) w |= IN_RIGHT;
+    if (Down(s_p2Keys[P2K_SHOOT])) w |= IN_SHOOT;
+    if (Down(s_p2Keys[P2K_FOCUS])) w |= IN_FOCUS;
+    if (Down(s_p2Keys[P2K_BOMB]))  w |= IN_BOMB;
     return w;
 }
 static int s_p2InputLogged = 0;
@@ -1146,6 +1186,12 @@ static int      s_netSceneId  = -1;        /* last top-level scene id (self+0x15
                                               change re-zeros the lockstep (start barrier)*/
 static int      s_proxFade   = 1;          /* coop.ini [coop] proximity_fade (default ON) */
 static int      s_disableDemo = 1;         /* coop.ini [coop] disable_demo (default ON)    */
+static int      s_debugKeys  = 0;          /* coop.ini [coop] debug_keys (item 5): the F2-F12
+                                              dev hotkeys (spawn/despawn/char-swap/killable…),
+                                              which can desync a net game. Default OFF so an
+                                              uninitiated player can't fork the sim by accident. */
+static int      s_forceReplayP2 = -1;      /* coop.ini [coop] force_replay_p2: force co-op
+                                              playback of a pre-tag-fix replay (-1 = off). */
 /* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
  * per-player char-select FSM under netplay. Both machines compute the same pair. */
 static uint16_t s_netP1Menu  = 0;
@@ -1190,6 +1236,22 @@ static void LoadNetConfig(void)
      * logs the 0x400-corruption fingerprint §8b needs, then fully restores + frees.
      * The shipped suppression baseline is untouched whether this is on or off. */
     s_p2FaceDiag = (int)GetPrivateProfileIntA("coop", "p2_face_diag", 0, ini);
+    /* item 5: dev F-key hotkeys behind a debug toggle (default OFF). */
+    s_debugKeys = (int)GetPrivateProfileIntA("coop", "debug_keys", 0, ini);
+    /* play back a co-op replay recorded before the tag fix (-1 = off). */
+    s_forceReplayP2 = (int)GetPrivateProfileIntA("coop", "force_replay_p2", -1, ini);
+    /* item 4: per-key overrides for the local-coop P2 binds (blank => keep default). */
+    {
+        static const char *p2KeyIni[P2K_COUNT] = {
+            "p2_up", "p2_down", "p2_left", "p2_right", "p2_shoot", "p2_focus", "p2_bomb"
+        };
+        char kb[32];
+        int i;
+        for (i = 0; i < P2K_COUNT; i++) {
+            GetPrivateProfileStringA("coop", p2KeyIni[i], "", kb, sizeof(kb), ini);
+            if (kb[0]) s_p2Keys[i] = ParseVk(kb, s_p2Keys[i]);
+        }
+    }
     /* N2: damper mode. 0 = flat 0.75 on all enemies; 1 = boss-only 0.60 (stage full). */
     s_damperBossOnly = (int)GetPrivateProfileIntA("coop", "damper_boss_only", 0, ini);
     /* DIAGNOSTIC: suppress the P2 entity entirely (no auto-spawn, F9 no-ops). Lets a
@@ -1584,12 +1646,29 @@ static int __fastcall HookedGameStart(int self)
         uint16_t before = *ADDR_RNG_SEED;
         *ADDR_RNG_SEED = Nc_GetInitSeed();
         s_seedForced = 1;
+        /* §8t fix: the per-frame pin in HookedSceneTick keeps the LIVE difficulty global
+         * (0x626280) = host's, which is why the guest's PAUSE menu reads host's. But the
+         * tester saw the actual GAMEPLAY difficulty differ: ZUN snapshots difficulty-
+         * derived run state at game-start (e.g. DAT_0062f85c = 0x626280+2, the rank
+         * table at +0x9634) BEFORE the per-frame pin had settled host's value into the
+         * run. Force the difficulty HERE too — once/scene, right before s_origGameStart
+         * runs the snapshot — so the run latches host's difficulty, not the guest's saved
+         * default. Host untouched. */
+        if (!s_netIsHost) {
+            int hd = Nc_GetPeerDifficulty();
+            if (hd >= 0 && (uint32_t)hd != *ADDR_DIFFICULTY) {
+                Log("netplay: difficulty FORCED at game-start (%u -> %d) before ZUN snapshot",
+                    (unsigned)*ADDR_DIFFICULTY, hd);
+                *ADDR_DIFFICULTY = (uint32_t)hd;
+            }
+        }
         /* §8r: log the x87 control word at the seeding moment too — if host and guest
          * differ here on the first stage, FP precision forked before the per-frame pin
-         * settled; if they match (both 0x_01f) the first-run fork is elsewhere. */
-        Log("netplay: SEEDFORCE F%d seed 0x%04x -> 0x%04x ctr=%u cw=0x%04x (once/scene)",
+         * settled; if they match (both 0x_01f) the first-run fork is elsewhere.
+         * diff= lets the tester confirm both sides entered the stage on the SAME value. */
+        Log("netplay: SEEDFORCE F%d seed 0x%04x -> 0x%04x ctr=%u cw=0x%04x diff=%u (once/scene)",
             s_netFrame, before, (unsigned)Nc_GetInitSeed(), (unsigned)*ADDR_RNG_CTR,
-            _controlfp(0, 0) & 0xffff);
+            _controlfp(0, 0) & 0xffff, (unsigned)*ADDR_DIFFICULTY);
     }
     return s_origGameStart(self);
 }
@@ -1622,7 +1701,16 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
     uint32_t r = s_origReplayHdr(self);
     /* param_1[1] is the 0xe8-byte header buffer (allocated on the first call). */
     unsigned char *hdr = (unsigned char *)((void **)self)[1];
-    int coop = (s_p2Sel >= 0) || s_netActive;
+    /* Tag whenever P2 is part of this run. The old gate ((s_p2Sel>=0)||s_netActive)
+     * MISSED a LOCAL co-op replay: there P2 auto-spawns mirroring P1, so s_p2Sel stays
+     * -1 and s_netActive is 0 — the header went untagged, so playback couldn't detect
+     * the co-op replay and never spawned P2 (→ replay desync once aimed enemies appear).
+     * With the co-op DLL loaded P2 ALWAYS auto-spawns unless suppress_p2 pins it off, so
+     * "this is a co-op run" is simply !s_suppressP2 — and that's TIMING-INDEPENDENT
+     * (FUN_00443040 is a task callback that may fire at record START, before P2 has
+     * spawned, so s_autoSpawned/s_p2 can't be relied on here). suppress_p2=1 keeps a
+     * P2-less run a byte-clean vanilla replay. */
+    int coop = !s_suppressP2;
     if (hdr && coop) {
         int p2sel = (s_p2Sel >= 0) ? s_p2Sel : (int)*ADDR_SEL_ID;  /* mirror -> P1 */
         hdr[RPY_COOP_OFF + 0] = RPY_COOP_MAG0;
@@ -1657,6 +1745,13 @@ static int s_replayIsCoop   = 0;   /* the loaded replay carries our co-op (0x58)
 static int s_replayP2Sel    = -1;  /* P2's character recovered from the header             */
 static int s_replayDiffChar = 0;   /* P2 was a different char (header byte 0x5b)           */
 static int s_replayLoadLogged = 0;
+/* coop.ini [coop] force_replay_p2: -1 = off (default). 0..5 = treat an UNTAGGED replay as
+ * co-op and spawn P2 with this selection (ReimuA..SakuyaB). For replays recorded before the
+ * tag fix: P2's per-frame input is ALREADY in the file (merge high bits), only the spawn tag
+ * was missing. Use the SAME character family as P1 for a stable, accurate playback — a
+ * different-char P2 is the unstable anm path (can crash on shoot). s_forceReplayP2 is
+ * declared up with the other [coop] config statics (it's read in LoadNetConfig). */
+#define RPY_P1CHAR_OFF 0x56        /* header byte 0x56 = P1's character (DAT_0062f647)     */
 
 static int IsReplayPlayback(void)
 {
@@ -1681,8 +1776,29 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
                 ADDR_SEL_NAMES[n], s_replayDiffChar, RPY_COOP_OFF);
             s_replayLoadLogged = 1;
         }
+    } else if (IsReplayPlayback() && s_forceReplayP2 >= 0 && hdr) {
+        /* untagged replay + user override: force co-op playback. P2's input is already in
+         * the file's high bits; we just spawn P2. diffchar = forced char's family differs
+         * from P1's (header 0x56) — a different family uses the unstable anm overlay. */
+        s_replayIsCoop   = 1;
+        s_replayP2Sel    = s_forceReplayP2;
+        s_replayDiffChar = ((s_forceReplayP2 / 2) != (int)hdr[RPY_P1CHAR_OFF]) ? 1 : 0;
+        if (!s_replayLoadLogged) {
+            int n = (s_forceReplayP2 <= 5) ? s_forceReplayP2 : 0;
+            Log("replay PLAYBACK: FORCED co-op (force_replay_p2=%d -> P2=%s diffchar=%d, "
+                "P1char=%d) — untagged replay", s_forceReplayP2, ADDR_SEL_NAMES[n],
+                s_replayDiffChar, (int)hdr[RPY_P1CHAR_OFF]);
+            s_replayLoadLogged = 1;
+        }
     } else {
         s_replayIsCoop = 0;   /* solo/vanilla replay — no phantom P2 */
+        if (IsReplayPlayback() && !s_replayLoadLogged) {  /* why a replay didn't recover P2 */
+            Log("replay PLAYBACK: NO co-op tag at +0x%02x (bytes %02x %02x) — solo/vanilla "
+                "or recorded pre-fix (set [coop] force_replay_p2 to spawn P2 anyway)",
+                RPY_COOP_OFF, hdr ? hdr[RPY_COOP_OFF] : 0xFF,
+                hdr ? hdr[RPY_COOP_OFF + 1] : 0xFF);
+            s_replayLoadLogged = 1;
+        }
     }
     return r;
 }
@@ -2589,6 +2705,10 @@ static void LifeShare(void *p2, uint16_t p1in, uint16_t p2in,
 
 static void PollHotkeys(void)
 {
+    /* item 5: the F2-F12 dev hotkeys are behind coop.ini [coop] debug_keys (default
+     * OFF). Many mutate co-op state (spawn/despawn/char-swap/killable) and would
+     * desync a net game — keep them off for ordinary players. */
+    if (!s_debugKeys) return;
     int f9  = (GetAsyncKeyState(VK_F9)  & 0x8000) != 0;
     int f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     int f8  = (GetAsyncKeyState(VK_F8)  & 0x8000) != 0;
@@ -3361,9 +3481,13 @@ static int __fastcall HookedUpdate(void *self)
 
         PollHotkeys();
 
-        /* auto-spawn shortly after P1 finishes the stage fly-in (state 0). In replay
-         * PLAYBACK only do so for a co-op replay (header tag present), and pull P2's
-         * character from the header so the clone matches what was recorded. */
+        /* auto-spawn P2 as soon as P1 is controllable. P2 is a CLONE of P1, so it
+         * can't exist until P1's character is loaded — P1Ready() (char-data set) is
+         * the hard floor, and by the time that's true P1 is already in state 0 (the
+         * stage intro that plays before the character loads is unavoidable lateness;
+         * spawning P2 with its OWN fly-in would be a separate entity, deferred).
+         * AUTO_SPAWN_AFTER (2) is just a tiny settle, deterministic on both machines.
+         * In replay PLAYBACK only for a co-op replay (tag present); P2's char from the tag. */
         if (!s_autoSpawned && !s_p2) {
             int playback = IsReplayPlayback();
             if ((!playback || s_replayIsCoop) && P1Ready() &&
@@ -3547,18 +3671,26 @@ static void DrawCoopHud(void *p2)
 
     /* live netplay status (EoSD-style connection readout): role, our logic frame,
      * delay, sync state, and the per-frame lockstep wait. A climbing wait= with a
-     * near-frozen frame number is exactly what a stall looks like. */
+     * near-frozen frame number is exactly what a stall looks like.
+     * Item 1: drawn at the playfield's bottom-left (full width) — NOT the ~190px
+     * sidebar (x=448), where "NET H F##### WAIT###ms" overran the HUD box. */
     if (s_netActive || s_netPeerLost) {
-        pos[1] = 280.f;
+        float npos[3];
+        npos[0] = 8.f; npos[1] = 462.f; npos[2] = 0.f;
+        int ping = Nc_GetPing();   /* item 3: round-trip latency, ms (-1 = not yet measured) */
         if (s_netPeerLost)
-            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET LOST");
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET LOST");
         else if (s_netWaitMs >= 100)
-            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d WAIT%dms",
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET %c F%d WAIT%dms",
                              Nc_IsHost() ? 'H' : 'G', s_netFrame, s_netWaitMs);
-        else
-            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d d%d %s",
+        else if (ping < 0)
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET %c F%d d%d %s PING--",
                              Nc_IsHost() ? 'H' : 'G', s_netFrame, Nc_GetDelay(),
                              s_netSync ? "SYNC" : "DSYN");
+        else
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET %c F%d d%d %s PING%dms",
+                             Nc_IsHost() ? 'H' : 'G', s_netFrame, Nc_GetDelay(),
+                             s_netSync ? "SYNC" : "DSYN", ping);
     }
 
     pos[1] = 296.f;
@@ -3878,16 +4010,17 @@ static void ResetCoopSession(void)
     Log("coop session reset (returned to front-end menu)");
 }
 
-/* P2's menu input in the MENU bit layout (same physical keys as ReadP2InputLocal). */
+/* P2's menu input in the MENU bit layout (same configurable binds as
+ * ReadP2InputLocal: move = dpad, SHOOT = confirm, BOMB = cancel). */
 static uint16_t ReadP2MenuInput(void)
 {
     uint16_t w = 0;
-    if (Down('W'))      w |= 0x10;          /* up    */
-    if (Down('S'))      w |= 0x20;          /* down  */
-    if (Down('A'))      w |= 0x40;          /* left  */
-    if (Down('D'))      w |= 0x80;          /* right */
-    if (Down(VK_SPACE)) w |= MENU_CONFIRM;  /* confirm */
-    if (Down('O'))      w |= MENU_CANCEL;   /* cancel  */
+    if (Down(s_p2Keys[P2K_UP]))    w |= 0x10;          /* up    */
+    if (Down(s_p2Keys[P2K_DOWN]))  w |= 0x20;          /* down  */
+    if (Down(s_p2Keys[P2K_LEFT]))  w |= 0x40;          /* left  */
+    if (Down(s_p2Keys[P2K_RIGHT])) w |= 0x80;          /* right */
+    if (Down(s_p2Keys[P2K_SHOOT])) w |= MENU_CONFIRM;  /* confirm */
+    if (Down(s_p2Keys[P2K_BOMB]))  w |= MENU_CANCEL;   /* cancel  */
     return w;
 }
 
@@ -3929,10 +4062,17 @@ static void DrawNetMenuStatus(void)
         if (s_netWaitMs >= 100)
             ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d WAIT%dms",
                              Nc_IsHost() ? 'H' : 'G', s_netFrame, s_netWaitMs);
-        else
-            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d d%d %s %04X/%04X",
-                             Nc_IsHost() ? 'H' : 'G', s_netFrame, Nc_GetDelay(),
-                             s_netSync ? "SYNC" : "DSYN", s_netSelfRng, s_netRcvRng);
+        else {
+            int ping = Nc_GetPing();   /* item 3: ping while waiting to connect */
+            if (ping < 0)
+                ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d d%d %s %04X/%04X PING--",
+                                 Nc_IsHost() ? 'H' : 'G', s_netFrame, Nc_GetDelay(),
+                                 s_netSync ? "SYNC" : "DSYN", s_netSelfRng, s_netRcvRng);
+            else
+                ADDR_ASCII_PRINT(ADDR_ASCII_MGR, pos, "NET %c F%d d%d %s %04X/%04X PING%dms",
+                                 Nc_IsHost() ? 'H' : 'G', s_netFrame, Nc_GetDelay(),
+                                 s_netSync ? "SYNC" : "DSYN", s_netSelfRng, s_netRcvRng, ping);
+        }
     }
 }
 
@@ -4160,6 +4300,9 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_DECL_MAKE)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_REPLAY_HDR_INIT)!= MH_OK) return 0;
+    if (MH_EnableHook(ADDR_REPLAY_LOAD)    != MH_OK) return 0;   /* §8k: was CREATED but never
+                                                                   ENABLED — playback ran unhooked,
+                                                                   so co-op replays never spawned P2 */
     if (MH_EnableHook(ADDR_ENEMY_UPDATE)   != MH_OK) return 0;   /* B5: live enemy-manager base */
     if (s_netEnabled) {
         if (MH_EnableHook(ADDR_SCENE_TICK) != MH_OK) return 0;

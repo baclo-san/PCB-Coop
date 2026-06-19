@@ -42,13 +42,9 @@
 #define IDC_CONNECT   1009
 #define IDC_LOCALCOOP 1010
 #define IDC_STATUS    1011
-#define IDC_SUPPRESS  1012
-#define IDC_FPUGUARD  1013
-#define IDC_CHERRY    1014
 #define IDC_DAMPERBOSS 1015
-#define IDC_AUTORESYNC 1016
 
-static HWND g_ip, g_port, g_local, g_delay, g_fade, g_suppress, g_fpuguard, g_cherry, g_damperboss, g_autoresync, g_exe, g_status;
+static HWND g_ip, g_port, g_local, g_delay, g_fade, g_damperboss, g_exe, g_status;
 static char g_dir[MAX_PATH];      /* launcher's own folder (trailing '\\')   */
 static char g_iniPath[MAX_PATH];  /* g_dir + coop.ini                        */
 static char g_dllPath[MAX_PATH];  /* g_dir + th07_coop.dll                   */
@@ -92,33 +88,25 @@ static void WriteIni(int role)
     int local = GetEditInt(g_local, 47001);
     int delay = GetEditInt(g_delay, 2);
     int fade  = (SendMessageA(g_fade, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
-    int sup   = (SendMessageA(g_suppress, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
-    int fpg   = (SendMessageA(g_fpuguard, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
-    int chy   = (SendMessageA(g_cherry, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
     int dbo   = (SendMessageA(g_damperboss, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
-    int ars   = (SendMessageA(g_autoresync, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
     GetEditStr(g_ip, ip, sizeof(ip));
     if (!ip[0]) strcpy(ip, "127.0.0.1");
     if (delay < 0)  delay = 0;
     if (delay > 10) delay = 10;
 
     WritePrivateProfileStringA("coop", "proximity_fade", fade ? "1" : "0", g_iniPath);
-    /* suppress_p2: the netplay desync isolation checkbox — write its state every
-     * launch (like fade) so what the box shows is exactly what the DLL reads. */
-    WritePrivateProfileStringA("coop", "suppress_p2", sup ? "1" : "0", g_iniPath);
-    /* fpu_guard: the FPU-firewall desync-fix checkbox — same every-launch write. */
-    WritePrivateProfileStringA("coop", "fpu_guard", fpg ? "1" : "0", g_iniPath);
-    /* cherry_both_full (B2): now a checkbox, written every launch like the others. This
-     * REPLACES the old "write 0 if absent" stub that was silently pinning the feature
-     * OFF in every deployed ini regardless of the DLL default. */
-    WritePrivateProfileStringA("coop", "cherry_both_full", chy ? "1" : "0", g_iniPath);
+    /* item 6: suppress_p2 / fpu_guard / cherry_both_full / auto_resync are no longer
+     * launcher toggles — they're baked at their shipped defaults. CRUCIAL: still WRITE
+     * each key here so a coop.ini left over from an older launcher (e.g. a tester who'd
+     * ticked suppress_p2=1) is healed to the default — WritePrivateProfileString only
+     * overwrites the key it's given, so a stale value would otherwise persist. */
+    WritePrivateProfileStringA("coop", "suppress_p2",      "0", g_iniPath); /* default OFF */
+    WritePrivateProfileStringA("coop", "fpu_guard",        "1", g_iniPath); /* default ON (confirmed desync fix) */
+    WritePrivateProfileStringA("coop", "cherry_both_full", "1", g_iniPath); /* default ON */
+    WritePrivateProfileStringA("coop", "auto_resync",      "0", g_iniPath); /* default OFF */
     /* damper_boss_only (N2): 1 = the 2P DPS damper hits only bosses (stage enemies take
      * full damage); 0 = flat reduction on every enemy. */
     WritePrivateProfileStringA("coop", "damper_boss_only", dbo ? "1" : "0", g_iniPath);
-    /* auto_resync (§8r): auto-recover a sustained in-stage desync (the first-run-after-
-     * launch fork) instead of needing a manual Escape->Give up->Retry. Written every
-     * launch like the rest so the box state is exactly what the DLL reads. */
-    WritePrivateProfileStringA("coop", "auto_resync", ars ? "1" : "0", g_iniPath);
 
     WritePrivateProfileStringA("net", "enabled", role ? "1" : "0", g_iniPath);
     WritePrivateProfileStringA("net", "role", role == 2 ? "guest" : "host", g_iniPath);
@@ -277,24 +265,10 @@ static void Prefill(void)
     sprintf(buf, "%d", local); SetWindowTextA(g_local, buf);
     sprintf(buf, "%d", delay); SetWindowTextA(g_delay, buf);
     SendMessageA(g_fade, BM_SETCHECK, fade ? BST_CHECKED : BST_UNCHECKED, 0);
-    {   /* diagnostics (default off): P2-suppress isolation + FPU firewall fix test */
-        int sup = (int)GetPrivateProfileIntA("coop", "suppress_p2", 0, g_iniPath);
-        int fpg = (int)GetPrivateProfileIntA("coop", "fpu_guard",   0, g_iniPath);
-        SendMessageA(g_suppress,  BM_SETCHECK, sup ? BST_CHECKED : BST_UNCHECKED, 0);
-        SendMessageA(g_fpuguard,  BM_SETCHECK, fpg ? BST_CHECKED : BST_UNCHECKED, 0);
-    }
-    {   /* gameplay options: cherry-power (default ON), boss-only damper (default off).
-         * cherry_both_full defaults to 1 when ABSENT so a fresh ini ships it on; an older
-         * ini that the previous launcher pinned to 0 loads unchecked — tick it once. */
-        int chy = (int)GetPrivateProfileIntA("coop", "cherry_both_full", 1, g_iniPath);
+    {   /* boss-only damper (default off). suppress_p2 / fpu_guard / cherry_both_full /
+         * auto_resync are no longer toggles (item 6) — baked in WriteIni. */
         int dbo = (int)GetPrivateProfileIntA("coop", "damper_boss_only", 0, g_iniPath);
-        SendMessageA(g_cherry,     BM_SETCHECK, chy ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageA(g_damperboss, BM_SETCHECK, dbo ? BST_CHECKED : BST_UNCHECKED, 0);
-    }
-    {   /* auto-resync (default OFF — a 2-PC test proved a mid-stage reseed doesn't fix
-         * PCB's desync; the manual scene restart is the working recovery). Opt-in only. */
-        int ars = (int)GetPrivateProfileIntA("coop", "auto_resync", 0, g_iniPath);
-        SendMessageA(g_autoresync, BM_SETCHECK, ars ? BST_CHECKED : BST_UNCHECKED, 0);
     }
 
     /* th07.exe: prefer the path remembered from a previous run, then one sitting
@@ -335,23 +309,14 @@ static void CreateControls(HWND w)
     mk(w, "STATIC", "Input delay (0-10):", WS_VISIBLE, lblx, y+3, 110, 20, 0);
     g_delay = mk(w, "EDIT", "", WS_BORDER | ES_NUMBER, edx, y, 90, 24, IDC_DELAY);
     y += row;
+    /* item 6: only two gameplay toggles remain (the desync-diagnostic boxes are gone,
+     * baked at their defaults). Start at the left margin with a full-width label so the
+     * text fits the window. */
     g_fade = mk(w, "BUTTON", "Fade the other player when they overlap you",
-                BS_AUTOCHECKBOX, edx, y, 300, 22, IDC_FADE);
+                BS_AUTOCHECKBOX, lblx, y, 410, 22, IDC_FADE);
     y += row;
-    g_suppress = mk(w, "BUTTON", "Suppress P2 (netplay desync isolation test)",
-                BS_AUTOCHECKBOX, edx, y, 300, 22, IDC_SUPPRESS);
-    y += row;
-    g_fpuguard = mk(w, "BUTTON", "FPU guard (firewall netcode x87 — desync fix test)",
-                BS_AUTOCHECKBOX, edx, y, 320, 22, IDC_FPUGUARD);
-    y += row;
-    g_cherry = mk(w, "BUTTON", "Cherry power: keep [P] drops until BOTH players full",
-                BS_AUTOCHECKBOX, edx, y, 320, 22, IDC_CHERRY);
-    y += row;
-    g_damperboss = mk(w, "BUTTON", "Damage cut: bosses only (stage enemies full damage)",
-                BS_AUTOCHECKBOX, edx, y, 320, 22, IDC_DAMPERBOSS);
-    y += row;
-    g_autoresync = mk(w, "BUTTON", "Auto-resync (experimental; OFF — use Retry to recover a desync)",
-                BS_AUTOCHECKBOX, edx, y, 360, 22, IDC_AUTORESYNC);
+    g_damperboss = mk(w, "BUTTON", "Damage cut: bosses only (stage enemies take full damage)",
+                BS_AUTOCHECKBOX, lblx, y, 410, 22, IDC_DAMPERBOSS);
     y += row;
 
     mk(w, "STATIC", "th07.exe:", WS_VISIBLE, lblx, y+3, 110, 20, 0);
@@ -364,10 +329,12 @@ static void CreateControls(HWND w)
     mk(w, "BUTTON", "Local Co-op", BS_PUSHBUTTON, 274, y, 120, 36, IDC_LOCALCOOP);
     y += 48;
 
+    /* item 6: word-wrap (no SS_LEFTNOWORDWRAP) so long status lines stay inside the
+     * window instead of being clipped at the right edge. */
     g_status = mk(w, "STATIC",
         "Host & guest: enter the SAME Port. Guest also fills Host IP. "
         "Then Host on one PC, Connect on the other.",
-        WS_VISIBLE | SS_LEFTNOWORDWRAP, 16, y, 400, 40, IDC_STATUS);
+        WS_VISIBLE, 16, y, 420, 48, IDC_STATUS);
 }
 
 static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
@@ -416,10 +383,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
     wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
     RegisterClassA(&wc);
 
-    sprintf(title, "%s  [net protocol %s]", APP_TITLE, "3.9.5");
+    /* keep in sync with MULTI_NET_VER_S in src/netplay/Connection.hpp */
+    sprintf(title, "%s  [net protocol %s]", APP_TITLE, "3.9.7");
     w = CreateWindowA("PcbCoopLauncher", title,
                       WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                      CW_USEDEFAULT, CW_USEDEFAULT, 438, 600,
+                      CW_USEDEFAULT, CW_USEDEFAULT, 462, 410,
                       NULL, NULL, hInst, NULL);
     if (!w) return 1;
     ShowWindow(w, show);

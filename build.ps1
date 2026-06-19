@@ -153,8 +153,8 @@ $coopIni = Join-Path $build "coop.ini"
 if (-not (Test-Path $coopIni)) {
 @"
 ; th07_coop.dll config. [net] drives the built-in netplay (fork A §8). With
-; enabled=0 (default) P2 is the local keyboard (IJKL/Space/U/O) — the
-; confirmed-good local co-op baseline, byte-for-byte unchanged.
+; enabled=0 (default) P2 is the local keyboard (WASD move / Space shoot / O focus
+; / P bomb; remappable via [coop] p2_* keys) — the local co-op baseline.
 ;
 ; Over the network: set enabled=1 on BOTH machines, role=host on one /
 ; role=guest on the other, give the guest the host's IP in peer=. The link

@@ -2331,3 +2331,132 @@ host-authoritative the same way. Both need the unlock-flag / lives globals locat
 near `0x626280`). The user is OK treating these pragmatically. Lesson reinforced: a netplay "desync" can
 be **pre-game config divergence between installs**, fixable by pinning the few starting globals — check
 those before any sim-side theory.
+
+### §8u — UX/QoL pass: HUD, spawn speed, P2 remap, debug gate, launcher cleanup (2026-06-19)
+
+Five quick wins from the tester's list (built + native test green; in-game confirm pending). Item
+numbers are the user's own list. The merged `claude/p2-bomb-portrait-m72hf7` (§8b face-anm probe,
+default off) is also now on `main`.
+
+- **(1) In-game net readout relocated.** `DrawCoopHud`'s `NET … SYNC/DSYN/WAITms` line was drawn at
+  `pos[0]=448` — inside the ~190px HUD sidebar — so `NET H F##### WAIT###ms` overran the box width.
+  Moved to its own `npos` at the **playfield bottom-left (x=8, y=462)**, which has the full screen width.
+  Sidebar P2 HUD (resources/ghost/revive) is unchanged.
+- **(2) P2 spawns ~immediately.** `AUTO_SPAWN_AFTER` 30→2 frames (still counted off P1 reaching state 0,
+  so deterministic on both machines). Removes the ~0.5s gap; P2 now pops in right as control begins.
+  *True co-fly-in (P2 doing its own fly-in alongside P1) is deferred — it needs P2 its own fly-in state.*
+- **(4) Local-P2 keys are ini-configurable + better defaults.** `s_p2Keys[P2K_COUNT]` array + `ParseVk`
+  (accepts a letter/digit, a friendly name like `SPACE`/`COMMA`/`PERIOD`, or a raw `0xNN` VK). Read from
+  `[coop] p2_up/p2_down/p2_left/p2_right/p2_shoot/p2_focus/p2_bomb` (blank = keep default). Both
+  `ReadP2InputLocal` and `ReadP2MenuInput` use the array. **Default focus/bomb moved U/O → adjacent O/P**
+  per the user's "OP" ask (shoot stays Space, move stays WASD).
+- **(5) Dev F-keys behind a debug toggle.** `PollHotkeys` now early-returns unless `[coop] debug_keys=1`
+  (default 0). The F2–F12 hotkeys (spawn/despawn/char-swap/killable/HP-scale/revive…) mutate co-op state
+  and can desync a net game, so they're off for ordinary players. Power users opt in via the ini.
+- **(6) Launcher decluttered + text fits.** Removed the four diagnostic checkboxes (`suppress_p2`,
+  `fpu_guard`, `cherry_both_full`, `auto_resync`); they're **baked at their shipped defaults** (0/1/1/0)
+  and **still written every launch** by `WriteIni` so an older ini that had one ticked is healed (per
+  [[launcher-owns-coop-ini]] — `WritePrivateProfileString` only overwrites the key it's given, so a stale
+  value would otherwise persist). Remaining toggles (`proximity_fade`, `damper_boss_only`) moved to the
+  left margin at full width; status line word-wraps; window 438×600 → 462×410; title version string
+  corrected 3.9.5 → **3.9.7** to match `MULTI_NET_VER_S`.
+
+**Item 3 (live network-delay hotkeys + ping/RTT readout) — DESIGNED, not yet built.** User picked the
+**full** approach. Two pieces of real netcode work (no `Nc_SetDelay` exists today; delay is fixed at
+handshake, and RTT is not measured — only `waitMs` per-frame stall is exposed):
+1. **Host-authoritative delay change:** a host hotkey sends a new control packet ("set delay D effective
+   at frame F"); both peers apply at F so the lockstep read index (`netFrame − delay`) flips in step and
+   doesn't desync. Guest's request (if any) routes through the host.
+2. **Real ping:** add a timestamp echo to packets, compute smoothed RTT, surface it next to the relocated
+   net readout (alongside the existing `waitMs`). Crucial for intercontinental play.
+
+### §8v — tester round 2: difficulty real-fix, replay P2 spawn, ping, fly-in spawn (2026-06-19)
+
+Tester confirmations on the §8t/§8u/§8k builds + the follow-ups they triggered. **All built + native
+`netloop_test` green; in-game confirm pending.**
+
+- **Difficulty (§8t) was HALF-fixed — now forced at game-start too.** Tester: the guest's PAUSE menu read
+  host's difficulty, but the *actual gameplay* difficulty differed. Cause: the per-frame pin in
+  `HookedSceneTick` keeps the LIVE global `0x626280` = host's (so the pause menu, which reads it live, is
+  right), but ZUN **snapshots difficulty-derived run state at game-start** before the pin settled host's
+  value into the run — `DAT_0062f85c = DAT_00626280 + 2` (PCBdecomp:37680) and the rank table at
+  player+0x9634 (PCBdecomp:18101-18103). So the run latched the guest's *saved default*. **Fix:** force
+  `0x626280` to the host's value in `HookedGameStart` too (once/scene, right before `s_origGameStart`
+  runs the snapshot). The `SEEDFORCE` log now prints `diff=` so both sides can be confirmed equal at
+  stage entry. (Most enemy/bullet code reads `0x626280` *live*, so the per-frame pin already covered
+  those — only the start-of-run snapshot needed the extra force.) Replay header byte **0x57 = difficulty**
+  (PCBdecomp:27704 record / 27884 playback), not stage as the §8k note guessed.
+- **Replay P2 spawn (§8k) FIXED — local co-op replays were untagged.** Tester: P2 doesn't spawn in
+  replay → desync once aimed enemies appear. Root cause: the record-side tag gate was
+  `(s_p2Sel>=0)||s_netActive`, but a LOCAL co-op replay has P2 **auto-spawn mirroring P1** (so
+  `s_p2Sel==-1`) with **netplay off** — the 0x58 co-op header block was never written, so playback's
+  `HookedReplayLoad` found no magic and never spawned P2. **Fix:** the tag gate is now `!s_suppressP2` —
+  with the co-op DLL loaded P2 ALWAYS auto-spawns unless `suppress_p2` pins it off, so that's the correct
+  "this is a co-op run" test, and it's **timing-independent**: `FUN_00443040` is a record-task callback
+  that may fire at record START (before P2 has spawned), so `s_autoSpawned`/`s_p2` can't be relied on at
+  tag time. Added a one-shot playback diagnostic (`replay PLAYBACK: NO co-op tag …`) so any remaining
+  untagged/old replay is obvious in the log. NOTE: replays recorded BEFORE this fix stay untagged —
+  re-record to get a co-op replay that plays P2 back.
+- **Item 3 → PING readout BUILT (live delay-change dropped per tester).** Tester: rebooting with a new
+  launcher delay is fine, no need for in-game delay change — just show ping. Implemented an **echo-model
+  RTT** in the netcode (no clock sync needed): every key pack carries `sendTick` (our clock) + `echoTick`
+  (the peer's latest tick we saw); when a pack returns carrying our tick, `rtt = now − echoTick` in our
+  own clock, EWMA-smoothed. New `Nc_GetPing()` (-1 until measured). Shown as `PING###ms` on the in-game
+  net readout (playfield bottom-left) and the front-end menu status line. Pure out-of-band metadata —
+  never touches lockstep input/RNG.
+- **Item 2 spawn timing — AUTO_SPAWN_AFTER 30→2; the state-1 fly-in idea was tried then REVERTED.**
+  First attempt spawned on `state==0 || state==1` (clone P1 mid-fly-in). The round-3 log showed it never
+  helped: `auto-spawn: 2 ready frames reached (P1 state=0)` — `P1Ready()` (char-data loaded) is the hard
+  floor, and by the time the character is loaded P1 is ALREADY at state 0. The "intro" the tester sees is
+  the stage opening that plays BEFORE the character object exists; P2 can't be cloned from a P1 that isn't
+  there yet. So earliness is char-load-bound — reverted to `state==0` only (tested-safe) + the 30→2
+  trim. True "spawn with P1" would need P2 as its OWN fly-in entity (deferred, bigger task).
+- **Bomb portrait (§8b) — STILL the open suppression baseline; the merged branch was only a PROBE.**
+  Tester expected the merged `claude/p2-bomb-portrait-m72hf7` to fix the P2 bomb portrait — but that
+  commit is the **read-only `p2_face_diag` probe (default off)**, not a fix; P2's portrait is still
+  suppressed by design (§8b "RESOLVED via SUPPRESSION"). To actually render the correct different-char P2
+  portrait, run the probe (`[coop] p2_face_diag=1`, read the `[face-diag]` log block) to identify the
+  0x400 corruptor, THEN implement the real per-player face load. Not yet done.
+
+### §8w — tester round 3: diff-char P2 shot CRASH diagnosed; replay-without-retag override (2026-06-19)
+
+- **CRASH on a DIFFERENT-char P2 shooting — root-caused (NOT the fly-in).** Tester picked Marisa for P2
+  over Reimu P1 (with `p2_face_diag=1`), saw P2 render as Reimu, then crash on shooting. Log: spawn was
+  `(P1 state=0)` so the fly-in path was never taken. Crash EIP `0x0043d5ec` = `FUN_0043d2f0`, ZUN's
+  **player-shot update loop** (iterates 96 shots at base+0x2444, stride 0x364). At PCBdecomp:25715-25717
+  it reads `*(int*)(shot+0x1e4)` (the shot's anm/sprite source) then derefs `+0x2c` — the AV `READ from
+  0x0000002c` is that pointer being NULL. Why null: the engine **reused P2's Marisa anm slot 48** (log:
+  `SwapAnm: slot 48 reused by engine -> retiring P2 different-char overlay (no crash, mirrors P1)`), so
+  P2 renders as P1 (Reimu) AND P2's in-flight Marisa shots reference the freed anm → null deref on tick.
+  The "no crash, mirrors P1" fallback fixes the PLAYER sprite but not the SHOTS. The `p2_face_diag` probe
+  (which perturbs the anm slots — it zeroes the 0x400 window during the face load, then restores)
+  likely hastened the slot-48 reuse. **Action items:** (a) re-test diff-char P2 with the probe OFF to see
+  if slot-48 reuse still happens; (b) the real fix is keeping P2's char anm in a slot the engine won't
+  recycle, or reverting P2's shot type to P1's when the overlay retires (so shots reference a live anm) —
+  this is the open §8b/diff-char-P2 anm-stability problem. Same-char P2 (no overlay) is unaffected.
+- **§8b probe DATA captured (for the portrait, later):** `face_mr00.anm` defines 13 ids in
+  `[0x4a0..0x4ac]` — the SAME range P1's face uses — and the face LOAD itself zeroes the player window
+  ids `0x400..0x40f` (script/rev → 0), confirming the LOAD is the 0x400 corruptor §8b was hunting. A
+  real per-player portrait must snapshot+restore `0x400..0x40f` around the face load (the probe already
+  does this) and place the face in a non-recycled slot.
+- **Replay-without-retag: `[coop] force_replay_p2` override (no file surgery).** Tester asked to "complete"
+  an existing pre-fix replay. The replay file is an additive stream cipher (subtract a key that +=7 from
+  offset 0x10) + LZSS (`FUN_0045ef00`) + summed checksum at 0x08 (init `0x3f000318`, over bytes 0x0d..EOF)
+  — and char/diff/our-0x58-block live INSIDE the compressed region, so byte-patching needs a full LZSS
+  round-trip (risky). Instead: P2's per-frame input is ALREADY in the file (merge high bits); only the
+  spawn tag was missing. New `[coop] force_replay_p2` (-1 off; 0..5 = P2 selection) makes `HookedReplayLoad`
+  treat an untagged replay as co-op and spawn P2 with that selection. Use the SAME character family as P1
+  (header byte 0x56) for a stable, accurate playback — a different family hits the diff-char crash above.
+
+### §8x — ROOT CAUSE of replay playback never working: hook CREATED but never ENABLED (2026-06-19)
+
+Tester round 4: even a freshly-recorded (correctly-tagged) co-op replay didn't spawn P2, AND
+`force_replay_p2` did nothing — both the §8k playback path and the §8w override live inside
+`HookedReplayLoad`, so both being dead pointed at the hook itself. **It was: `MH_CreateHook(ADDR_REPLAY_LOAD)`
+existed but the matching `MH_EnableHook(ADDR_REPLAY_LOAD)` was missing** (only `ADDR_REPLAY_HDR_INIT`, the
+RECORD hook, was enabled — which is why tagging always worked but playback never did). `FUN_00443550` ran
+unhooked, so `s_replayIsCoop` was never set and the auto-spawn gate's `(playback && !s_replayIsCoop)`
+always blocked the spawn. **Fix: add `MH_EnableHook(ADDR_REPLAY_LOAD)`.** This is the whole §8k "BUILT,
+awaiting in-game confirm" feature — it had never actually run. Lesson: every `MH_CreateHook` needs its
+`MH_EnableHook`; grep both lists when a hook "does nothing." Awaiting in-game confirm that P2 now plays
+back (tagged replays) and that `force_replay_p2` revives old untagged ones.

@@ -2460,3 +2460,24 @@ always blocked the spawn. **Fix: add `MH_EnableHook(ADDR_REPLAY_LOAD)`.** This i
 awaiting in-game confirm" feature — it had never actually run. Lesson: every `MH_CreateHook` needs its
 `MH_EnableHook`; grep both lists when a hook "does nothing." Awaiting in-game confirm that P2 now plays
 back (tagged replays) and that `force_replay_p2` revives old untagged ones.
+
+### §8y — diff-char P2 anm stability, step 1: CRASH-PROOF the overlay retire (2026-06-19)
+
+User direction: fix diff-char-P2 anm stability, then the portrait. Step 1 = make the §8w crash
+impossible. When the engine frees P2's char-anm slot, `SwapAnm` already retired the overlay (P2 falls
+back to P1's sprites) — but P2's **in-flight shots** still hold a direct ref (`shot+0x1e4`) to the freed
+anm, and ZUN's shot loop `FUN_0043d2f0` derefs it (`+0x2c`) → the crash. **Fix:** on retire, `ClearP2Shots`
+zeroes the active flag (`+0x34a`) of all 96 P2 shot slots (`+0x2444`, stride `0x364`) BEFORE
+`s_origUpdate(p2)` runs the loop (SwapAnm(1) is called right before it at coop.c). New P2 shots after
+retirement bind P1's live anm and are safe. So even if a retire happens, no crash — P2 just reverts to
+P1's look. Constants verified against the decomp (active `0x34a`, stride `0x364`, base `0x2444`, count
+`0x60`). Build green, native test green.
+
+**Stability (keep the different char) — relies on the slot not being freed in normal play.** Evidence:
+the tester's round-3 RECORDING (probe OFF, diff-char P2, full run to game over) shows NO `SwapAnm: slot
+reused` line and no crash — the slot-48 free in the crash run was with `p2_face_diag=1` (the probe
+perturbs the anm slots). So: (1) keep the probe OFF for play; (2) **next test: run diff-char P2 with the
+probe off and confirm P2 keeps its character the whole run** (no "retiring … mirrors P1" log). If it ever
+DOES retire mid-run in normal play, the follow-up is a free-protection hook on `FUN_0044e4e0` (skip frees
+of `s_p2AnmSlot` unless we initiated them) — deferred until there's evidence it's needed (it's an
+invasive thiscall hook). THEN build the portrait on top.

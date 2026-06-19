@@ -2126,6 +2126,22 @@ static void LoadP2FaceDiag(int charId)
     }
 }
 
+/* Mark every active P2 shot inactive. Used when the different-char overlay retires:
+ * P2's in-flight shots hold a direct reference (shot+0x1e4) to the now-freed char
+ * anm; ZUN's shot-update loop (FUN_0043d2f0) derefs it (+0x2c/+0x30) and crashes on
+ * the freed pointer. Clearing the slots removes those dangling shots; new P2 shots
+ * after retirement bind P1's (live) anm and are safe. */
+static void ClearP2Shots(void *p2)
+{
+    char *arr = (char *)p2 + OFF_SHOTS;
+    int i, cleared = 0;
+    for (i = 0; i < SHOT_COUNT; i++) {
+        short *act = (short *)(arr + i * SHOT_STRIDE + OFF_SHOT_ACTIVE);
+        if (*act) { *act = 0; cleared++; }
+    }
+    if (cleared) Log("retire: cleared %d P2 shots (would dangle the freed char anm)", cleared);
+}
+
 /* Exchange the 0x400-range table entries between P1's (live) and P2's captured
  * char for exactly the ids P2 defines. enter=1 installs P2, enter=0 restores
  * P1. Re-entrancy-guarded; only acts while P2 has a different-char anm.
@@ -2135,7 +2151,9 @@ static void LoadP2FaceDiag(int charId)
  * that we avoid kGameAnmSlots, but some path might), those pointers dangle and
  * swapping them in would crash on the next draw. So before installing P2, verify
  * the slot still holds OUR file; if not, retire the different-char overlay (P2
- * falls back to rendering P1's char — safe) and log it. */
+ * falls back to rendering P1's char — safe) and log it. CRITICAL: also clear P2's
+ * in-flight shots, which still point at the freed anm — leaving them crashes ZUN's
+ * shot-update loop on the next tick (the observed diff-char-P2 "crash on shooting"). */
 static void SwapAnm(int enter)
 {
     uint32_t mgr = *ADDR_ANM_MGR_PP;
@@ -2147,8 +2165,9 @@ static void SwapAnm(int enter)
         uint32_t cur = *(uint32_t *)(mgr + ANM_SLOT_TBL + s_p2AnmSlot * 0xc);
         if (cur != s_p2AnmFile) {
             Log("SwapAnm: slot %d reused by engine (file 0x%08x != 0x%08x) "
-                "-> retiring P2 different-char overlay (no crash, mirrors P1)",
+                "-> retiring P2 different-char overlay (mirrors P1)",
                 s_p2AnmSlot, cur, s_p2AnmFile);
+            if (s_p2) ClearP2Shots((void *)s_p2);   /* kill shots that ref the freed anm */
             s_p2AnmActive = 0;
             s_anmSwapped = 0;
             return;

@@ -3518,13 +3518,17 @@ static int __fastcall HookedUpdate(void *self)
      * live cross-machine desync the RNG oracle missed; a machine's live log vs its OWN replay log
      * exposes a record/playback asymmetry in our code. P1-also-off => global FP; P2-only => graft.
      * The §8aa pin proved a no-op for th7_12, so the residual is NOT control-word precision. */
-    if (isP1 && (s_netActive || (IsReplayPlayback() && s_replayIsCoop))) {
+    if (isP1 && (s_p2 || (IsReplayPlayback() && s_replayIsCoop))) {
         static int s_rpyDbgTick = 0;
-        int fr = s_netActive ? s_netFrame : s_rpyDbgTick;
+        int play = IsReplayPlayback();
+        int fr = s_netActive ? s_netFrame : s_rpyDbgTick;   /* net=lockstep frame; else stage-tick */
         if ((fr % 60) == 0) {
             void *p2d = (void *)s_p2;
+            /* REC-LOC vs RPLY share the stage-tick counter (P2 auto-spawns on the same frame both
+             * times), so a LOCAL record-then-replay on ONE machine diffs line-for-line — the
+             * cleanest determinism test (no netcode, no seed-force, no cross-platform). */
             Log("coop diag %s f=%d P1=(%.3f,%.3f) P2=(%.3f,%.3f) rng=0x%04x ctr=%u cw=0x%04x pin=%d",
-                s_netActive ? "LIVE" : "RPLY", fr,
+                s_netActive ? "LIVE-NET" : (play ? "RPLY" : "REC-LOC"), fr,
                 *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X),
                 *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_Y),
                 p2d ? *(float *)((char *)p2d + OFF_POS_X) : -1.0f,

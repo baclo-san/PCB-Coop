@@ -1397,6 +1397,7 @@ static void PinFpuForNetplay(void)
  * the header net-recorded flag (or replay_fpu_pin override) so solo/vanilla replays — recorded
  * WITHOUT a pin — keep their native FP and are never perturbed. */
 static int s_fpuPinnedReplay = 0;
+static int s_replayPinDecisionLogged = 0;   /* §8aa: one-shot per replay, logs pin yes/no + cw */
 static void PinFpuForReplay(void)
 {
     unsigned prev = _controlfp(0, 0);
@@ -1480,6 +1481,14 @@ static int __fastcall HookedSceneTick(void *self)
         int pin = (s_replayFpuPin == 1) ? 1
                 : (s_replayFpuPin == 0) ? 0
                 : (s_replayIsCoop && s_replayNetRecorded);   /* auto (-1) */
+        if (!s_replayPinDecisionLogged) {
+            s_replayPinDecisionLogged = 1;
+            Log("replay PLAYBACK: fpu-pin decision=%s (replay_fpu_pin=%d netRec=%d coop=%d) "
+                "current cw=0x%04x — if drift persists with pin=YES, the residual is cross-machine "
+                "FP not covered by the control word (transcendentals).",
+                pin ? "PIN" : "native", s_replayFpuPin, s_replayNetRecorded, s_replayIsCoop,
+                _controlfp(0, 0) & 0xffff);
+        }
         if (pin) PinFpuForReplay();
     }
     if (s_netStarted && !s_netActive) {
@@ -3502,6 +3511,30 @@ static int __fastcall HookedUpdate(void *self)
     uint16_t p1GhostSavedIn = 0;
     CRUMB2("update", 0);
 
+    /* §8ab diag: snapshot P1+P2 positions, the RNG pair and the x87 control word ~1/sec, during
+     * BOTH live netplay AND co-op replay playback — both positions are last-frame-settled here
+     * (pre-update). The point: diff the logs to localise the fork. Under netplay the frame label is
+     * the LOCKSTEP frame (identical on both machines), so host-live vs guest-live diff exposes a
+     * live cross-machine desync the RNG oracle missed; a machine's live log vs its OWN replay log
+     * exposes a record/playback asymmetry in our code. P1-also-off => global FP; P2-only => graft.
+     * The §8aa pin proved a no-op for th7_12, so the residual is NOT control-word precision. */
+    if (isP1 && (s_netActive || (IsReplayPlayback() && s_replayIsCoop))) {
+        static int s_rpyDbgTick = 0;
+        int fr = s_netActive ? s_netFrame : s_rpyDbgTick;
+        if ((fr % 60) == 0) {
+            void *p2d = (void *)s_p2;
+            Log("coop diag %s f=%d P1=(%.3f,%.3f) P2=(%.3f,%.3f) rng=0x%04x ctr=%u cw=0x%04x pin=%d",
+                s_netActive ? "LIVE" : "RPLY", fr,
+                *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X),
+                *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_Y),
+                p2d ? *(float *)((char *)p2d + OFF_POS_X) : -1.0f,
+                p2d ? *(float *)((char *)p2d + OFF_POS_Y) : -1.0f,
+                (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR,
+                _controlfp(0, 0) & 0xffff, s_fpuPinnedReplay);
+        }
+        s_rpyDbgTick++;
+    }
+
     /* B2: refresh the power->cherry suppression flag once per frame (read by the
      * item-spawner detour; inert when that hook isn't installed). Suppress while
      * P2 is live and below full power — so P1-full alone keeps drops as power. */
@@ -4105,6 +4138,7 @@ static void ResetCoopSession(void)
     s_replayIsCoop  = 0;         /* §8k: forget the last replay's co-op tag        */
     s_replayNetRecorded = 0;     /* §8aa: forget last replay's net-recorded/FPU flag */
     s_fpuPinnedReplay = 0;       /* re-log the replay FPU pin for the next replay    */
+    s_replayPinDecisionLogged = 0;
     s_replayLoadLogged = 0;      /* so the next replay re-logs its P2 character     */
     s_p1Ghost       = 0;
     s_p2Ghost       = 0;

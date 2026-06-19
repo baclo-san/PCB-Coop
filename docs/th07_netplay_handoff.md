@@ -2541,3 +2541,33 @@ so a hand-set `replay_fpu_pin=1` survives launches, and AUTO needs no ini entry.
 auto-pins, run should reproduce to the end. Log: `replay PLAYBACK: ... netRec=1` then `x87 control word
 pinned ... (§8aa)`. (b) the existing `th7_10`: set `[coop] replay_fpu_pin = 1`, play it back, confirm it
 holds together far longer. Build green, native test green (16/16).
+
+### §8ab — replay drift is NOT the control word; cross-machine sim divergence diag (2026-06-19)
+
+Tester ran a 2nd Phantasm replay `th7_12` recorded on the OTHER machine (**Wine + Ryzen 5800**), played back
+on the Windows box. It holds sync with the real run for MINUTES (through Ran's 1st spellcard) then P2 dies a
+few px to the LEFT of where the real P2 (video) dodged to the RIGHT. Crucially: **`replay_fpu_pin` ON vs OFF
+gave EXACTLY the same result** — so the §8aa x87 control-word pin is a **no-op** here, and the residual drift
+is **not** precision/rounding. P2 spawn was verified deterministic (clones P1's fixed stage-start pos ±
+`P2_SPAWN_OFFSET_X` on a deterministic frame), and "holds for minutes" rules out a spawn-frame/large start
+offset (those diverge from frame 1). So it's slow accumulating drift from something the control word doesn't
+cover — candidates: cross-platform transcendentals (Wine vs Windows `fsin`/`fcos`/`fpatan` in aimed shots /
+curving lasers), or a record-vs-playback asymmetry in OUR code, or a residual LIVE cross-machine desync the
+RNG-seed oracle never caught (the two machines' P2 differed live, and the replay just reproduces the
+playback-machine's version — note `th7_10` desynced even SAME-machine, so cross-platform is not the whole
+story).
+
+**Diagnostic added (coop.c `HookedUpdate`):** `coop diag LIVE/RPLY f=… P1=(x,y) P2=(x,y) rng ctr cw pin`
+~1/sec, during **both** live netplay and co-op replay playback. Under netplay the frame label is the lockstep
+frame (identical on both machines). The experiment to localise the fork:
+1. **Same-machine faithful?** Play `th7_12` on the WINE box (where it was recorded). If it matches the video
+   there, the replay format is faithful and the Windows divergence is pure cross-platform sim.
+2. **Fresh 2-PC run with this build**, keep BOTH coop_log.txt files, then play each machine's `.rpy` back on
+   its own machine. Diff:
+   - host-LIVE vs guest-LIVE (same `f=`): if they differ, the **live** sims forked cross-machine (RNG oracle
+     missed it) — the root problem, unfixable by any replay change.
+   - a machine's LIVE vs its OWN RPLY: if they differ, a **record/playback asymmetry in our code** (fixable).
+   - P1 also off ⇒ global FP; P2-only ⇒ our graft.
+
+No determinism fix this round — this is instrumentation to turn the guesswork into a diff. Build green,
+native test green (16/16).

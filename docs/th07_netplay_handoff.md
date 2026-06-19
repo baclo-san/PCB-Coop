@@ -2481,3 +2481,33 @@ probe off and confirm P2 keeps its character the whole run** (no "retiring … m
 DOES retire mid-run in normal play, the follow-up is a free-protection hook on `FUN_0044e4e0` (skip frees
 of `s_p2AnmSlot` unless we initiated them) — deferred until there's evidence it's needed (it's an
 invasive thiscall hook). THEN build the portrait on top.
+
+### §8z — LOCAL co-op replays never recorded P2's input (the real playback desync) (2026-06-19)
+
+Tester confirmed diff-char P2 is crash-free with the probe off (§8y good), and that replay playback now
+spawns P2 and "resembles gameplay but **desyncs and doesn't go far**." Hypothesis on the table: the replay
+was recorded at spawn delay 30 but plays back at 2. **That's a red herring** — `AUTO_SPAWN_AFTER` is a
+compile-time constant, so record and playback use the identical value for any same-build replay, and the
+spawn frame is deterministic (P1Ready && state==0 lands on the same frame both times).
+
+**Real root cause (found by tracing the record path):** ZUN's record task `FUN_00442cd0` saves
+**`g_InputMenu`** (`0x4b9e4c`) to the `.rpy` each frame (it also copies it into `g_InputGameplay`).
+Playback's `FUN_00442ee0` writes that saved word back into `g_InputGameplay`, whose **high 7 bits are P2**
+(UnpackP2). So P2's input rides the recorded word — *but only if something put P2 into `g_InputMenu`'s high
+bits before the record runs*. Under **netplay** `HookedSceneTick` does exactly that (`*g_InputMenu = merged`).
+Under **LOCAL co-op there was no such seam** — `g_InputMenu` held P1 only, so a local `.rpy` recorded
+**zero P2 input**. On playback P2 spawned (tag works) but never moved or shot, so the co-op sim forked the
+moment P2's actions mattered. (Note: record uses `FUN_00442cd0`, playback uses a *different* task
+`FUN_00442ee0`, so our `HookedFrameTask` hook only runs while recording/live — the correct exclusive seam.)
+
+**Fix (coop.c):** added `PackP2()` (exact inverse of `UnpackP2`) and, in `HookedFrameTask` **before**
+`s_origFrameTask` runs, for local co-op in-stage: `*g_InputMenu = (g_InputMenu & 0x1FF) | PackP2(ReadP2InputLocal())`.
+The captured word is stored in `s_p2LocalIn` and the player-update hook now reads P2's local input from that
+same static instead of re-polling — so the word saved to the `.rpy` is byte-identical to the one P2 acts on
+this frame (**record == live == playback**). `HookedFrameTask` always runs before the player update (the
+record task must copy `g_InputMenu`→`g_InputGameplay` before the player reads it), so the static is fresh.
+
+**Important:** old `.rpy` files (incl. the tester's `th7_10.rpy` / the round-2 MarisaB recording) were made
+*before* this seam existed, so they still hold no P2 input — they can't be rescued. **A replay recorded with
+THIS build will carry P2.** Test: record a fresh local co-op run, play it back, confirm P2 reproduces its run
+to the end without desync. Build green, native test green (16/16).

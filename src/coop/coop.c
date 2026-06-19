@@ -1222,6 +1222,27 @@ static uint16_t UnpackP2(uint16_t m)
     return w;
 }
 
+/* Pack P2's gameplay word (IN_* low-bit layout) into the merged high bits — the exact
+ * inverse of UnpackP2. Used by the LOCAL co-op replay-record seam (HookedFrameTask) to
+ * lay P2 into g_InputMenu's high 7 bits before ZUN records it, so a local .rpy carries
+ * P2's input the same way a netplay .rpy does (where merge.cpp/SceneTick already merge). */
+static uint16_t PackP2(uint16_t w)
+{
+    uint16_t m = 0;
+    if (w & IN_SHOOT) m |= (1u << 9);
+    if (w & IN_BOMB)  m |= (1u << 10);
+    if (w & IN_FOCUS) m |= (1u << 11);
+    if (w & IN_UP)    m |= (1u << 12);
+    if (w & IN_DOWN)  m |= (1u << 13);
+    if (w & IN_LEFT)  m |= (1u << 14);
+    if (w & IN_RIGHT) m |= (1u << 15);
+    return m;
+}
+/* P2's local-keyboard word captured at the record seam (HookedFrameTask) each frame and
+ * reused by the player-update hook, so the word saved to the replay is byte-identical to
+ * the one P2 actually acts on this frame (record == live == playback). */
+static uint16_t s_p2LocalIn = 0;
+
 static void LoadNetConfig(void)
 {
     char ini[MAX_PATH], buf[64];
@@ -1675,9 +1696,10 @@ static int __fastcall HookedGameStart(int self)
 /* ===================== end netplay ===================== */
 
 /* ---- co-op replay tagging (FUN_00443040 — replay header builder) -------------
- * PCB already records the full 16-bit input word per frame (FUN_00442cd0), and
- * our merge puts P2 in the high 7 bits — so a co-op .rpy ALREADY carries P2's
- * whole input stream for free. The one datum the vanilla header lacks is WHICH
+ * PCB already records the full 16-bit input word per frame (FUN_00442cd0 saves
+ * g_InputMenu), and our merge puts P2 in the high 7 bits — netplay merges in
+ * HookedSceneTick, LOCAL co-op merges in HookedFrameTask right before the record —
+ * so a co-op .rpy carries P2's whole input stream. The one datum the vanilla header lacks is WHICH
  * character P2 picked. We stash it (so co-op runs save as complete replays now;
  * actual two-player PLAYBACK is a planned follow-up that will read this back).
  *
@@ -3364,6 +3386,22 @@ static void __fastcall HookedBorderBreak(void *self, void *edx, int flag)
  * run reseeds from P1. A ghost is revived by the transition (still 0 spares). */
 static int __fastcall HookedFrameTask(int *self)
 {
+    /* LOCAL co-op REPLAY RECORD: s_origFrameTask (FUN_00442cd0) saves g_InputMenu to the
+     * .rpy buffer each frame. Under netplay HookedSceneTick already merged P2 into g_InputMenu
+     * (high 7 bits) before this runs, so net replays carry P2. LOCAL co-op had NO such seam —
+     * g_InputMenu held P1 only, so a local .rpy recorded P1's stream and ZERO P2 input. On
+     * playback P2 then spawned but never moved or shot, and the co-op sim diverged ("resembles
+     * gameplay but desyncs"). Lay P2 into the high bits HERE, before the record reads g_InputMenu,
+     * and capture the exact word (this task always runs before the player update) so the live
+     * update below uses the identical value — record == live == playback. Playback registers a
+     * DIFFERENT task (FUN_00442ee0), so this hook never runs during playback; gating is belt-only. */
+    if (!s_netActive && !IsReplayPlayback() && s_p2 && !s_p2Ghost) {
+        s_p2LocalIn = ReadP2InputLocal();
+        *ADDR_INPUT_MENU = (uint16_t)((*ADDR_INPUT_MENU & 0x01FF) | PackP2(s_p2LocalIn));
+    } else {
+        s_p2LocalIn = 0;
+    }
+
     int r = s_origFrameTask(self);
     int f = *self;
     uint32_t res = *ADDR_RES_PTR;
@@ -3534,7 +3572,7 @@ static int __fastcall HookedUpdate(void *self)
              * The swap below is unchanged for all three. */
             uint16_t p2in  = IsReplayPlayback() ? UnpackP2(*ADDR_INPUT_GAMEPLAY)
                            : s_netActive        ? UnpackP2(s_netMerged)
-                           : ReadP2InputLocal();
+                           : s_p2LocalIn; /* captured at the record seam — same word saved to .rpy */
             uint16_t saved = *ADDR_INPUT_GAMEPLAY;
             if (p2in && !s_p2InputLogged) { Log("P2 input read OK: 0x%03x (key path works)", p2in); s_p2InputLogged = 1; }
             if (s_p2Ghost) p2in = 0;    /* ghost: no input at all — MoveGhost drives it */

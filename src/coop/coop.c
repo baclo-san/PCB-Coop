@@ -1530,24 +1530,10 @@ static int __fastcall HookedSceneTick(void *self)
      * s_replayTargetCw (from the header) whenever it differs from the default 24-bit. Local replays
      * (target 0x007f) are left untouched (they already replay perfectly). Auto (replay_fpu_pin=-1)
      * decides by the target; =1 forces a pin, =0 disables. Real fldcw, before this frame's sim. */
-    if (IsReplayPlayback()) {
-        /* effective target: a replay predating the §8ad cw stamp AND the §8aa net flag falls back
-         * to 24-bit; replay_fpu_pin=1 forces 64-bit so such OLD netplay replays can be reproduced. */
-        unsigned short tgt = s_replayTargetCw;
-        if (s_replayFpuPin == 1 && tgt == 0x007f) tgt = 0x037f;
-        int pin = (s_replayFpuPin == 0) ? 0
-                : (s_replayFpuPin == 1) ? 1
-                : (s_replayIsCoop && tgt != 0x007f);   /* auto (-1) */
-        s_replayPinCw = pin ? tgt : 0;                 /* §8ad: re-pinned at the sim seam too */
-        if (!s_replayPinDecisionLogged) {
-            s_replayPinDecisionLogged = 1;
-            Log("replay PLAYBACK: fpu-pin decision=%s targetCw=0x%04x (replay_fpu_pin=%d netRec=%d "
-                "coop=%d) current cw=0x%04x — reproducing the recording's precision (§8ad).",
-                pin ? "PIN" : "native", tgt, s_replayFpuPin, s_replayNetRecorded,
-                s_replayIsCoop, (unsigned)FpuCw());
-        }
-        if (pin) PinFpuForReplay(tgt);
-    }
+    /* §8ad: apply the playback FPU pin if this scene-tick runs (menus). The DECISION is made in
+     * HookedReplayLoad and the per-frame IN-STAGE pin is HookedPlayTask (FUN_00442ee0) — this
+     * scene-tick does NOT run during in-stage replay playback (confirmed: no decision line fired). */
+    if (IsReplayPlayback() && s_replayPinCw) FpuSetCw(s_replayPinCw);
     if (s_netStarted && !s_netActive) {
         /* connection handshake at the front-end: keep pinging until the peer answers,
          * then the link is live (guest has adopted the host's delay+seed). */
@@ -1883,8 +1869,11 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
  * 16-bit word into g_InputGameplay, so its HIGH bits ARE P2's recorded input. */
 #define REPLAY_MODE_OFF  0x44                     /* mgr+0x44: 0 record, 1 playback         */
 #define ADDR_REPLAY_LOAD ((LPVOID)0x00443550)     /* FUN_00443550 — playback header consume */
+#define ADDR_REPLAY_PLAY_TASK ((LPVOID)0x00442ee0) /* FUN_00442ee0 — per-frame PLAYBACK input task */
 typedef uint32_t (__fastcall *ReplayLoadFn_t)(void *self);
 static ReplayLoadFn_t s_origReplayLoad = NULL;
+typedef int (__fastcall *PlayTaskFn_t)(int *self);
+static PlayTaskFn_t s_origPlayTask = NULL;
 /* s_replayIsCoop + s_replayNetRecorded are declared earlier (before HookedSceneTick). */
 static int s_replayP2Sel    = -1;  /* P2's character recovered from the header             */
 static int s_replayDiffChar = 0;   /* P2 was a different char (header byte 0x5b)           */
@@ -1957,6 +1946,33 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
             s_replayLoadLogged = 1;
         }
     }
+    /* §8ad: decide the playback FPU pin ONCE here (HookedReplayLoad always runs on load),
+     * because HookedSceneTick's pin block does NOT execute during in-stage replay playback
+     * (the replay drives a different task path — confirmed: no "fpu-pin decision" line, pin=0).
+     * The actual fldcw is applied each frame by HookedPlayTask (frame-start) + the sim seam. */
+    {
+        unsigned short tgt = s_replayTargetCw;
+        if (s_replayFpuPin == 1 && tgt == 0x007f) tgt = 0x037f;   /* force override → 64-bit */
+        int pin = (s_replayFpuPin == 0) ? 0
+                : (s_replayFpuPin == 1) ? 1
+                : (s_replayIsCoop && tgt != 0x007f);              /* auto (-1) */
+        s_replayPinCw = pin ? tgt : 0;
+        if (IsReplayPlayback())
+            Log("replay PLAYBACK: fpu-pin decision=%s targetCw=0x%04x (replay_fpu_pin=%d netRec=%d "
+                "coop=%d) — reproducing the recording's x87 precision (§8ad).",
+                pin ? "PIN" : "native", tgt, s_replayFpuPin, s_replayNetRecorded, s_replayIsCoop);
+    }
+    return r;
+}
+
+/* §8ad: FUN_00442ee0 — the per-frame PLAYBACK input task (mirror of the record task FUN_00442cd0).
+ * THIS is the frame-start hook that actually runs during in-stage replay playback, so it's where
+ * the recorded x87 precision must be re-asserted (before the frame's whole sim — enemies, bullets,
+ * players). HookedSceneTick doesn't fire here; HookedReplayLoad decided s_replayPinCw. */
+static int __fastcall HookedPlayTask(int *self)
+{
+    int r = s_origPlayTask(self);
+    if (s_replayPinCw) PinFpuForReplay(s_replayPinCw);
     return r;
 }
 
@@ -4503,6 +4519,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_DECL_DRAW,      (LPVOID)&HookedDeclDraw,      (LPVOID*)&s_origDeclDraw)      != MH_OK) return 0;
     if (MH_CreateHook(ADDR_REPLAY_HDR_INIT,(LPVOID)&HookedReplayHdrInit, (LPVOID*)&s_origReplayHdr)     != MH_OK) return 0;
     if (MH_CreateHook(ADDR_REPLAY_LOAD,    (LPVOID)&HookedReplayLoad,    (LPVOID*)&s_origReplayLoad)    != MH_OK) return 0; /* §8k playback */
+    if (MH_CreateHook(ADDR_REPLAY_PLAY_TASK,(LPVOID)&HookedPlayTask,     (LPVOID*)&s_origPlayTask)      != MH_OK) return 0; /* §8ad playback FPU pin */
     /* B5: capture the enemy-manager base (FUN_00420620's ECX/param_1) so the boss-spell
      * armour gate reads the LIVE spellcardInfo.isActive at param_1+0x9545c8. The base is
      * non-zero in-game (the absolute-globals assumption was wrong — see HookedEnemyUpdate). */
@@ -4540,6 +4557,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_DECL_MAKE)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_REPLAY_HDR_INIT)!= MH_OK) return 0;
+    if (MH_EnableHook(ADDR_REPLAY_PLAY_TASK)!= MH_OK) return 0;  /* §8ad playback FPU pin */
     if (MH_EnableHook(ADDR_REPLAY_LOAD)    != MH_OK) return 0;   /* §8k: was CREATED but never
                                                                    ENABLED — playback ran unhooked,
                                                                    so co-op replays never spawned P2 */

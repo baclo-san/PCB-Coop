@@ -2571,3 +2571,42 @@ frame (identical on both machines). The experiment to localise the fork:
 
 No determinism fix this round — this is instrumentation to turn the guesswork into a diff. Build green,
 native test green (16/16).
+
+### §8ac — instrumentation: per-frame replay-determinism trace + the 2-PC diff (2026-06-20)
+
+Tester clarified the test methodology (the EARLY stage-1 desyncs are the expected sync ritual; the REAL run
+is the continuous Phantasm stage), and confirmed **local co-op replays play perfectly**. So the core
+record→playback path is sound and the bug is **netplay-specific**. To localise it, added a per-frame CSV
+trace keyed by the **replay frame index** (`*(int*)(*ADDR_REPLAY_MGR)` — identical in record and playback):
+`coop_rdt_rec.csv` while recording, `coop_rdt_rpy.csv` on playback, columns
+`rf,input,seed,counter,p1x,p1y,p2x,p2y,cw`. Gated by `[coop] replay_trace` (default 0).
+
+**The 2-PC log diff that cracked it.** Host vs guest det-trace across all **30,648 frames** of the continuous
+Phantasm run: **0 input diffs, 0 RNG-seed diffs** — the live netplay sim was BIT-PERFECT. Yet the netplay
+replay of that perfect run desyncs, and local replays are perfect. So inputs and seed are correct; the
+divergence is record-vs-playback, netplay-only.
+
+### §8ad — THE netplay-replay desync: 64-bit record vs 24-bit playback x87 precision (2026-06-20)
+
+The `cw` columns gave it away. The live det-trace shows **`fpucw=037f` (64-bit extended)** on both machines
+the whole run; the playback trace (`coop_rdt_rpy.csv`) shows **`cw=007f` (24-bit)**. **The netplay sim
+records at 64-bit but the replay re-runs at 24-bit** — same inputs + same seed at a different x87 precision
+fork the simulation. That's the whole bug, and it explains every observation:
+- **Local replays sync**: no netcode runs, so the recording stays at D3D's 24-bit → playback 24-bit. Match.
+- **Netplay replays desync**: the netcode leaves the x87 in 64-bit during the live run → recording at 64-bit,
+  playback at 24-bit. Mismatch.
+- **Live run bit-perfect**: both machines run the netcode → both 64-bit → consistent with each other.
+- **The §8q/§8aa "24-bit pin" was always a no-op**: `_controlfp` on this llvm-mingw CRT does NOT change the
+  x87 precision field (the det-trace stayed 037f under the "pin"). The real 2-PC desync fix back then was the
+  host-authoritative difficulty ([[netplay-desync-starting-config]]), not the pin.
+
+**Fix (coop.c):** reproduce the recording's precision on playback with a **real `fldcw`** (`FpuSetCw`).
+(1) While recording, the player-update hook stamps the sim's actual control word into replay header byte
+`0x5d` (sentinel `0x80|((cw>>8)&0xf)`). (2) On load, `HookedReplayLoad` computes `s_replayTargetCw` from
+that stamp, or — for replays predating the stamp — falls back to the §8aa net-recorded flag (netplay⇒64-bit,
+local⇒24-bit). (3) `HookedSceneTick` calls `PinFpuForReplay()` → `FpuSetCw(targetCw)` each frame when the
+target differs from 24-bit, so the playback sim runs at the recorded precision. Local replays (target 0x007f)
+are left untouched. Live netplay is **not** modified (it works at 64-bit). The existing bit-perfect run's
+host `.rpy` carries the §8aa net flag, so it auto-pins to 64-bit on playback with this build — verifiable
+without a fresh 2-PC run. Confirm: `coop diag RPLY ... cw=0x037f` and the replay tracks the run to the end.
+Build green, native test green (16/16).

@@ -1362,6 +1362,12 @@ static inline unsigned short FpuCw(void)
 { unsigned short w; __asm__ __volatile__("fnstcw %0" : "=m"(w)); return w; }
 static inline unsigned short FpuSw(void)
 { unsigned short w; __asm__ __volatile__("fnstsw %0" : "=m"(w)); return w; }
+/* Set the x87 control word for real (fldcw). _controlfp on this llvm-mingw CRT does NOT change
+ * the x87 PRECISION field (confirmed §8ad: the det-trace stayed at 0x037f under the "24-bit pin"),
+ * so any precision change must use fldcw directly. 0x007f = 24-bit/round-nearest (D3D/vanilla),
+ * 0x037f = 64-bit extended (what the netcode leaves the x87 in during live netplay). */
+static inline void FpuSetCw(unsigned short cw)
+{ __asm__ __volatile__("fldcw %0" : : "m"(cw)); }
 static unsigned char s_fpuState[108] __attribute__((aligned(16)));
 #define FPU_SAVE()    __asm__ __volatile__("fnsave  %0" : "=m"(s_fpuState) : : "memory")
 #define FPU_RESTORE() __asm__ __volatile__("frstor  %0" : : "m"(s_fpuState) : "memory")
@@ -1402,14 +1408,22 @@ static void PinFpuForNetplay(void)
  * WITHOUT a pin — keep their native FP and are never perturbed. */
 static int s_fpuPinnedReplay = 0;
 static int s_replayPinDecisionLogged = 0;   /* §8aa: one-shot per replay, logs pin yes/no + cw */
+static unsigned short s_replayTargetCw = 0x007f;  /* §8ad: the x87 cw the recording's SIM ran at */
+/* §8ad: reproduce the recording's x87 PRECISION on playback. The real bug: a NETPLAY recording's
+ * sim runs at 64-bit (0x037f — the netcode leaves the x87 in extended precision), but replay
+ * playback runs at D3D's 24-bit (0x007f, confirmed: coop_rdt_rpy.csv cw=007f vs the live
+ * det-trace 037f). Same inputs + same seed at a DIFFERENT precision => the sim forks. Local
+ * recordings have no netcode so they run at 24-bit and replay fine — which is exactly why local
+ * replays were perfect and netplay replays desynced. Force the recorded precision with a REAL
+ * fldcw (PinFpuForNetplay's _controlfp was a no-op). */
 static void PinFpuForReplay(void)
 {
-    unsigned prev = _controlfp(0, 0);
-    _controlfp(_PC_24 | _RC_NEAR, _MCW_PC | _MCW_RC);
+    unsigned short prev = FpuCw();
+    FpuSetCw(s_replayTargetCw);
     if (!s_fpuPinnedReplay) {
         s_fpuPinnedReplay = 1;
-        Log("replay PLAYBACK: x87 control word pinned to 24-bit/round-nearest (was 0x%04x) — "
-            "matching the netplay recording's FP environment (§8aa).", prev & 0xffff);
+        Log("replay PLAYBACK: x87 control word set to 0x%04x (was 0x%04x) — reproducing the "
+            "recording's precision (§8ad).", s_replayTargetCw, prev);
     }
 }
 
@@ -1509,22 +1523,22 @@ static void SyncMenuRepeat(uint16_t merged)
 static int __fastcall HookedSceneTick(void *self)
 {
     int r = s_origSceneTick(self);          /* ZUN: g_InputMenu = Input_Poll() */
-    /* §8aa: co-op replay PLAYBACK runs with s_netActive=0, so the netplay FPU pin below never
-     * fires — but a NETPLAY .rpy was recorded pinned, so re-simulate it pinned too or it drifts.
-     * Auto (replay_fpu_pin=-1): pin iff the header says it was net-recorded. =1 forces it on (old
-     * netplay replays predating the flag, e.g. th7_10); =0 disables. Solo/local replays (not pinned
-     * at record) stay native. Runs before the sim this frame, same timing as PinFpuForNetplay. */
+    /* §8ad: co-op replay PLAYBACK runs at D3D's 24-bit x87, but a NETPLAY run RECORDED at 64-bit
+     * (the netcode leaves the x87 in extended precision). Same inputs+seed at a different precision
+     * forks the sim — THE netplay-replay desync. Reproduce the recorded precision: pin to
+     * s_replayTargetCw (from the header) whenever it differs from the default 24-bit. Local replays
+     * (target 0x007f) are left untouched (they already replay perfectly). Auto (replay_fpu_pin=-1)
+     * decides by the target; =1 forces a pin, =0 disables. Real fldcw, before this frame's sim. */
     if (IsReplayPlayback()) {
         int pin = (s_replayFpuPin == 1) ? 1
                 : (s_replayFpuPin == 0) ? 0
-                : (s_replayIsCoop && s_replayNetRecorded);   /* auto (-1) */
+                : (s_replayIsCoop && s_replayTargetCw != 0x007f);   /* auto (-1) */
         if (!s_replayPinDecisionLogged) {
             s_replayPinDecisionLogged = 1;
-            Log("replay PLAYBACK: fpu-pin decision=%s (replay_fpu_pin=%d netRec=%d coop=%d) "
-                "current cw=0x%04x — if drift persists with pin=YES, the residual is cross-machine "
-                "FP not covered by the control word (transcendentals).",
-                pin ? "PIN" : "native", s_replayFpuPin, s_replayNetRecorded, s_replayIsCoop,
-                _controlfp(0, 0) & 0xffff);
+            Log("replay PLAYBACK: fpu-pin decision=%s targetCw=0x%04x (replay_fpu_pin=%d netRec=%d "
+                "coop=%d) current cw=0x%04x — reproducing the recording's precision (§8ad).",
+                pin ? "PIN" : "native", s_replayTargetCw, s_replayFpuPin, s_replayNetRecorded,
+                s_replayIsCoop, (unsigned)FpuCw());
         }
         if (pin) PinFpuForReplay();
     }
@@ -1803,9 +1817,11 @@ static int __fastcall HookedGameStart(int self)
 #define RPY_COOP_OFF  0x58                 /* spare header gap 0x58-0x5d           */
 #define RPY_COOP_MAG0 0xC2                 /* co-op block magic / format tag       */
 #define RPY_COOP_MAG1 0x07
+#define RPY_CW_OFF    0x5d                 /* §8ad: recording's x87 cw nibble (0x80|((cw>>8)&0xf)) */
 typedef uint32_t (__fastcall *ReplayHdrFn_t)(void *self);
 static ReplayHdrFn_t s_origReplayHdr = NULL;
 static int s_rpyTagLogged = 0;
+static unsigned char *s_rpyHdrBuf = NULL;  /* §8ad: live header buffer, so the SIM can stamp the cw */
 
 static uint32_t __fastcall HookedReplayHdrInit(void *self)
 {
@@ -1833,6 +1849,13 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
          * reproduce that FP environment or the sim drifts (trig-driven aimed shots diverge) —
          * "resembles the moves but desyncs". Local/solo runs leave this 0 (vanilla FP). */
         hdr[RPY_COOP_OFF + 4] = (unsigned char)(s_netActive ? 0x01 : 0x00);
+        /* §8ad: byte 0x5d holds the x87 control word the SIM runs at, so playback can reproduce
+         * the exact precision (a netplay run records at 64-bit, local at 24-bit — the real cause
+         * of the netplay-replay desync). The cw isn't known yet at header init, so seed it 0
+         * (no sentinel) and let the player-update hook stamp 0x80|((cw>>8)&0xf) once the sim runs.
+         * Keep the live buffer so the SIM can write into the same bytes that get saved. */
+        hdr[RPY_CW_OFF] = 0x00;
+        s_rpyHdrBuf = hdr;
         if (!s_rpyTagLogged) {
             int n = (p2sel >= 0 && p2sel <= 5) ? p2sel : 0;
             Log("replay: tagged co-op header — P2=%s diff=%d (+0x%02x)",
@@ -1886,10 +1909,16 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
         s_replayP2Sel    = (signed char)hdr[RPY_COOP_OFF + 2];
         s_replayDiffChar = hdr[RPY_COOP_OFF + 3] ? 1 : 0;
         s_replayNetRecorded = (hdr[RPY_COOP_OFF + 4] & 0x01) ? 1 : 0;   /* §8aa */
+        /* §8ad: target playback precision. Prefer the stamped cw (sentinel bit7, built by this
+         * build); else fall back to the net flag (older co-op replays predate the cw byte —
+         * netplay recorded at 64-bit, local at 24-bit). */
+        s_replayTargetCw = (hdr[RPY_CW_OFF] & 0x80)
+                         ? (unsigned short)(0x007f | ((hdr[RPY_CW_OFF] & 0x0f) << 8))
+                         : (s_replayNetRecorded ? 0x037f : 0x007f);
         if (!s_replayLoadLogged) {
             int n = (s_replayP2Sel >= 0 && s_replayP2Sel <= 5) ? s_replayP2Sel : 0;
-            Log("replay PLAYBACK: co-op replay — P2=%s diffchar=%d netRec=%d (header +0x%02x)",
-                ADDR_SEL_NAMES[n], s_replayDiffChar, s_replayNetRecorded, RPY_COOP_OFF);
+            Log("replay PLAYBACK: co-op replay — P2=%s diffchar=%d netRec=%d targetCw=0x%04x (header +0x%02x)",
+                ADDR_SEL_NAMES[n], s_replayDiffChar, s_replayNetRecorded, s_replayTargetCw, RPY_COOP_OFF);
             s_replayLoadLogged = 1;
         }
     } else if (IsReplayPlayback() && s_forceReplayP2 >= 0 && hdr) {
@@ -1900,6 +1929,10 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
         s_replayP2Sel    = s_forceReplayP2;
         s_replayDiffChar = ((s_forceReplayP2 / 2) != (int)hdr[RPY_P1CHAR_OFF]) ? 1 : 0;
         s_replayNetRecorded = 0;   /* §8aa: untagged/forced — flag unknown; use replay_fpu_pin=1 */
+        /* §8ad: forced/legacy replays predate the cw stamp and are almost always netplay-era
+         * (a local co-op replay would carry the tag), so assume 64-bit unless a stamp exists. */
+        s_replayTargetCw = (hdr[RPY_CW_OFF] & 0x80)
+                         ? (unsigned short)(0x007f | ((hdr[RPY_CW_OFF] & 0x0f) << 8)) : 0x037f;
         if (!s_replayLoadLogged) {
             int n = (s_forceReplayP2 <= 5) ? s_forceReplayP2 : 0;
             Log("replay PLAYBACK: FORCED co-op (force_replay_p2=%d -> P2=%s diffchar=%d, "
@@ -3557,13 +3590,21 @@ static int __fastcall HookedUpdate(void *self)
     if (isP1 && (s_p2 || (IsReplayPlayback() && s_replayIsCoop))) {
         static int s_rpyDbgTick = 0;
         int play = IsReplayPlayback();
+        /* §8ad: while RECORDING, stamp the cw the SIM is actually running at into the replay
+         * header (sentinel bit7 set) so playback can reproduce that exact precision. This is the
+         * fix: a netplay sim runs at 64-bit, a local sim at 24-bit; without this, every netplay
+         * replay re-runs at D3D's 24-bit and forks. !play => recording; s_rpyHdrBuf is the live
+         * header. Stamped every frame (cheap, 1 byte) so the saved header carries the latest. */
+        if (!play && s_rpyHdrBuf)
+            s_rpyHdrBuf[RPY_CW_OFF] = (unsigned char)(0x80 | ((FpuCw() >> 8) & 0x0f));
         ReplayDetTrace(play);                               /* §8ac per-frame CSV (gated by replay_trace) */
         int fr = s_netActive ? s_netFrame : s_rpyDbgTick;   /* net=lockstep frame; else stage-tick */
         if ((fr % 60) == 0) {
             void *p2d = (void *)s_p2;
             /* REC-LOC vs RPLY share the stage-tick counter (P2 auto-spawns on the same frame both
              * times), so a LOCAL record-then-replay on ONE machine diffs line-for-line — the
-             * cleanest determinism test (no netcode, no seed-force, no cross-platform). */
+             * cleanest determinism test (no netcode, no seed-force, no cross-platform). cw is the
+             * RAW x87 word (FpuCw) now — 0x037f=64-bit, 0x007f=24-bit; the §8ad precision lever. */
             Log("coop diag %s f=%d P1=(%.3f,%.3f) P2=(%.3f,%.3f) rng=0x%04x ctr=%u cw=0x%04x pin=%d",
                 s_netActive ? "LIVE-NET" : (play ? "RPLY" : "REC-LOC"), fr,
                 *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X),
@@ -3571,7 +3612,7 @@ static int __fastcall HookedUpdate(void *self)
                 p2d ? *(float *)((char *)p2d + OFF_POS_X) : -1.0f,
                 p2d ? *(float *)((char *)p2d + OFF_POS_Y) : -1.0f,
                 (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR,
-                _controlfp(0, 0) & 0xffff, s_fpuPinnedReplay);
+                (unsigned)FpuCw(), s_fpuPinnedReplay);
         }
         s_rpyDbgTick++;
     }
@@ -4178,6 +4219,7 @@ static void ResetCoopSession(void)
     s_readyFrames   = 0;
     s_replayIsCoop  = 0;         /* §8k: forget the last replay's co-op tag        */
     s_replayNetRecorded = 0;     /* §8aa: forget last replay's net-recorded/FPU flag */
+    s_replayTargetCw = 0x007f;   /* §8ad: default precision until the next replay loads its cw */
     s_fpuPinnedReplay = 0;       /* re-log the replay FPU pin for the next replay    */
     s_replayPinDecisionLogged = 0;
     s_replayLoadLogged = 0;      /* so the next replay re-logs its P2 character     */

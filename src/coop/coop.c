@@ -157,6 +157,7 @@
 #define ADDR_PLAYER_UPDATE  ((LPVOID)0x00441fb0)   /* __fastcall(ecx=player)     */
 #define ADDR_PLAYER_DRAW    ((LPVOID)0x004420b0)   /* __fastcall(ecx=player)     */
 #define ADDR_INPUT_GAMEPLAY ((volatile uint16_t*)0x004b9e50) /* g_InputGameplay  */
+#define ADDR_REPLAY_MGR  ((void **)0x004b9e48)   /* -> replay manager (NULL until a game; §8ac trace) */
 
 /* gameplay input bits (low 9; same layout the player update reads) */
 #define IN_SHOOT 0x01
@@ -1202,6 +1203,7 @@ static int      s_replayFpuPin = -1;       /* coop.ini [coop] replay_fpu_pin: pi
  * reads them for the §8aa playback FPU pin). IsReplayPlayback() is forward-declared for the same. */
 static int      s_replayIsCoop = 0;        /* the loaded replay carries our co-op (0x58) tag    */
 static int      s_replayNetRecorded = 0;   /* §8aa: recorded under netplay (header 0x5c bit0)   */
+static int      s_replayTrace = 0;         /* §8ac coop.ini replay_trace: per-frame record/playback CSV */
 static int      IsReplayPlayback(void);
 /* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
  * per-player char-select FSM under netplay. Both machines compute the same pair. */
@@ -1274,6 +1276,8 @@ static void LoadNetConfig(void)
     s_forceReplayP2 = (int)GetPrivateProfileIntA("coop", "force_replay_p2", -1, ini);
     /* §8aa: pin x87 during co-op replay playback to match a netplay recording's FP env. */
     s_replayFpuPin = (int)GetPrivateProfileIntA("coop", "replay_fpu_pin", -1, ini);
+    /* §8ac: per-frame record/playback determinism CSV (coop_rdt_rec/rpy.csv). Default 0. */
+    s_replayTrace = (int)GetPrivateProfileIntA("coop", "replay_trace", 0, ini);
     /* item 4: per-key overrides for the local-coop P2 binds (blank => keep default). */
     {
         static const char *p2KeyIni[P2K_COUNT] = {
@@ -1442,6 +1446,39 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
             (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR, waitMs, sync,
             rf, sk, rk, rs, rsrc, rwr, s_fpuCw, s_fpuSw);
     fflush(s_trace);                        /* survive the freeze tail */
+}
+
+/* §8ac REPLAY-DETERMINISM TRACE — one CSV row per logic frame, keyed by the REPLAY FRAME
+ * INDEX (the record/playback task's own counter at *(*ADDR_REPLAY_MGR)), which is identical
+ * during recording and playback. So a netplay (or local) record run and a playback of its .rpy
+ * produce two files that diff line-for-line: the first rf where seed/counter/pos differ is the
+ * exact divergence. input = g_InputGameplay (the merged word actually applied this frame), so
+ * the streams can also be aligned by input if the rf origins differ. Gated by [coop] replay_trace
+ * (default 0) so normal play writes nothing. Separate files for record vs playback. */
+static FILE *s_rdtRec = NULL, *s_rdtRpy = NULL;
+static void ReplayDetTrace(int playback)
+{
+    if (!s_replayTrace) return;
+    void *rm = *ADDR_REPLAY_MGR;
+    int rf = rm ? *(int *)rm : -1;
+    FILE **fp = playback ? &s_rdtRpy : &s_rdtRec;
+    if (!*fp) {
+        char p[MAX_PATH];
+        snprintf(p, sizeof(p), "%scoop_rdt_%s.csv", s_dir, playback ? "rpy" : "rec");
+        *fp = fopen(p, "w");
+        if (!*fp) return;
+        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw\n", *fp);
+    }
+    void *p2 = (void *)s_p2;
+    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x\n",
+            rf, (unsigned)*ADDR_INPUT_GAMEPLAY,
+            (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR,
+            *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X),
+            *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_Y),
+            p2 ? *(float *)((char *)p2 + OFF_POS_X) : -1.0f,
+            p2 ? *(float *)((char *)p2 + OFF_POS_Y) : -1.0f,
+            (unsigned)FpuCw());
+    fflush(*fp);
 }
 
 /* Re-derive ZUN's menu key-repeat (hold-to-scroll) from the MERGED word so it is
@@ -1815,7 +1852,6 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
  * FUN_00442ee0 playback, PCBdecomp 27968-28003); the chosen mode is stored at
  * replayMgr+0x44 (0=record, 1=playback). In playback FUN_00442ee0 writes the recorded
  * 16-bit word into g_InputGameplay, so its HIGH bits ARE P2's recorded input. */
-#define ADDR_REPLAY_MGR  ((void **)0x004b9e48)   /* -> replay manager (NULL until a game)  */
 #define REPLAY_MODE_OFF  0x44                     /* mgr+0x44: 0 record, 1 playback         */
 #define ADDR_REPLAY_LOAD ((LPVOID)0x00443550)     /* FUN_00443550 — playback header consume */
 typedef uint32_t (__fastcall *ReplayLoadFn_t)(void *self);
@@ -3521,6 +3557,7 @@ static int __fastcall HookedUpdate(void *self)
     if (isP1 && (s_p2 || (IsReplayPlayback() && s_replayIsCoop))) {
         static int s_rpyDbgTick = 0;
         int play = IsReplayPlayback();
+        ReplayDetTrace(play);                               /* §8ac per-frame CSV (gated by replay_trace) */
         int fr = s_netActive ? s_netFrame : s_rpyDbgTick;   /* net=lockstep frame; else stage-tick */
         if ((fr % 60) == 0) {
             void *p2d = (void *)s_p2;

@@ -2610,3 +2610,48 @@ are left untouched. Live netplay is **not** modified (it works at 64-bit). The e
 host `.rpy` carries the §8aa net flag, so it auto-pins to 64-bit on playback with this build — verifiable
 without a fresh 2-PC run. Confirm: `coop diag RPLY ... cw=0x037f` and the replay tracks the run to the end.
 Build green, native test green (16/16).
+
+> **REFUTED by §8ae (2026-06-20).** The `037f` in the live trace was a sample-point artifact: that column is
+> captured in `HookedSceneTick` *right after the netcode runs* (which leaves the x87 at 64-bit), but the actual
+> SIM runs later at 24-bit. The **clean rec-vs-rpy trace proves the live sim records at `cw=007f` (24-bit)** —
+> identical to a local replay. Pinning playback to 64-bit was therefore *wrong*; it changed nothing because the
+> real fork was the RNG seed. The §8ad pin is now neutered (always targets the recorded 24-bit; never forces
+> 64-bit). Precision was never the cause.
+
+### §8ae — THE netplay-replay desync (for real): replay restores the PRE-force RNG seed (2026-06-20)
+
+A clean **record-vs-playback determinism diff** (both sides traced by the *same* `ReplayDetTrace` sample point,
+keyed by replay-frame `rf`) finally isolated it. Aligning the Phantasm stage of `coop_rdt_rec.csv` (live record)
+against `coop_rdt_rpy.csv` (its playback):
+- **Inputs are byte-perfect** — every input transition matches (`0200, 0a00, 0a00, 0200, …`), confirming the
+  merged P1+P2 stream is recorded and replayed exactly.
+- **Player positions are identical** at stage start (P1=176,384 / P2=224,384).
+- **But the RNG seed differs at stage frame 1**: rec `seed=0b14` vs rpy `seed=4207`. Same positions, same
+  inputs, different RNG state ⇒ every enemy's bullet pattern forks from the first frame of the stage. Both
+  players walk into bullets that weren't there live; **aimed** sections (deterministic from the forked seed)
+  kill fastest. The live RNG **counter is pinned at 0** the whole stage (`FUN_00442c60` zeroes `DAT_0049fe24`
+  every frame, PCBdecomp.c:27583) while playback's climbs — a second tell that the record/playback RNG paths
+  differ.
+
+**Mechanism.** Netplay force-seeds the live RNG to the shared init seed (`0x960b`) at *every scene start* — the
+`SEEDFORCE F1 seed 0x…->0x960b (once/scene)` log lines, applied in `HookedGameStart` / `HookedSceneTick`. But
+ZUN snapshots the seed into the replay's per-stage block (`stageblock+0x20`) **before** that force lands, so the
+`.rpy` stores the *pre-force* seed. On playback `FUN_00443550` does `DAT_0049fe20 = stageblock+0x20`
+(PCBdecomp.c:27909) — restoring the wrong seed. The live sim ran from `0x960b`; the replay runs from the stale
+snapshot ⇒ fork. **Local replays are perfect because local co-op never force-seeds**, so ZUN's snapshot *is* the
+seed the sim used. This also matched every prior symptom (input-perfect, position-perfect, precision-independent,
+netplay-only) once the FP red herring (§8ad) was cleared.
+
+**Fix (coop.c, §8ae):**
+1. **Record:** `HookedReplayHdrInit` stamps the netplay init seed (`Nc_GetInitSeed()`) into the free header bytes
+   `0x5e-0x5f` and sets bit1 of `0x5c` as the "seed present" sentinel (backfilled per-frame in case header-init
+   ran before link-up). Local/solo runs leave it clear → byte-clean vanilla replay.
+2. **Playback:** at the end of `HookedReplayLoad` (which *is* the hook on `FUN_00443550`, runs once per stage),
+   after the original restores the stale seed, re-apply `*ADDR_RNG_SEED = stampedInitSeed` — at the exact point
+   ZUN restored it and before the stage sim draws, mirroring the live per-scene SEEDFORCE. Gated on a net-recorded
+   replay carrying the stamp; legacy/forced replays (no stamp) can't be fixed retroactively.
+
+**Verification needs a FRESH recording** — replays made before this build (e.g. `th7_11.rpy`) lack the stamped
+seed and stay broken. Record a new netplay (or loopback) run on this build, play it back, and confirm the log
+shows `RNG seed re-forced 0x…-> 0x960b (§8ae …)` and the replay tracks the live run through the aimed sections.
+Build green, native test green (16/16).

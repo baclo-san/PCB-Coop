@@ -1203,6 +1203,8 @@ static int      s_replayFpuPin = -1;       /* coop.ini [coop] replay_fpu_pin: pi
  * reads them for the §8aa playback FPU pin). IsReplayPlayback() is forward-declared for the same. */
 static int      s_replayIsCoop = 0;        /* the loaded replay carries our co-op (0x58) tag    */
 static int      s_replayNetRecorded = 0;   /* §8aa: recorded under netplay (header 0x5c bit0)   */
+static unsigned short s_replayInitSeed = 0;/* §8ae: netplay RNG init seed stamped in the replay (0x5e) */
+static int      s_replayHasSeed = 0;       /* §8ae: a netplay init seed was stamped (0x5c bit1)  */
 static int      s_replayTrace = 0;         /* §8ac coop.ini replay_trace: per-frame record/playback CSV */
 static int      IsReplayPlayback(void);
 /* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
@@ -1810,6 +1812,7 @@ static int __fastcall HookedGameStart(int self)
 #define RPY_COOP_MAG0 0xC2                 /* co-op block magic / format tag       */
 #define RPY_COOP_MAG1 0x07
 #define RPY_CW_OFF    0x5d                 /* §8ad: recording's x87 cw nibble (0x80|((cw>>8)&0xf)) */
+#define RPY_SEED_OFF  0x5e                 /* §8ae: netplay RNG init seed (u16 LE) — valid iff 0x5c bit1 */
 typedef uint32_t (__fastcall *ReplayHdrFn_t)(void *self);
 static ReplayHdrFn_t s_origReplayHdr = NULL;
 static int s_rpyTagLogged = 0;
@@ -1840,7 +1843,24 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
          * was pinned to 24-bit/round-nearest every frame (PinFpuForNetplay). Playback must
          * reproduce that FP environment or the sim drifts (trig-driven aimed shots diverge) —
          * "resembles the moves but desyncs". Local/solo runs leave this 0 (vanilla FP). */
-        hdr[RPY_COOP_OFF + 4] = (unsigned char)(s_netActive ? 0x01 : 0x00);
+        /* §8ae: stamp the netplay RNG init seed. The netcode force-seeds the LIVE RNG to this value
+         * at every scene start (the SEEDFORCE F1 log lines), AFTER ZUN has already snapshotted the
+         * PRE-force seed into the replay's stage block — so a vanilla restore replays the WRONG seed
+         * and EVERY enemy's bullet RNG forks from stage frame 1 (positions/inputs match, but both
+         * players walk into bullets that weren't there live; aimed sections kill fastest). This was
+         * THE netplay-replay desync. Save the forced seed (bit1 of 0x5c marks it present);
+         * HookedReplayLoad re-applies it on playback. Local/solo runs never force-seed, so they leave
+         * bit1 clear and ZUN's own stage-block restore is already correct. */
+        {
+            unsigned char netFlag = (unsigned char)(s_netActive ? 0x01 : 0x00);
+            unsigned short is = s_netActive ? (unsigned short)Nc_GetInitSeed() : 0;
+            if (is) {                                    /* skip a 0 seed (link not up yet) — no false stamp */
+                hdr[RPY_SEED_OFF + 0] = (unsigned char)(is & 0xff);
+                hdr[RPY_SEED_OFF + 1] = (unsigned char)((is >> 8) & 0xff);
+                netFlag |= 0x02;                         /* bit1: a valid init seed is stamped at 0x5e */
+            }
+            hdr[RPY_COOP_OFF + 4] = netFlag;
+        }
         /* §8ad: byte 0x5d holds the x87 control word the SIM runs at, so playback can reproduce
          * the exact precision (a netplay run records at 64-bit, local at 24-bit — the real cause
          * of the netplay-replay desync). The cw isn't known yet at header init, so seed it 0
@@ -1904,16 +1924,20 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
         s_replayP2Sel    = (signed char)hdr[RPY_COOP_OFF + 2];
         s_replayDiffChar = hdr[RPY_COOP_OFF + 3] ? 1 : 0;
         s_replayNetRecorded = (hdr[RPY_COOP_OFF + 4] & 0x01) ? 1 : 0;   /* §8aa */
-        /* §8ad: target playback precision. Prefer the stamped cw (sentinel bit7, built by this
-         * build); else fall back to the net flag (older co-op replays predate the cw byte —
-         * netplay recorded at 64-bit, local at 24-bit). */
+        /* §8ae: recover the stamped netplay RNG init seed (0x5c bit1 set => 0x5e-0x5f hold it). */
+        s_replayHasSeed  = (hdr[RPY_COOP_OFF + 4] & 0x02) ? 1 : 0;
+        s_replayInitSeed = (unsigned short)(hdr[RPY_SEED_OFF] | (hdr[RPY_SEED_OFF + 1] << 8));
+        /* §8ad: target playback precision = the cw the SIM actually ran at, stamped at 0x5d (the
+         * netplay sim runs at 24-bit/0x007f, same as a local replay — the earlier "records at 64-bit"
+         * premise was wrong). Stamp absent (pre-§8ad replay) => default to 24-bit; never force 64-bit. */
         s_replayTargetCw = (hdr[RPY_CW_OFF] & 0x80)
                          ? (unsigned short)(0x007f | ((hdr[RPY_CW_OFF] & 0x0f) << 8))
-                         : (s_replayNetRecorded ? 0x037f : 0x007f);
+                         : 0x007f;
         if (!s_replayLoadLogged) {
             int n = (s_replayP2Sel >= 0 && s_replayP2Sel <= 5) ? s_replayP2Sel : 0;
-            Log("replay PLAYBACK: co-op replay — P2=%s diffchar=%d netRec=%d targetCw=0x%04x (header +0x%02x)",
-                ADDR_SEL_NAMES[n], s_replayDiffChar, s_replayNetRecorded, s_replayTargetCw, RPY_COOP_OFF);
+            Log("replay PLAYBACK: co-op replay — P2=%s diffchar=%d netRec=%d hasSeed=%d initSeed=0x%04x "
+                "targetCw=0x%04x (header +0x%02x)", ADDR_SEL_NAMES[n], s_replayDiffChar,
+                s_replayNetRecorded, s_replayHasSeed, s_replayInitSeed, s_replayTargetCw, RPY_COOP_OFF);
             s_replayLoadLogged = 1;
         }
     } else if (IsReplayPlayback() && s_forceReplayP2 >= 0 && hdr) {
@@ -1923,11 +1947,11 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
         s_replayIsCoop   = 1;
         s_replayP2Sel    = s_forceReplayP2;
         s_replayDiffChar = ((s_forceReplayP2 / 2) != (int)hdr[RPY_P1CHAR_OFF]) ? 1 : 0;
-        s_replayNetRecorded = 0;   /* §8aa: untagged/forced — flag unknown; use replay_fpu_pin=1 */
-        /* §8ad: forced/legacy replays predate the cw stamp and are almost always netplay-era
-         * (a local co-op replay would carry the tag), so assume 64-bit unless a stamp exists. */
+        s_replayNetRecorded = 0;   /* §8aa: untagged/forced — flag unknown */
+        s_replayHasSeed = 0;       /* §8ae: legacy/forced replays predate the seed stamp — can't fix */
+        /* §8ad: forced/legacy replays predate the cw stamp; the sim runs at 24-bit either way. */
         s_replayTargetCw = (hdr[RPY_CW_OFF] & 0x80)
-                         ? (unsigned short)(0x007f | ((hdr[RPY_CW_OFF] & 0x0f) << 8)) : 0x037f;
+                         ? (unsigned short)(0x007f | ((hdr[RPY_CW_OFF] & 0x0f) << 8)) : 0x007f;
         if (!s_replayLoadLogged) {
             int n = (s_forceReplayP2 <= 5) ? s_forceReplayP2 : 0;
             Log("replay PLAYBACK: FORCED co-op (force_replay_p2=%d -> P2=%s diffchar=%d, "
@@ -1938,6 +1962,7 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
     } else {
         s_replayIsCoop = 0;   /* solo/vanilla replay — no phantom P2 */
         s_replayNetRecorded = 0;
+        s_replayHasSeed = 0;  /* §8ae */
         if (IsReplayPlayback() && !s_replayLoadLogged) {  /* why a replay didn't recover P2 */
             Log("replay PLAYBACK: NO co-op tag at +0x%02x (bytes %02x %02x) — solo/vanilla "
                 "or recorded pre-fix (set [coop] force_replay_p2 to spawn P2 anyway)",
@@ -1951,16 +1976,30 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
      * (the replay drives a different task path — confirmed: no "fpu-pin decision" line, pin=0).
      * The actual fldcw is applied each frame by HookedPlayTask (frame-start) + the sim seam. */
     {
-        unsigned short tgt = s_replayTargetCw;
-        if (s_replayFpuPin == 1 && tgt == 0x007f) tgt = 0x037f;   /* force override → 64-bit */
+        unsigned short tgt = s_replayTargetCw;   /* = the cw the SIM recorded at (24-bit for both net & local) */
         int pin = (s_replayFpuPin == 0) ? 0
                 : (s_replayFpuPin == 1) ? 1
-                : (s_replayIsCoop && tgt != 0x007f);              /* auto (-1) */
+                : (s_replayIsCoop && tgt != 0x007f);              /* auto (-1): only if a non-24-bit cw was stamped */
         s_replayPinCw = pin ? tgt : 0;
         if (IsReplayPlayback())
             Log("replay PLAYBACK: fpu-pin decision=%s targetCw=0x%04x (replay_fpu_pin=%d netRec=%d "
                 "coop=%d) — reproducing the recording's x87 precision (§8ad).",
                 pin ? "PIN" : "native", tgt, s_replayFpuPin, s_replayNetRecorded, s_replayIsCoop);
+    }
+    /* §8ae: re-force the netplay RNG init seed the LIVE sim actually ran from. s_origReplayLoad
+     * (FUN_00443550) just executed `DAT_0049fe20 = stageblock+0x20` (PCBdecomp.c:27909), restoring the
+     * PRE-force seed ZUN snapshotted before the netcode's per-scene SEEDFORCE — so without this the
+     * replayed sim starts every stage from the wrong RNG state and forks all enemy bullets (root cause
+     * of the netplay-replay desync). FUN_00443550 runs once per stage as the playback task's init
+     * callback (it loads DAT_0062f85c's stage block), so stamping the seed back here re-applies it at
+     * EACH stage, at the exact point ZUN restored it and before the stage sim draws — mirroring the
+     * live force. Only for net-recorded replays carrying the stamp; local replays restore correctly. */
+    if (IsReplayPlayback() && s_replayHasSeed) {
+        unsigned short before = *ADDR_RNG_SEED;
+        *ADDR_RNG_SEED = s_replayInitSeed;
+        Log("replay PLAYBACK: RNG seed re-forced 0x%04x -> 0x%04x (§8ae — reproduce the netplay "
+            "per-scene SEEDFORCE the .rpy didn't capture; stage=%d)",
+            before, s_replayInitSeed, (int)*(volatile uint32_t *)0x0062f85c);
     }
     return r;
 }
@@ -3613,12 +3652,24 @@ static int __fastcall HookedUpdate(void *self)
         static int s_rpyDbgTick = 0;
         int play = IsReplayPlayback();
         /* §8ad: while RECORDING, stamp the cw the SIM is actually running at into the replay
-         * header (sentinel bit7 set) so playback can reproduce that exact precision. This is the
-         * fix: a netplay sim runs at 64-bit, a local sim at 24-bit; without this, every netplay
-         * replay re-runs at D3D's 24-bit and forks. !play => recording; s_rpyHdrBuf is the live
-         * header. Stamped every frame (cheap, 1 byte) so the saved header carries the latest. */
-        if (!play && s_rpyHdrBuf)
+         * header (sentinel bit7 set) so playback can reproduce that exact precision. The netplay sim
+         * actually runs at 24-bit (0x007f, same as a local replay — the earlier "64-bit" premise was
+         * wrong), so this records 0x007f and playback stays native; the real desync was the RNG seed
+         * (§8ae), not precision. !play => recording; s_rpyHdrBuf is the live header. */
+        if (!play && s_rpyHdrBuf) {
             s_rpyHdrBuf[RPY_CW_OFF] = (unsigned char)(0x80 | ((FpuCw() >> 8) & 0x0f));
+            /* §8ae: backfill the netplay init seed if header-init ran before link-up (seed was 0
+             * then, so bit1 stayed clear). Once linked, stamp it so the .rpy can reproduce the
+             * per-scene SEEDFORCE. Cheap; only writes until the seed is present. */
+            if (s_netActive && !(s_rpyHdrBuf[RPY_COOP_OFF + 4] & 0x02)) {
+                unsigned short is = (unsigned short)Nc_GetInitSeed();
+                if (is) {
+                    s_rpyHdrBuf[RPY_SEED_OFF + 0] = (unsigned char)(is & 0xff);
+                    s_rpyHdrBuf[RPY_SEED_OFF + 1] = (unsigned char)((is >> 8) & 0xff);
+                    s_rpyHdrBuf[RPY_COOP_OFF + 4] |= 0x02;
+                }
+            }
+        }
         ReplayDetTrace(play);                               /* §8ac per-frame CSV (gated by replay_trace) */
         int fr = s_netActive ? s_netFrame : s_rpyDbgTick;   /* net=lockstep frame; else stage-tick */
         if ((fr % 60) == 0) {
@@ -4247,6 +4298,8 @@ static void ResetCoopSession(void)
     s_readyFrames   = 0;
     s_replayIsCoop  = 0;         /* §8k: forget the last replay's co-op tag        */
     s_replayNetRecorded = 0;     /* §8aa: forget last replay's net-recorded/FPU flag */
+    s_replayHasSeed = 0;         /* §8ae: forget last replay's stamped RNG init seed */
+    s_replayInitSeed = 0;        /* §8ae */
     s_replayTargetCw = 0x007f;   /* §8ad: default precision until the next replay loads its cw */
     s_replayPinCw = 0;           /* §8ad: no sim-seam pin until the next replay decides */
     s_fpuPinnedReplay = 0;       /* re-log the replay FPU pin for the next replay    */

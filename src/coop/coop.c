@@ -1416,14 +1416,15 @@ static unsigned short s_replayTargetCw = 0x007f;  /* §8ad: the x87 cw the recor
  * recordings have no netcode so they run at 24-bit and replay fine — which is exactly why local
  * replays were perfect and netplay replays desynced. Force the recorded precision with a REAL
  * fldcw (PinFpuForNetplay's _controlfp was a no-op). */
-static void PinFpuForReplay(void)
+static unsigned short s_replayPinCw = 0;   /* §8ad: cw to pin playback to (0 = no pin this run) */
+static void PinFpuForReplay(unsigned short cw)
 {
     unsigned short prev = FpuCw();
-    FpuSetCw(s_replayTargetCw);
+    FpuSetCw(cw);
     if (!s_fpuPinnedReplay) {
         s_fpuPinnedReplay = 1;
         Log("replay PLAYBACK: x87 control word set to 0x%04x (was 0x%04x) — reproducing the "
-            "recording's precision (§8ad).", s_replayTargetCw, prev);
+            "recording's precision (§8ad).", cw, prev);
     }
 }
 
@@ -1530,17 +1531,22 @@ static int __fastcall HookedSceneTick(void *self)
      * (target 0x007f) are left untouched (they already replay perfectly). Auto (replay_fpu_pin=-1)
      * decides by the target; =1 forces a pin, =0 disables. Real fldcw, before this frame's sim. */
     if (IsReplayPlayback()) {
-        int pin = (s_replayFpuPin == 1) ? 1
-                : (s_replayFpuPin == 0) ? 0
-                : (s_replayIsCoop && s_replayTargetCw != 0x007f);   /* auto (-1) */
+        /* effective target: a replay predating the §8ad cw stamp AND the §8aa net flag falls back
+         * to 24-bit; replay_fpu_pin=1 forces 64-bit so such OLD netplay replays can be reproduced. */
+        unsigned short tgt = s_replayTargetCw;
+        if (s_replayFpuPin == 1 && tgt == 0x007f) tgt = 0x037f;
+        int pin = (s_replayFpuPin == 0) ? 0
+                : (s_replayFpuPin == 1) ? 1
+                : (s_replayIsCoop && tgt != 0x007f);   /* auto (-1) */
+        s_replayPinCw = pin ? tgt : 0;                 /* §8ad: re-pinned at the sim seam too */
         if (!s_replayPinDecisionLogged) {
             s_replayPinDecisionLogged = 1;
             Log("replay PLAYBACK: fpu-pin decision=%s targetCw=0x%04x (replay_fpu_pin=%d netRec=%d "
                 "coop=%d) current cw=0x%04x — reproducing the recording's precision (§8ad).",
-                pin ? "PIN" : "native", s_replayTargetCw, s_replayFpuPin, s_replayNetRecorded,
+                pin ? "PIN" : "native", tgt, s_replayFpuPin, s_replayNetRecorded,
                 s_replayIsCoop, (unsigned)FpuCw());
         }
-        if (pin) PinFpuForReplay();
+        if (pin) PinFpuForReplay(tgt);
     }
     if (s_netStarted && !s_netActive) {
         /* connection handshake at the front-end: keep pinging until the peer answers,
@@ -3617,6 +3623,12 @@ static int __fastcall HookedUpdate(void *self)
         s_rpyDbgTick++;
     }
 
+    /* §8ad: re-assert the recorded precision right at the SIM seam (after the diag sampled the
+     * frame-start cw, so the diag still reveals whether HookedSceneTick's pin held). This covers
+     * the P1 update below AND the P2 re-invoke even if something reset the cw after frame start. */
+    if (isP1 && s_replayPinCw && IsReplayPlayback())
+        FpuSetCw(s_replayPinCw);
+
     /* B2: refresh the power->cherry suppression flag once per frame (read by the
      * item-spawner detour; inert when that hook isn't installed). Suppress while
      * P2 is live and below full power — so P1-full alone keeps drops as power. */
@@ -4220,6 +4232,7 @@ static void ResetCoopSession(void)
     s_replayIsCoop  = 0;         /* §8k: forget the last replay's co-op tag        */
     s_replayNetRecorded = 0;     /* §8aa: forget last replay's net-recorded/FPU flag */
     s_replayTargetCw = 0x007f;   /* §8ad: default precision until the next replay loads its cw */
+    s_replayPinCw = 0;           /* §8ad: no sim-seam pin until the next replay decides */
     s_fpuPinnedReplay = 0;       /* re-log the replay FPU pin for the next replay    */
     s_replayPinDecisionLogged = 0;
     s_replayLoadLogged = 0;      /* so the next replay re-logs its P2 character     */

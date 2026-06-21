@@ -1507,17 +1507,28 @@ static void ReplayDetTrace(int playback)
         snprintf(p, sizeof(p), "%scoop_rdt_%s.csv", s_dir, playback ? "rpy" : "rec");
         *fp = fopen(p, "w");
         if (!*fp) return;
-        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw\n", *fp);
+        /* §8ak diag: inMenu/netMerged/headW/headNext expose the P2 input-timing slip. P2 lags P1 by
+         * one frame on playback — record sources P2 from the FRESH s_netMerged (merged[N]) while
+         * playback sources it from g_InputGameplay; this records every candidate source at the SAME
+         * sample point (pre-update) so a rec-vs-rpy diff shows which word P2 must use to match. */
+        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw,inMenu,netMerged,headW,headNext\n", *fp);
     }
     void *p2 = (void *)s_p2;
-    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x\n",
+    /* replay buffer current head + next entry words (the recorded merged words FUN_00442ee0 applies) */
+    unsigned hW = 0xFFFF, hN = 0xFFFF;
+    if (rm) {
+        unsigned char *head = *(unsigned char **)((char *)rm + 0x84);
+        if (head) { hW = *(unsigned short *)head; hN = *(unsigned short *)(head + 4); }
+    }
+    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x,%04x,%04x,%04x,%04x\n",
             rf, (unsigned)*ADDR_INPUT_GAMEPLAY,
             (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR,
             *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X),
             *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_Y),
             p2 ? *(float *)((char *)p2 + OFF_POS_X) : -1.0f,
             p2 ? *(float *)((char *)p2 + OFF_POS_Y) : -1.0f,
-            (unsigned)FpuCw());
+            (unsigned)FpuCw(),
+            (unsigned)*ADDR_INPUT_MENU, (unsigned)s_netMerged, hW, hN);
     fflush(*fp);
 }
 
@@ -3981,13 +3992,26 @@ static int __fastcall HookedUpdate(void *self)
             /* INPUT SWAP: P2's update reads g_InputGameplay; point it at P2's
              * own word for the duration, then restore so P1 is unaffected.
              * This is the precise seam the netcode will feed (P2 = high bits). */
-            /* P2's word: in replay PLAYBACK from the REPLAYED gameplay word's high bits
-             * (FUN_00442ee0 already wrote the recorded merged word into g_InputGameplay);
-             * under netplay from the WIRE (merged high bits); else the local keyboard.
-             * The swap below is unchanged for all three. */
-            uint16_t p2in  = IsReplayPlayback() ? UnpackP2(*ADDR_INPUT_GAMEPLAY)
-                           : s_netActive        ? UnpackP2(s_netMerged)
-                           : s_p2LocalIn; /* captured at the record seam — same word saved to .rpy */
+            /* §8ak: P2's input source per mode. PLAYBACK must read the recorded word the playback
+             * task (FUN_00442ee0) is ABOUT to apply THIS frame — the replay buffer's current head —
+             * NOT g_InputGameplay. The playback task runs AFTER this player update, so during the
+             * update g_InputGameplay still holds the PREVIOUS frame's word; P1 reads it too (and was
+             * recorded reading it, so P1 stays faithful), but on the LIVE record side P2 read the
+             * FRESH s_netMerged (= this frame's merged word), one frame ahead of g_InputGameplay.
+             * Reading g_InputGameplay for P2 therefore lagged it one frame behind its recorded self,
+             * shifting every P2 rand-action by a frame -> the residual replay desync. The head word
+             * (recorded[N]) is the replay equivalent of s_netMerged, so record and playback now drive
+             * P2 from the identical frame. Falls back to g_InputGameplay if the head can't be read. */
+            uint16_t p2in;
+            if (IsReplayPlayback()) {
+                void *rm = *ADDR_REPLAY_MGR;
+                unsigned char *head = (recActive && rm) ? *(unsigned char **)((char *)rm + 0x84) : NULL;
+                p2in = UnpackP2(head ? *(unsigned short *)head : *ADDR_INPUT_GAMEPLAY);
+            } else if (s_netActive) {
+                p2in = UnpackP2(s_netMerged);
+            } else {
+                p2in = s_p2LocalIn;        /* captured at the record seam — same word saved to .rpy */
+            }
             uint16_t saved = *ADDR_INPUT_GAMEPLAY;
             if (p2in && !s_p2InputLogged) { Log("P2 input read OK: 0x%03x (key path works)", p2in); s_p2InputLogged = 1; }
             if (s_p2Ghost) p2in = 0;    /* ghost: no input at all — MoveGhost drives it */

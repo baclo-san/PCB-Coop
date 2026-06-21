@@ -2844,3 +2844,30 @@ saved-replay) and header `+0x5c` **bit1** (in-memory watch-replay). The seed str
 **Verify with a fresh net recording + playback.** With `replay_trace=1`, `coop_rdt_rpy.csv`'s seed column should now track
 `coop_rdt_rec.csv` frame-for-frame (modulo the cosmetic +1 sample offset) all the way through the stage, and the replay should
 hold sync past Ran/the midboss to wherever the live run actually ended. Build green, native test green (16/16).
+
+### §8ak — netplay-replay desync (the actual root): P2's input is sourced one frame stale on playback (2026-06-22)
+
+§8aj proved its point — with the seed re-pinned every frame, `coop_rdt_rpy.csv`'s seed matched `coop_rdt_rec.csv` on **3942 of
+3943 frames**. But the replay STILL desynced, and the same trace finally showed why, in the **positions**: `p1x/p1y` plays back at
+the cosmetic **+1** rf offset, but `p2x/p2y` plays back at **+2** — **P2 lags P1 by exactly one frame on playback** (e.g. REC rf297
+`p2=(235.314,395.314)` == RPY rf299; REC rf297 `p1` == RPY rf298). On record P1 and P2 are in lockstep. That one-frame P2 lag is
+what made playback draw a different *number* of rands per frame (the §8aj within-frame divergence): every P2 rand-consuming action
+(shot, focus, bomb) fires a frame late, so it draws from a different mid-frame seed, and once the phase is off the boss RNG
+avalanches. §8aj's per-frame seed re-pin couldn't fix it because the *event itself* moves frames — re-pinning the frame-start seed
+doesn't put a shifted shot back on its original frame.
+
+**Why P2 lags (and P1 doesn't).** PCB's record/playback tasks set `g_InputGameplay` (FUN_00442cd0 copies `g_InputMenu`→
+`g_InputGameplay`; FUN_00442ee0 writes the recorded word there) and those tasks run **after** the player update. So during the
+update `g_InputGameplay` still holds the **previous** frame's word. P1 reads `g_InputGameplay` and *was recorded reading it the same
+way*, so P1 stays faithful (that's just vanilla replay's one-frame input structure, consistent record↔playback). But our co-op P2
+re-invoke sourced P2 from **`s_netMerged`** on the live record side — the FRESH `merged[N]`, one frame ahead of `g_InputGameplay` —
+while on playback it read `g_InputGameplay` (`recorded[N-1]`). Different source, different timing → P2 one frame behind its recorded
+self.
+
+**Fix (coop.c, §8ak).** On playback, source P2 from the recorded word the playback task is **about to apply this frame** — the
+replay buffer's current head, `*(uint16_t*)(replayMgr+0x84)` (= `recorded[N]`, not yet consumed because FUN_00442ee0 runs after this
+update). That is the replay equivalent of the live `s_netMerged`, so record and playback now drive P2 from the **identical** frame.
+Playback-only (live and local paths untouched); falls back to `g_InputGameplay` if the head can't be read or we're not in-stage.
+Because it reproduces the recorded `s_netMerged` timing, it should fix **old** net replays too, not just freshly recorded ones.
+ReplayDetTrace gains diagnostic columns `inMenu,netMerged,headW,headNext` to confirm the alignment (`headW` on the rpy side should
+lead the `input`/`g_InputGameplay` column by one frame). Build green, native test green (16/16).

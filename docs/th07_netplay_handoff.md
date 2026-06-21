@@ -2655,3 +2655,126 @@ netplay-only) once the FP red herring (§8ad) was cleared.
 seed and stay broken. Record a new netplay (or loopback) run on this build, play it back, and confirm the log
 shows `RNG seed re-forced 0x…-> 0x960b (§8ae …)` and the replay tracks the live run through the aimed sections.
 Build green, native test green (16/16).
+
+> **SUPERSEDED by §8ah (2026-06-21).** The diagnosis above (replay restores the pre-force seed) is correct, but
+> this *fix* was structurally dead: the header `0x58-0x5f` block — magic AND the `0x5e` seed stamp — is overwritten
+> by ZUN's replay **date** (`0x58`) and player **name** (`0x5e`) fields when the `.rpy` is saved, so it only ever
+> survived in-memory "watch replay", never a real file. §8ah moves the seed into ZUN's native `stageblock+0x20`
+> slot (restored automatically) and the tag into the `stageblock+0x28` gap, both of which round-trip on disk.
+
+### §8af — startup-desync root cause, replay-save disconnect, HUD polish (2026-06-21)
+
+Three independent fixes; none touch the §8ae replay-playback seed path (all gated off it). Build green, native
+test green (16/16).
+
+**1. Startup desync root cause: ZUN seeds the RNG from wall-clock time.** The live-2-PC "RNG syncs only after a
+*random number of restarts* (changing each time), then never drops" symptom is the tell of a **wall-clock**
+dependency, not a deterministic code fork. Found exactly one: ZUN inits the live RNG seed `DAT_0049fe20` from
+`(u16)timeGetTime()` in the title/logo init `FUN_00438986` (PCBdecomp.c:23325-23328). It is the *only*
+clock-based reseed — every other write to `0x0049fe20` is deterministic (`FUN_00442c60` per-frame snapshot, the
+replay restore `FUN_00443550`, and a save/restore around `FUN_004012b0` at PCBdecomp.c:18448-18450). So each
+machine's menu RNG evolves from a different base; the once-per-scene `SEEDFORCE` only realigns the seed *at*
+stage entry, leaving a window where ZUN's stage setup can draw from the per-machine pre-force state → divergent
+spawns that don't heal.
+
+- **Fix (coop.c `HookedSceneTick`, after the merge):** pin the seed to the shared `Nc_GetInitSeed()` **every
+  front-end frame** — `if (s_netActive && !inStage && !IsReplayPlayback()) *ADDR_RNG_SEED = Nc_GetInitSeed()`
+  (skips a 0 seed before link-up). This hands stage 1 an identical RNG state on both machines, closing the
+  pre-force window; the per-scene `SEEDFORCE` then stays as belt-and-suspenders. **IN-STAGE is deliberately
+  untouched** — lockstep keeps the naturally-evolving RNG aligned, and pinning there was the old Chen's-orbs
+  bug (§ in the "force-every-frame" regression). Runs before ZUN's menu update tasks (those fire after this
+  hook returns; `s_origSceneTick` above only polled input). The recorded stage seed is still `Nc_GetInitSeed()`
+  exactly as §8ae stamps it, so replay record/playback is unaffected.
+- **Confirm (if any residual fork remains):** diff both logs' first `SEEDFORCE … -> 0xXXXX … diff=` (the forced
+  value must be identical host vs guest) and the first per-frame `rng self/peer/ctr` (tells pre-force draw vs an
+  input-side divergence). New memory: `zun-rng-seeded-from-walltime`.
+
+**2. Replay-save disconnect: front-end lockstep deadline.** "Drops the net connection after saving the replay"
+is the **5s `GetKeys` lockstep timeout** (netcode.cpp). The replay-save name-entry menu `FUN_00447198` is itself
+lockstep-safe (it reads `DAT_004b9e4c` = the merged input our hook writes), but confirming a save fires a
+synchronous ~1MB write `FUN_00443da0` (malloc 0x100000 + WriteFile, PCBdecomp.c:28044) that blocks one machine's
+frame loop. If that exceeds 5s (slow/synced disk, AV scanning the new `.rpy`) the peer hits the deadline and
+`g_is_connected=false` latches a permanent drop.
+
+- **Fix (netcode.cpp `GetKeys`):** make the deadline `is_in_UI ? 30.0 : 5.0` seconds. The front end (menus /
+  results / save) gets generous grace so a one-frame I/O hitch can't trip a permanent disconnect; **in a stage
+  the deadline stays tight (5s)** so a genuine desync/stall is still caught fast. `is_in_UI` is already plumbed
+  (coop.c passes `inStage ? 0 : 1` → `Netcode_GetInput_Net` → `GetKeys`). Orthogonal to replay playback, which
+  doesn't use the netcode at all.
+
+**3. HUD polish (coop.c `DrawCoopHud`).** The full-size net readout across the playfield bottom-left was
+distracting and `SYNC` is a misleading RNG oracle. Moved into the **bottom-right just above ZUN's FPS counter**
+(FPS draws at 512,465 via `FUN_00401f40`; net line at 496,451) and shrunk to **~0.75×**. The net line and the
+FPS counter share one bitmap-font manager (`0x0134ce18`), which captures its scale per text entry from
+`mgr+0x74c4`/`+0x74c8` (floats) — so a save/shrink/print/restore scales *only* our line. Compacted to
+`NET H SYNC 12ms` / `NET G WAIT###ms` / `NET LOST` (dropped the dev-only `F#####`/`d#`; a stall now reads as
+`WAIT###ms`). Position/scale are trivially adjustable constants.
+
+### §8ag — difficulty desync fixed at the SOURCE (cursor reset, not the live pin); config globals located (2026-06-21)
+
+**The §8t/§8v host-authoritative difficulty pin did NOT fix gameplay** (tester, confirmed): it forced the
+*live* `0x626280` every frame, so the guest's **pause menu** read the host's difficulty — but the actual
+run still played at the guest's difficulty. Root cause, found by mapping the EoSD `GameConfiguration`
+(`uth06dos`) to PCB: difficulty is chosen on the select screen, whose **cursor seeds from the per-install
+SAVED default difficulty** — config byte **`0x00575a89`** (PCBdecomp:37150 `*cursor = DAT_00575a89`). The
+two installs have different saved defaults, lockstepped navigation preserves the offset, and they **confirm
+different difficulties** (`DAT_00626280 = DAT_00575a89`, PCBdecomp:37675/37795), which also latches the
+difficulty-derived run state (`0x62f85c`) at confirm. Pinning the live value after the fact never touched
+that. Tester tell: the cursor "resets to Normal for both" after bouncing through Extra Start.
+
+**PCB `GameConfiguration` (saved th07.cfg; defaults set at PCBdecomp:23870-23894), EoSD-cross-referenced:**
+- `0x00575a84` = starting lives ("Initial Players", 0-4, default 2) — EoSD `cfg.lifeCount`.
+- `0x00575a85` = starting bombs (0-3, default 3) — EoSD `cfg.bombCount`.
+- `0x00575a89` = default difficulty (0-5, default 1=Normal) — EoSD `cfg.defaultDifficulty`.
+
+**Fix (coop.c, §8ag):** at LINK UP, reset `*0x575a89 = 1` (Normal) on **both** peers — exactly the
+realignment ZUN's Extra-Start path does — so both difficulty cursors seed identically and they naturally
+confirm the same difficulty; lockstep then keeps `0x575a89` (and the confirmed difficulty + its run
+snapshot) in step. Link-up always precedes difficulty selection (`g_InputMenu` is pinned to the startup
+menu until then), so the reset can't clobber a live pick. **Removed** the old per-frame `0x626280` pin and
+the §8v game-start force (both superseded); kept a one-shot in-stage **cross-check log** (`difficulty
+MISMATCH in stage`) and the existing `SEEDFORCE … diff=` audit (host and guest must print the same `diff=`).
+
+**Lives/bombs (DONE, §8ag):** same per-install class — at link-up also reset `*0x575a84 = 2` (lives) and
+`*0x575a85 = 3` (bombs) on both peers (user chose fixed-defaults over a host-broadcast wire change). Players
+re-pick together in-menu afterwards (lockstepped, stays in step). If a host ever wants to keep a non-default
+saved config without re-selecting, the upgrade path is the `MULTI_NET_VER` bump + 2 wire bytes.
+
+**Unlocks (DONE, §8ag):** detour `FUN_0042f8de` (Extra) and `FUN_0042f94c` (Phantasm) → `return 1` under
+netplay (created+enabled only when `[net] enabled=1`), so the guest's menu offers the same options as the
+host's regardless of each install's `score.dat`. Returning 1 early also skips `FUN_0042f94c`'s score-data
+self-write (we don't mutate the save). Underlying clear table (not needed by the fix): static
+`0x0062e6c4 + char*0x1c + diff` (byte; `'c'`=99 = cleared); spell-card table `gm+0x8e + i*0x78`.
+
+All three (difficulty + lives/bombs + unlocks) build green, native test green (16/16). In-game verification
+pending a second tester.
+
+### §8ah — netplay-replay desync (for real, for real): the header co-op block doesn't survive a SAVED .rpy (2026-06-21)
+
+**§8ae was structurally dead on saved replays.** The tester reported the fix never engaged: a freshly-recorded,
+tagged net replay (a) wouldn't auto-detect P2 (`force_replay_p2=-1` → no P2) and (b) still desynced. The log
+gave the smoking gun: recording stamped the co-op magic at header `0x58` (`replay: tagged co-op header … (+0x58)`),
+but playback read **`replay PLAYBACK: NO co-op tag at +0x58 (bytes 30 36)`** — `0x30 0x36` = ASCII **"06"**.
+
+**Mechanism.** Header offset `0x58` is **ZUN's replay DATE string** ("06/…") and `0x5e` is the **player NAME**
+("NO NAME", written by `FUN_00443040` at `+0x5e`), both populated by the results/name-entry screen at *save* time
+— **after** our `HookedReplayHdrInit` stamp. So the whole `0x58-0x5f` co-op block (magic, P2 char, cw, and the
+§8ae seed) is overwritten when the replay is written to disk. It only ever survived the in-memory "watch replay
+immediately" path — never a real `.rpy`. The header gap was never a gap. (This also silently broke P2-char
+recovery and local-co-op saved replays, not just netplay.)
+
+**Fix (coop.c, §8ah) — stop fighting for header space; use fields that round-trip natively:**
+1. **Seed → ZUN's own per-stage seed slot `stageblock+0x20`.** `FUN_00443040` sets it to `DAT_0062f854` (the
+   pre-force snapshot); `HookedReplayHdrInit` now overwrites it with the **forced** `Nc_GetInitSeed()` right after.
+   ZUN saves the stage block verbatim and `FUN_00443550:27909` restores `DAT_0049fe20 = stageblock+0x20` on
+   playback — so the correct seed lands **before any of our code**, fixing the desync on **every** path: tagged,
+   `force_replay_p2`, and in-memory. No re-force hook needed (the §8ae `HookedReplayLoad` re-force is **removed**).
+2. **Co-op tag → free stage-block gap `+0x28-0x2b`** (between the last block field at `+0x27` and the input stream
+   at `+0x2c`; the record/play tasks `FUN_00442cd0`/`FUN_00442ee0` only touch `+0x2c+`). Carries magic / P2 sel /
+   diffchar+netRec flags, so a **saved** replay auto-detects P2 (`force_replay_p2=-1` works again). The header
+   `0x58` tag is kept only as a best-effort fallback for immediate post-run playback.
+
+**Verify with a FRESH recording** (old `.rpy`s lack the stage-block tag/seed). On record the log shows
+`replay: stage-seed fix sb+0x20 0x…-> 0x…(stage=N) [§8ah …]`; on playback `replay PLAYBACK: co-op replay — …
+src=stageblock`. P2 should auto-spawn with `force_replay_p2=-1`, and the replay should track the live run through
+aimed sections. Build green, native test green (16/16). Supersedes §8ae's header-stamp approach.

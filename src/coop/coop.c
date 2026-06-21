@@ -1136,6 +1136,14 @@ static int s_p2InputLogged = 0;
 #define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
 #define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
 #define ADDR_DIFFICULTY ((volatile uint32_t *)0x00626280) /* 0..3 main, 4 Extra, 5 Phantasm */
+/* Saved config (th07.cfg) defaults — the difficulty-SELECT screen seeds its cursor from
+ * the saved default difficulty (PCBdecomp:37150), and the live 0x626280 is written from
+ * that cursor at confirm (:37675/:37795). These differ per install, so the desync is at
+ * the SOURCE; §8ag resets the saved default to a common value at link-up. (Adjacent
+ * config bytes: 0x575a84 = starting lives, 0x575a85 = bombs — same per-install class.) */
+#define ADDR_CFG_DIFFICULTY ((volatile uint8_t *)0x00575a89) /* saved default difficulty 0..5 */
+#define ADDR_CFG_LIVES      ((volatile uint8_t *)0x00575a84) /* saved "Initial Players" 0..4   */
+#define ADDR_CFG_BOMBS      ((volatile uint8_t *)0x00575a85) /* saved starting bombs 0..3      */
 /* Menu key-REPEAT (hold-to-scroll) state. ZUN's scene-tick (FUN_00437c70 @22803-22816)
  * derives these from the LOCAL keyboard poll, BEFORE our merged-word overwrite — so the
  * cursor's hold-scroll (gated on the repeat flag @PCBdecomp.c:29077) advances a machine-
@@ -1151,6 +1159,18 @@ typedef int (__fastcall *SceneTickFn_t)(void *self);
 typedef int (__fastcall *GameStartFn_t)(int self);
 static SceneTickFn_t s_origSceneTick = NULL;
 static GameStartFn_t s_origGameStart = NULL;
+
+/* §8ag: Extra/Phantasm unlock predicates (the menu calls these to decide whether to OFFER
+ * the option). Both take the score-data object in ecx. Under netplay we force them to
+ * "unlocked" so the guest's menu offers the same options as the host's regardless of each
+ * install's score.dat — required so the guest can follow the host into Extra/Phantasm.
+ * FUN_0042f8de = Extra (any char cleared Easy..Lunatic; gates the Extra menu item,
+ * PCBdecomp:36471/36557). FUN_0042f94c = Phantasm (PCBdecomp:18767; char-select/title). */
+#define ADDR_EXTRA_UNLOCKED ((LPVOID)0x0042f8de)
+#define ADDR_PHANT_UNLOCKED ((LPVOID)0x0042f94c)
+typedef int (__fastcall *UnlockFn_t)(int self);
+static UnlockFn_t s_origExtraUnlocked = NULL;
+static UnlockFn_t s_origPhantUnlocked = NULL;
 
 /* config (coop.ini [net], read once at attach) */
 static int      s_netEnabled = 0;          /* feature flag (default OFF)              */
@@ -1201,10 +1221,8 @@ static int      s_replayFpuPin = -1;       /* coop.ini [coop] replay_fpu_pin: pi
                                               old netplay replays that predate the header flag). */
 /* Replay-playback flags read in HookedReplayLoad; declared here (before HookedSceneTick, which
  * reads them for the §8aa playback FPU pin). IsReplayPlayback() is forward-declared for the same. */
-static int      s_replayIsCoop = 0;        /* the loaded replay carries our co-op (0x58) tag    */
-static int      s_replayNetRecorded = 0;   /* §8aa: recorded under netplay (header 0x5c bit0)   */
-static unsigned short s_replayInitSeed = 0;/* §8ae: netplay RNG init seed stamped in the replay (0x5e) */
-static int      s_replayHasSeed = 0;       /* §8ae: a netplay init seed was stamped (0x5c bit1)  */
+static int      s_replayIsCoop = 0;        /* the loaded replay carries our co-op tag (§8ah: stageblock+0x28) */
+static int      s_replayNetRecorded = 0;   /* §8aa: recorded under netplay (stageblock 0x2a bit1) */
 static int      s_replayTrace = 0;         /* §8ac coop.ini replay_trace: per-frame record/playback CSV */
 static int      IsReplayPlayback(void);
 /* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
@@ -1552,8 +1570,28 @@ static int __fastcall HookedSceneTick(void *self)
             s_seedForced = 0;               /* force the shared seed at the first stage */
             s_menuRepeatCtr = 0;            /* fresh hold-scroll shadow for lockstep menu */
             Nc_Reset();                     /* fresh lockstep maps from frame 0         */
+            /* §8ag: HOST-AUTHORITATIVE START CONFIG, fixed at the SOURCE. Each install's
+             * difficulty-SELECT cursor seeds from its SAVED default difficulty
+             * (config 0x575a89; PCBdecomp:37150), which then writes the live 0x626280 at
+             * confirm. Saved defaults differ per install, so lockstepped navigation
+             * preserves the offset and the two CONFIRM different difficulties — and the
+             * difficulty-derived run state latched at confirm then diverges, which the old
+             * per-frame pin of the LIVE 0x626280 never fixed (it only corrected the value
+             * the pause menu reads). Reset the saved default to Normal on BOTH machines —
+             * the same realignment ZUN's Extra-Start path performs — so both cursors seed
+             * identically; from here lockstep keeps 0x575a89 (and the confirmed difficulty)
+             * in step. Link-up always precedes difficulty selection (g_InputMenu is pinned
+             * to the startup menu below until now), so the reset can't clobber a live pick. */
+            *ADDR_CFG_DIFFICULTY = 1;        /* Normal — common cursor seed on both peers */
+            /* §8ag: starting lives + bombs are the same per-install config-desync class
+             * (each menu seeds from these saved bytes). Reset both peers to PCB's defaults
+             * so the two runs start with identical resources; players can change them
+             * together in-menu afterwards (lockstepped, so they stay in step). */
+            *ADDR_CFG_LIVES = 2;             /* default Initial Players */
+            *ADDR_CFG_BOMBS = 3;             /* default starting bombs   */
             Log("netplay: LINK UP (handshake done). role=%s delay=%d seed=0x%04x. "
-                "Both inputs from the WIRE; each player picks its own character.",
+                "Both inputs from the WIRE; each player picks its own character. "
+                "Start config reset on both: difficulty=Normal lives=2 bombs=3 (§8ag).",
                 Nc_IsHost() ? "host" : "guest", Nc_GetDelay(), Nc_GetInitSeed());
         } else if (Nc_HandshakeVersionBad() && !s_netVerWarned) {
             Log("netplay: peer VERSION MISMATCH — both machines must run the same "
@@ -1575,23 +1613,21 @@ static int __fastcall HookedSceneTick(void *self)
     }
     if (s_netActive) {
         PinFpuForNetplay();   /* §8q: force matching x87 precision/rounding before the sim runs */
-        /* HOST-AUTHORITATIVE DIFFICULTY (§8t): the two installs can have DIFFERENT saved
-         * difficulty (confirmed desync: host Normal=1 / guest Lunatic=3 in the trace), which
-         * no lockstep can reconcile — different difficulty = different HP/bullets/thresholds.
-         * Report ours on the wire (sent inside Nc_GetInputNet below) and, on the GUEST, pin
-         * the difficulty global to the HOST's so both start identical. Done every frame so the
-         * guest's menu display follows the host and the value is already correct at game start
-         * (HookedSceneTick runs before the stage init reads it). The host is untouched. */
+        /* DIFFICULTY (§8ag): synced at the SOURCE now — the link-up cursor reset above makes
+         * both peers confirm the same difficulty, so the live 0x626280 is naturally identical
+         * and we no longer FORCE it (the old per-frame pin only ever fixed the pause-menu value,
+         * not the difficulty-derived run state, which is why gameplay still diverged). We still
+         * report ours on the wire for a cross-check: if the two live difficulties ever disagree
+         * once IN-STAGE, the cursor reset didn't hold — surface it ONCE rather than mask it.
+         * (The per-scene SEEDFORCE log also prints diff= on both peers for the same audit.) */
         Nc_SetLocalDifficulty((int)*ADDR_DIFFICULTY);
-        if (!s_netIsHost) {
+        if (!s_netIsHost && ((*ADDR_MODE_FLAGS >> 2) & 1) && !s_diffForcedLogged) {
             int hd = Nc_GetPeerDifficulty();
             if (hd >= 0 && (uint32_t)hd != *ADDR_DIFFICULTY) {
-                if (!s_diffForcedLogged) {
-                    Log("netplay: difficulty pinned to host's (%d -> %d) — guest follows host",
-                        (int)*ADDR_DIFFICULTY, hd);
-                    s_diffForcedLogged = 1;
-                }
-                *ADDR_DIFFICULTY = (uint32_t)hd;
+                Log("netplay: WARNING difficulty MISMATCH in stage (self=%u host=%d) — §8ag "
+                    "cursor reset did not hold; the run will desync, investigate",
+                    (unsigned)*ADDR_DIFFICULTY, hd);
+                s_diffForcedLogged = 1;
             }
         }
         /* START BARRIER / scene-reset — the th06 Supervisor::OnUpdate "last_frame_a >
@@ -1658,6 +1694,26 @@ static int __fastcall HookedSceneTick(void *self)
         int sync = connected ? Nc_IsSync() : 1;
         Nc_GetSyncStats(&s_netSelfRng, &s_netRcvRng, &s_netWaitMs);
         s_netSync = sync;
+
+        /* §8af: NETPLAY STARTUP SYNC — pin the FRONT-END RNG seed to the shared init
+         * seed every menu frame. ZUN seeds the live RNG from timeGetTime() at title
+         * init (FUN_00438986, PCBdecomp:23325), so each machine's menu RNG evolves
+         * from a different base. The once-per-scene SEEDFORCE (HookedGameStart) only
+         * realigns the seed AT stage entry, leaving a window where ZUN's stage setup
+         * can draw from the per-machine pre-force state — the nondeterministic
+         * "syncs after a random number of restarts" startup desync. Pinning the seed
+         * to initSeed across the front end hands stage 1 an identical RNG state on
+         * both machines, closing that window; the per-scene force then stays as a
+         * belt-and-suspenders. IN-STAGE is deliberately untouched (lockstep keeps the
+         * naturally-evolving RNG aligned; pinning there caused the old Chen's-orbs
+         * bug). Runs BEFORE ZUN's menu update tasks (those fire after this hook
+         * returns; s_origSceneTick above only polled input). Guarded off replay
+         * playback so the §8ae replay-seed restore path is never disturbed, and off a
+         * 0 seed (link not fully up yet). */
+        if (s_netActive && !inStage && !IsReplayPlayback()) {
+            unsigned short shared = (unsigned short)Nc_GetInitSeed();
+            if (shared) *ADDR_RNG_SEED = shared;
+        }
 
         NetTrace(s_netFrame, inStage, merged, s_netWaitMs, sync);  /* DIAGNOSTIC */
 
@@ -1764,22 +1820,12 @@ static int __fastcall HookedGameStart(int self)
         uint16_t before = *ADDR_RNG_SEED;
         *ADDR_RNG_SEED = Nc_GetInitSeed();
         s_seedForced = 1;
-        /* §8t fix: the per-frame pin in HookedSceneTick keeps the LIVE difficulty global
-         * (0x626280) = host's, which is why the guest's PAUSE menu reads host's. But the
-         * tester saw the actual GAMEPLAY difficulty differ: ZUN snapshots difficulty-
-         * derived run state at game-start (e.g. DAT_0062f85c = 0x626280+2, the rank
-         * table at +0x9634) BEFORE the per-frame pin had settled host's value into the
-         * run. Force the difficulty HERE too — once/scene, right before s_origGameStart
-         * runs the snapshot — so the run latches host's difficulty, not the guest's saved
-         * default. Host untouched. */
-        if (!s_netIsHost) {
-            int hd = Nc_GetPeerDifficulty();
-            if (hd >= 0 && (uint32_t)hd != *ADDR_DIFFICULTY) {
-                Log("netplay: difficulty FORCED at game-start (%u -> %d) before ZUN snapshot",
-                    (unsigned)*ADDR_DIFFICULTY, hd);
-                *ADDR_DIFFICULTY = (uint32_t)hd;
-            }
-        }
+        /* §8ag: the game-start difficulty FORCE that used to live here (§8v) is gone — it
+         * patched the difficulty-derived run snapshot AFTER the guest had already confirmed
+         * the wrong difficulty, which was fragile and incomplete. Difficulty is now correct
+         * before this point because both peers selected it from the same reset cursor
+         * (link-up §8ag), so ZUN's own snapshot already latches the matching value. The
+         * SEEDFORCE diff= below is the audit: host and guest must print the same diff=. */
         /* §8r: log the x87 control word at the seeding moment too — if host and guest
          * differ here on the first stage, FP precision forked before the per-frame pin
          * settled; if they match (both 0x_01f) the first-run fork is elsewhere.
@@ -1789,6 +1835,21 @@ static int __fastcall HookedGameStart(int self)
             _controlfp(0, 0) & 0xffff, (unsigned)*ADDR_DIFFICULTY);
     }
     return s_origGameStart(self);
+}
+
+/* §8ag: force Extra/Phantasm "unlocked" under netplay so the guest's menu offers the same
+ * options as the host's regardless of each install's score.dat (otherwise the guest can't
+ * follow the host into Extra/Phantasm). Off netplay, vanilla behaviour. Returning 1 early
+ * also skips FUN_0042f94c's score-data self-write — fine, we don't mutate the save. */
+static int __fastcall HookedExtraUnlocked(int self)
+{
+    if (s_netActive) return 1;
+    return s_origExtraUnlocked(self);
+}
+static int __fastcall HookedPhantUnlocked(int self)
+{
+    if (s_netActive) return 1;
+    return s_origPhantUnlocked(self);
 }
 /* ===================== end netplay ===================== */
 
@@ -1808,15 +1869,19 @@ static int __fastcall HookedGameStart(int self)
  * vanilla PCB still loads it. Only written when co-op is actually in play, so a
  * solo run made with the DLL stays a byte-clean vanilla replay. */
 #define ADDR_REPLAY_HDR_INIT ((LPVOID)0x00443040)
-#define RPY_COOP_OFF  0x58                 /* spare header gap 0x58-0x5d           */
-#define RPY_COOP_MAG0 0xC2                 /* co-op block magic / format tag       */
+/* Header-gap tag (0x58-0x5d): in-memory "watch replay" ONLY. A SAVED .rpy overwrites it with
+ * ZUN's date (0x58) and player name (0x5e) — the durable co-op block lives in the stage block
+ * (§8ah: seed at +0x20, magic/p2sel/flags at +0x28-0x2b). */
+#define RPY_COOP_OFF  0x58                 /* header gap 0x58-0x5d (in-memory playback only)      */
+#define RPY_COOP_MAG0 0xC2                 /* co-op block magic / format tag                      */
 #define RPY_COOP_MAG1 0x07
 #define RPY_CW_OFF    0x5d                 /* §8ad: recording's x87 cw nibble (0x80|((cw>>8)&0xf)) */
-#define RPY_SEED_OFF  0x5e                 /* §8ae: netplay RNG init seed (u16 LE) — valid iff 0x5c bit1 */
 typedef uint32_t (__fastcall *ReplayHdrFn_t)(void *self);
 static ReplayHdrFn_t s_origReplayHdr = NULL;
 static int s_rpyTagLogged = 0;
 static unsigned char *s_rpyHdrBuf = NULL;  /* §8ad: live header buffer, so the SIM can stamp the cw */
+static int s_rpySeedLogged = 0;            /* §8ah: log the stage-block seed fix once per recording */
+static unsigned char *s_rpyStageBlk = NULL;/* §8ah: current recording stage block (seed backfill target) */
 
 static uint32_t __fastcall HookedReplayHdrInit(void *self)
 {
@@ -1835,42 +1900,57 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
     int coop = !s_suppressP2;
     if (hdr && coop) {
         int p2sel = (s_p2Sel >= 0) ? s_p2Sel : (int)*ADDR_SEL_ID;  /* mirror -> P1 */
+        unsigned char netFlag = (unsigned char)(s_netActive ? 0x01 : 0x00);
+        /* Header-gap tag (0x58-0x5d): recovered by playback ONLY for the in-memory "watch replay"
+         * path. A SAVED .rpy clobbers it — ZUN's results screen writes the replay DATE string at
+         * 0x58 and the player NAME at 0x5e (a reloaded header reads "06" at 0x58, not our magic —
+         * confirmed in the log). So the DURABLE co-op block + seed live in the per-stage block
+         * below; this header tag is kept only as a best-effort for immediate post-run playback. */
         hdr[RPY_COOP_OFF + 0] = RPY_COOP_MAG0;
         hdr[RPY_COOP_OFF + 1] = RPY_COOP_MAG1;
         hdr[RPY_COOP_OFF + 2] = (unsigned char)p2sel;
         hdr[RPY_COOP_OFF + 3] = (unsigned char)(s_allowDiffChar ? 1 : 0);
-        /* §8aa byte 0x5c bit0: this run was recorded UNDER NETPLAY, where the x87 control word
-         * was pinned to 24-bit/round-nearest every frame (PinFpuForNetplay). Playback must
-         * reproduce that FP environment or the sim drifts (trig-driven aimed shots diverge) —
-         * "resembles the moves but desyncs". Local/solo runs leave this 0 (vanilla FP). */
-        /* §8ae: stamp the netplay RNG init seed. The netcode force-seeds the LIVE RNG to this value
-         * at every scene start (the SEEDFORCE F1 log lines), AFTER ZUN has already snapshotted the
-         * PRE-force seed into the replay's stage block — so a vanilla restore replays the WRONG seed
-         * and EVERY enemy's bullet RNG forks from stage frame 1 (positions/inputs match, but both
-         * players walk into bullets that weren't there live; aimed sections kill fastest). This was
-         * THE netplay-replay desync. Save the forced seed (bit1 of 0x5c marks it present);
-         * HookedReplayLoad re-applies it on playback. Local/solo runs never force-seed, so they leave
-         * bit1 clear and ZUN's own stage-block restore is already correct. */
-        {
-            unsigned char netFlag = (unsigned char)(s_netActive ? 0x01 : 0x00);
-            unsigned short is = s_netActive ? (unsigned short)Nc_GetInitSeed() : 0;
-            if (is) {                                    /* skip a 0 seed (link not up yet) — no false stamp */
-                hdr[RPY_SEED_OFF + 0] = (unsigned char)(is & 0xff);
-                hdr[RPY_SEED_OFF + 1] = (unsigned char)((is >> 8) & 0xff);
-                netFlag |= 0x02;                         /* bit1: a valid init seed is stamped at 0x5e */
-            }
-            hdr[RPY_COOP_OFF + 4] = netFlag;
-        }
-        /* §8ad: byte 0x5d holds the x87 control word the SIM runs at, so playback can reproduce
-         * the exact precision (a netplay run records at 64-bit, local at 24-bit — the real cause
-         * of the netplay-replay desync). The cw isn't known yet at header init, so seed it 0
-         * (no sentinel) and let the player-update hook stamp 0x80|((cw>>8)&0xf) once the sim runs.
-         * Keep the live buffer so the SIM can write into the same bytes that get saved. */
-        hdr[RPY_CW_OFF] = 0x00;
+        hdr[RPY_COOP_OFF + 4] = netFlag;
+        hdr[RPY_CW_OFF]       = 0x00;
         s_rpyHdrBuf = hdr;
+        /* §8ah: durable co-op metadata in the per-stage block (round-trips through a saved .rpy,
+         * unlike the header gap). FUN_00443040 just allocated this stage's block at hdr+0x1c+stage*4
+         * and set its +0x20 seed slot to DAT_0062f854 (the PRE-force seed ZUN snapshots BEFORE the
+         * netcode's per-scene SEEDFORCE) — overwrite it with the FORCED init seed so ZUN's own restore
+         * (FUN_00443550: DAT_0049fe20 = stageblock+0x20) reproduces the RNG state the live sim actually
+         * ran from. This was THE netplay-replay desync, and the fix now lands on BOTH the tagged and
+         * the force_replay_p2 playback paths. The 0x28-0x2b gap (between the last block field at +0x27
+         * and the input stream at +0x2c) carries the co-op tag so playback auto-detects P2 from a
+         * saved replay. Local/solo runs never force-seed, so they leave +0x20 as ZUN set it. */
+        s_rpyStageBlk = NULL;
+        {
+            int st = (int)*(volatile uint32_t *)0x0062f85c - 1;
+            if (st < 0) st = 0;
+            if (st > 6) st = 6;
+            unsigned char *sb = *(unsigned char **)(hdr + 0x1c + st * 4);
+            if (sb) {
+                s_rpyStageBlk = sb;                      /* backfill target if the link came up late */
+                if (s_netActive) {
+                    unsigned short is = (unsigned short)Nc_GetInitSeed();
+                    if (is) {                            /* skip a 0 seed (link not up yet) */
+                        unsigned short b4 = *(unsigned short *)(sb + 0x20);
+                        *(unsigned short *)(sb + 0x20) = is;
+                        if (!s_rpySeedLogged) {
+                            Log("replay: stage-seed fix sb+0x20 0x%04x -> 0x%04x (stage=%d) "
+                                "[§8ah: ZUN-native seed slot, survives saved .rpy]", b4, is, st + 1);
+                            s_rpySeedLogged = 1;
+                        }
+                    }
+                }
+                sb[0x28] = RPY_COOP_MAG0;
+                sb[0x29] = (unsigned char)p2sel;
+                sb[0x2a] = (unsigned char)((s_allowDiffChar ? 1 : 0) | (s_netActive ? 2 : 0));
+                sb[0x2b] = 0;
+            }
+        }
         if (!s_rpyTagLogged) {
             int n = (p2sel >= 0 && p2sel <= 5) ? p2sel : 0;
-            Log("replay: tagged co-op header — P2=%s diff=%d (+0x%02x)",
+            Log("replay: tagged co-op header — P2=%s diff=%d (hdr +0x%02x / stageblock +0x28)",
                 ADDR_SEL_NAMES[n], s_allowDiffChar, RPY_COOP_OFF);
             s_rpyTagLogged = 1;
         }
@@ -1919,25 +1999,37 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
 {
     uint32_t r = s_origReplayLoad(self);
     unsigned char *hdr = self ? (unsigned char *)((void **)self)[1] : NULL;
-    if (hdr && hdr[RPY_COOP_OFF] == RPY_COOP_MAG0 && hdr[RPY_COOP_OFF + 1] == RPY_COOP_MAG1) {
-        s_replayIsCoop   = 1;
-        s_replayP2Sel    = (signed char)hdr[RPY_COOP_OFF + 2];
-        s_replayDiffChar = hdr[RPY_COOP_OFF + 3] ? 1 : 0;
-        s_replayNetRecorded = (hdr[RPY_COOP_OFF + 4] & 0x01) ? 1 : 0;   /* §8aa */
-        /* §8ae: recover the stamped netplay RNG init seed (0x5c bit1 set => 0x5e-0x5f hold it). */
-        s_replayHasSeed  = (hdr[RPY_COOP_OFF + 4] & 0x02) ? 1 : 0;
-        s_replayInitSeed = (unsigned short)(hdr[RPY_SEED_OFF] | (hdr[RPY_SEED_OFF + 1] << 8));
-        /* §8ad: target playback precision = the cw the SIM actually ran at, stamped at 0x5d (the
-         * netplay sim runs at 24-bit/0x007f, same as a local replay — the earlier "records at 64-bit"
-         * premise was wrong). Stamp absent (pre-§8ad replay) => default to 24-bit; never force 64-bit. */
-        s_replayTargetCw = (hdr[RPY_CW_OFF] & 0x80)
-                         ? (unsigned short)(0x007f | ((hdr[RPY_CW_OFF] & 0x0f) << 8))
-                         : 0x007f;
+    /* §8ah: the DURABLE co-op tag lives in the current stage block (+0x28), which round-trips
+     * through a saved .rpy; the header 0x58 gap only survives in-memory playback (ZUN's date/name
+     * fields clobber it on save). s_origReplayLoad just made the +0x1c stage pointers absolute, so
+     * read the block for the stage being loaded (DAT_0062f85c). The RNG seed is restored natively by
+     * ZUN from stageblock+0x20 (which we forced at record), so playback needs no seed re-force. */
+    unsigned char *sb = NULL;
+    if (hdr) {
+        int st = (int)*(volatile uint32_t *)0x0062f85c - 1;
+        if (st < 0) st = 0;
+        if (st > 6) st = 6;
+        sb = *(unsigned char **)(hdr + 0x1c + st * 4);
+    }
+    int sbTag  = (sb && sb[0x28] == RPY_COOP_MAG0);
+    int hdrTag = (hdr && hdr[RPY_COOP_OFF] == RPY_COOP_MAG0 && hdr[RPY_COOP_OFF + 1] == RPY_COOP_MAG1);
+    if (sbTag || hdrTag) {
+        s_replayIsCoop = 1;
+        if (sbTag) {                                        /* saved-replay path (durable) */
+            s_replayP2Sel       = (signed char)sb[0x29];
+            s_replayDiffChar    = (sb[0x2a] & 1) ? 1 : 0;
+            s_replayNetRecorded = (sb[0x2a] & 2) ? 1 : 0;
+        } else {                                            /* in-memory watch-replay path */
+            s_replayP2Sel       = (signed char)hdr[RPY_COOP_OFF + 2];
+            s_replayDiffChar    = hdr[RPY_COOP_OFF + 3] ? 1 : 0;
+            s_replayNetRecorded = (hdr[RPY_COOP_OFF + 4] & 0x01) ? 1 : 0;   /* §8aa */
+        }
+        s_replayTargetCw = 0x007f;   /* sim is 24-bit in both net & local; pin neutered (§8ad refuted) */
         if (!s_replayLoadLogged) {
             int n = (s_replayP2Sel >= 0 && s_replayP2Sel <= 5) ? s_replayP2Sel : 0;
-            Log("replay PLAYBACK: co-op replay — P2=%s diffchar=%d netRec=%d hasSeed=%d initSeed=0x%04x "
-                "targetCw=0x%04x (header +0x%02x)", ADDR_SEL_NAMES[n], s_replayDiffChar,
-                s_replayNetRecorded, s_replayHasSeed, s_replayInitSeed, s_replayTargetCw, RPY_COOP_OFF);
+            Log("replay PLAYBACK: co-op replay — P2=%s diffchar=%d netRec=%d src=%s "
+                "(stageblock +0x28 / header +0x%02x)", ADDR_SEL_NAMES[n], s_replayDiffChar,
+                s_replayNetRecorded, sbTag ? "stageblock" : "header", RPY_COOP_OFF);
             s_replayLoadLogged = 1;
         }
     } else if (IsReplayPlayback() && s_forceReplayP2 >= 0 && hdr) {
@@ -1948,25 +2040,22 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
         s_replayP2Sel    = s_forceReplayP2;
         s_replayDiffChar = ((s_forceReplayP2 / 2) != (int)hdr[RPY_P1CHAR_OFF]) ? 1 : 0;
         s_replayNetRecorded = 0;   /* §8aa: untagged/forced — flag unknown */
-        s_replayHasSeed = 0;       /* §8ae: legacy/forced replays predate the seed stamp — can't fix */
-        /* §8ad: forced/legacy replays predate the cw stamp; the sim runs at 24-bit either way. */
-        s_replayTargetCw = (hdr[RPY_CW_OFF] & 0x80)
-                         ? (unsigned short)(0x007f | ((hdr[RPY_CW_OFF] & 0x0f) << 8)) : 0x007f;
+        s_replayTargetCw = 0x007f; /* §8ad: sim runs at 24-bit either way */
         if (!s_replayLoadLogged) {
             int n = (s_forceReplayP2 <= 5) ? s_forceReplayP2 : 0;
             Log("replay PLAYBACK: FORCED co-op (force_replay_p2=%d -> P2=%s diffchar=%d, "
-                "P1char=%d) — untagged replay", s_forceReplayP2, ADDR_SEL_NAMES[n],
-                s_replayDiffChar, (int)hdr[RPY_P1CHAR_OFF]);
+                "P1char=%d) — untagged replay (seed still fixed via ZUN's stageblock+0x20)",
+                s_forceReplayP2, ADDR_SEL_NAMES[n], s_replayDiffChar, (int)hdr[RPY_P1CHAR_OFF]);
             s_replayLoadLogged = 1;
         }
     } else {
         s_replayIsCoop = 0;   /* solo/vanilla replay — no phantom P2 */
         s_replayNetRecorded = 0;
-        s_replayHasSeed = 0;  /* §8ae */
+        s_replayTargetCw = 0x007f;
         if (IsReplayPlayback() && !s_replayLoadLogged) {  /* why a replay didn't recover P2 */
-            Log("replay PLAYBACK: NO co-op tag at +0x%02x (bytes %02x %02x) — solo/vanilla "
-                "or recorded pre-fix (set [coop] force_replay_p2 to spawn P2 anyway)",
-                RPY_COOP_OFF, hdr ? hdr[RPY_COOP_OFF] : 0xFF,
+            Log("replay PLAYBACK: NO co-op tag (stageblock+0x28=%02x header+0x%02x=%02x %02x) — "
+                "solo/vanilla or recorded pre-fix (set [coop] force_replay_p2 to spawn P2 anyway)",
+                sb ? sb[0x28] : 0xFF, RPY_COOP_OFF, hdr ? hdr[RPY_COOP_OFF] : 0xFF,
                 hdr ? hdr[RPY_COOP_OFF + 1] : 0xFF);
             s_replayLoadLogged = 1;
         }
@@ -1986,21 +2075,10 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
                 "coop=%d) — reproducing the recording's x87 precision (§8ad).",
                 pin ? "PIN" : "native", tgt, s_replayFpuPin, s_replayNetRecorded, s_replayIsCoop);
     }
-    /* §8ae: re-force the netplay RNG init seed the LIVE sim actually ran from. s_origReplayLoad
-     * (FUN_00443550) just executed `DAT_0049fe20 = stageblock+0x20` (PCBdecomp.c:27909), restoring the
-     * PRE-force seed ZUN snapshotted before the netcode's per-scene SEEDFORCE — so without this the
-     * replayed sim starts every stage from the wrong RNG state and forks all enemy bullets (root cause
-     * of the netplay-replay desync). FUN_00443550 runs once per stage as the playback task's init
-     * callback (it loads DAT_0062f85c's stage block), so stamping the seed back here re-applies it at
-     * EACH stage, at the exact point ZUN restored it and before the stage sim draws — mirroring the
-     * live force. Only for net-recorded replays carrying the stamp; local replays restore correctly. */
-    if (IsReplayPlayback() && s_replayHasSeed) {
-        unsigned short before = *ADDR_RNG_SEED;
-        *ADDR_RNG_SEED = s_replayInitSeed;
-        Log("replay PLAYBACK: RNG seed re-forced 0x%04x -> 0x%04x (§8ae — reproduce the netplay "
-            "per-scene SEEDFORCE the .rpy didn't capture; stage=%d)",
-            before, s_replayInitSeed, (int)*(volatile uint32_t *)0x0062f85c);
-    }
+    /* §8ah: no RNG seed re-force here — ZUN's own restore (s_origReplayLoad, FUN_00443550:
+     * DAT_0049fe20 = stageblock+0x20) already loaded the FORCED seed we wrote into that slot at
+     * record time, so every playback path (tagged, force_replay_p2, in-memory) starts each stage
+     * from the exact RNG state the live sim ran from. Verify by trace, not by a log line here. */
     return r;
 }
 
@@ -3651,23 +3729,17 @@ static int __fastcall HookedUpdate(void *self)
     if (isP1 && (s_p2 || (IsReplayPlayback() && s_replayIsCoop))) {
         static int s_rpyDbgTick = 0;
         int play = IsReplayPlayback();
-        /* §8ad: while RECORDING, stamp the cw the SIM is actually running at into the replay
-         * header (sentinel bit7 set) so playback can reproduce that exact precision. The netplay sim
-         * actually runs at 24-bit (0x007f, same as a local replay — the earlier "64-bit" premise was
-         * wrong), so this records 0x007f and playback stays native; the real desync was the RNG seed
-         * (§8ae), not precision. !play => recording; s_rpyHdrBuf is the live header. */
+        /* §8ah: while RECORDING, backfill the FORCED init seed into ZUN's stage-block seed slot
+         * (s_rpyStageBlk+0x20) in case header-init ran before the link was up (Nc_GetInitSeed()==0
+         * then, so HookedReplayHdrInit couldn't write it). Once linked, stamp it so the saved .rpy
+         * reproduces the per-scene SEEDFORCE via ZUN's own restore. Cheap; idempotent — only writes
+         * while the slot still differs. The header cw byte is kept for the in-memory path only. */
         if (!play && s_rpyHdrBuf) {
             s_rpyHdrBuf[RPY_CW_OFF] = (unsigned char)(0x80 | ((FpuCw() >> 8) & 0x0f));
-            /* §8ae: backfill the netplay init seed if header-init ran before link-up (seed was 0
-             * then, so bit1 stayed clear). Once linked, stamp it so the .rpy can reproduce the
-             * per-scene SEEDFORCE. Cheap; only writes until the seed is present. */
-            if (s_netActive && !(s_rpyHdrBuf[RPY_COOP_OFF + 4] & 0x02)) {
+            if (s_netActive && s_rpyStageBlk) {
                 unsigned short is = (unsigned short)Nc_GetInitSeed();
-                if (is) {
-                    s_rpyHdrBuf[RPY_SEED_OFF + 0] = (unsigned char)(is & 0xff);
-                    s_rpyHdrBuf[RPY_SEED_OFF + 1] = (unsigned char)((is >> 8) & 0xff);
-                    s_rpyHdrBuf[RPY_COOP_OFF + 4] |= 0x02;
-                }
+                if (is && *(unsigned short *)(s_rpyStageBlk + 0x20) != is)
+                    *(unsigned short *)(s_rpyStageBlk + 0x20) = is;
             }
         }
         ReplayDetTrace(play);                               /* §8ac per-frame CSV (gated by replay_trace) */
@@ -3971,28 +4043,35 @@ static void DrawCoopHud(void *p2)
     float pos[3];
     pos[0] = 448.f; pos[2] = 0.f;
 
-    /* live netplay status (EoSD-style connection readout): role, our logic frame,
-     * delay, sync state, and the per-frame lockstep wait. A climbing wait= with a
-     * near-frozen frame number is exactly what a stall looks like.
-     * Item 1: drawn at the playfield's bottom-left (full width) — NOT the ~190px
-     * sidebar (x=448), where "NET H F##### WAIT###ms" overran the HUD box. */
+    /* live netplay status (EoSD-style connection readout): role, sync state, ping,
+     * and a stall warning. Tucked into the bottom-right corner just above ZUN's FPS
+     * counter (drawn at 512,465) and shrunk to ~0.75x so it stays out of the way —
+     * the playfield-bottom-left full-size line was distracting (user, §8af). The
+     * verbose F#/delay fields were dev-only; a stall now shows as WAIT###ms.
+     *
+     * The ascii manager captures its current scale (mgr+0x74c4 = X, +0x74c8 = Y,
+     * floats) into each text entry at print time, so save/shrink/print/restore
+     * scales ONLY our line and leaves the FPS counter (same manager) untouched. */
     if (s_netActive || s_netPeerLost) {
         float npos[3];
-        npos[0] = 8.f; npos[1] = 462.f; npos[2] = 0.f;
-        int ping = Nc_GetPing();   /* item 3: round-trip latency, ms (-1 = not yet measured) */
+        npos[0] = 496.f; npos[1] = 451.f; npos[2] = 0.f;   /* above the FPS readout */
+        int ping = Nc_GetPing();   /* round-trip latency, ms (-1 = not yet measured) */
+        volatile float *sx = (volatile float *)((char *)ADDR_ASCII_MGR + 0x74c4);
+        volatile float *sy = (volatile float *)((char *)ADDR_ASCII_MGR + 0x74c8);
+        float oldX = *sx, oldY = *sy;
+        *sx = oldX * 0.75f; *sy = oldY * 0.75f;
         if (s_netPeerLost)
             ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET LOST");
         else if (s_netWaitMs >= 100)
-            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET %c F%d WAIT%dms",
-                             Nc_IsHost() ? 'H' : 'G', s_netFrame, s_netWaitMs);
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET %c WAIT%dms",
+                             Nc_IsHost() ? 'H' : 'G', s_netWaitMs);
         else if (ping < 0)
-            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET %c F%d d%d %s PING--",
-                             Nc_IsHost() ? 'H' : 'G', s_netFrame, Nc_GetDelay(),
-                             s_netSync ? "SYNC" : "DSYN");
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET %c %s",
+                             Nc_IsHost() ? 'H' : 'G', s_netSync ? "SYNC" : "DSYN");
         else
-            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET %c F%d d%d %s PING%dms",
-                             Nc_IsHost() ? 'H' : 'G', s_netFrame, Nc_GetDelay(),
-                             s_netSync ? "SYNC" : "DSYN", ping);
+            ADDR_ASCII_PRINT(ADDR_ASCII_MGR, npos, "NET %c %s %dms",
+                             Nc_IsHost() ? 'H' : 'G', s_netSync ? "SYNC" : "DSYN", ping);
+        *sx = oldX; *sy = oldY;   /* restore so the FPS counter stays full-size */
     }
 
     pos[1] = 296.f;
@@ -4298,8 +4377,8 @@ static void ResetCoopSession(void)
     s_readyFrames   = 0;
     s_replayIsCoop  = 0;         /* §8k: forget the last replay's co-op tag        */
     s_replayNetRecorded = 0;     /* §8aa: forget last replay's net-recorded/FPU flag */
-    s_replayHasSeed = 0;         /* §8ae: forget last replay's stamped RNG init seed */
-    s_replayInitSeed = 0;        /* §8ae */
+    s_rpyStageBlk = NULL;        /* §8ah: forget last recording's stage block (seed backfill target) */
+    s_rpySeedLogged = 0;         /* §8ah: re-log the stage-seed fix for the next recording */
     s_replayTargetCw = 0x007f;   /* §8ad: default precision until the next replay loads its cw */
     s_replayPinCw = 0;           /* §8ad: no sim-seam pin until the next replay decides */
     s_fpuPinnedReplay = 0;       /* re-log the replay FPU pin for the next replay    */
@@ -4584,6 +4663,9 @@ static int InstallHooks(void)
     if (s_netEnabled) {
         if (MH_CreateHook(ADDR_SCENE_TICK, (LPVOID)&HookedSceneTick, (LPVOID*)&s_origSceneTick) != MH_OK) return 0;
         if (MH_CreateHook(ADDR_GAME_START, (LPVOID)&HookedGameStart, (LPVOID*)&s_origGameStart) != MH_OK) return 0;
+        /* §8ag: Extra/Phantasm unlock predicates — forced "unlocked" under netplay (see hooks). */
+        if (MH_CreateHook(ADDR_EXTRA_UNLOCKED, (LPVOID)&HookedExtraUnlocked, (LPVOID*)&s_origExtraUnlocked) != MH_OK) return 0;
+        if (MH_CreateHook(ADDR_PHANT_UNLOCKED, (LPVOID)&HookedPhantUnlocked, (LPVOID*)&s_origPhantUnlocked) != MH_OK) return 0;
     }
     /* B2: FP-safe naked detour on the item spawner, gated on coop.ini so a default
      * build is byte-for-byte unchanged. Create+enable together (MinHook allows it). */
@@ -4618,6 +4700,8 @@ static int InstallHooks(void)
     if (s_netEnabled) {
         if (MH_EnableHook(ADDR_SCENE_TICK) != MH_OK) return 0;
         if (MH_EnableHook(ADDR_GAME_START) != MH_OK) return 0;
+        if (MH_EnableHook(ADDR_EXTRA_UNLOCKED) != MH_OK) return 0;  /* §8ag unlocks */
+        if (MH_EnableHook(ADDR_PHANT_UNLOCKED) != MH_OK) return 0;
     }
     return 1;
 }

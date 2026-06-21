@@ -2778,3 +2778,30 @@ recovery and local-co-op saved replays, not just netplay.)
 `replay: stage-seed fix sb+0x20 0x…-> 0x…(stage=N) [§8ah …]`; on playback `replay PLAYBACK: co-op replay — …
 src=stageblock`. P2 should auto-spawn with `force_replay_p2=-1`, and the replay should track the live run through
 aimed sections. Build green, native test green (16/16). Supersedes §8ae's header-stamp approach.
+
+### §8ai — netplay-replay desync: the SEEDFORCE wipes ZUN's stage-setup draws; reproduce it on playback (2026-06-22)
+
+§8ah fixed the *start* seed but the replay still desynced. A clean record-vs-playback `ReplayDetTrace` (now logging
+from the stage's first frame, mode bit2) plus the live `coop_trace_host.csv` localised it precisely:
+- **Start seed is identical** — `stage-seed fix → 0x1480` (record) and playback `seed=0x1480` confirmed.
+- **The very first in-stage frame already differs.** Live `rec` rf0 = `seed=0x1480` (== initSeed, *undrawn*); playback
+  `rpy` rf1 = `seed=0xf7c5` (== initSeed after **~95 RNG draws**). Inputs/positions stay aligned (`rec[N]==rpy[N+1]`,
+  a trace-sample offset) — only the seed forks, from frame 0.
+
+**Mechanism.** ZUN's stage-init draws ~80-95 RNG calls (warm-up / ECL init) at stage entry. In a **live netplay** run
+the per-scene `SEEDFORCE` fires at the stage's first frame *after* those draws and **resets the seed to initSeed**
+(the live trace shows `SEEDFORCE … 0x7136 -> 0x1480 ctr=82` at the `inStage 0→1` edge), so the recorded **gameplay**
+starts clean at initSeed. On **playback**, ZUN's stage-load restore (`FUN_00443550 → DAT_0049fe20 = stageblock+0x20`,
+the §8ah seed) lands initSeed *before* the setup draws, so the setup evolves it away (→ `0xf7c5`) and every enemy's
+RNG forks from the first gameplay frame. (The §8ah seed is still correct and necessary — it's *when* it lands that was
+wrong.) Local replays are unaffected: local co-op never force-seeds, so ZUN's setup draws are part of their canonical
+flow.
+
+**Fix (coop.c, §8ai).** Reproduce the live SEEDFORCE's wipe-point on playback. `HookedReplayLoad` arms a re-force for
+net-recorded co-op replays (`s_replayInitSeed = stageblock+0x20`); `HookedUpdate` fires it **once at the first in-stage
+frame** (mode bit2 set) — after ZUN's stage-setup draws, before that frame's gameplay draws, mirroring exactly where
+the live SEEDFORCE landed. Net-recorded only; one re-force per stage (armed at load, cleared on fire). Log:
+`replay PLAYBACK: §8ai first-in-stage seed re-force 0x…-> 0x… (wipes ~N stage-setup draws…)`.
+
+**Verify with a fresh net recording + playback.** The replayed run should now hold sync through the stage (the prior
+captures died at Cirno / Ran from the forked setup seed). Build green, native test green (16/16).

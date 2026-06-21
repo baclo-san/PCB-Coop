@@ -1223,6 +1223,8 @@ static int      s_replayFpuPin = -1;       /* coop.ini [coop] replay_fpu_pin: pi
  * reads them for the §8aa playback FPU pin). IsReplayPlayback() is forward-declared for the same. */
 static int      s_replayIsCoop = 0;        /* the loaded replay carries our co-op tag (§8ah: stageblock+0x28) */
 static int      s_replayNetRecorded = 0;   /* §8aa: recorded under netplay (stageblock 0x2a bit1) */
+static unsigned short s_replayInitSeed = 0;/* §8ai: recorded netplay init seed (stageblock+0x20)  */
+static int      s_replaySeedArm = 0;       /* §8ai: re-force the seed at the first in-stage frame  */
 static int      s_replayTrace = 0;         /* §8ac coop.ini replay_trace: per-frame record/playback CSV */
 static int      IsReplayPlayback(void);
 /* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
@@ -2085,6 +2087,18 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
         Log("replay PLAYBACK: stage=%d seed=0x%04x (stageblock+0x20=0x%04x tag+0x28=0x%02x) "
             "[§8ah seed round-trip check]", (int)*(volatile uint32_t *)0x0062f85c,
             (unsigned)*ADDR_RNG_SEED, (unsigned)*(unsigned short *)(sb + 0x20), sb[0x28]);
+    }
+    /* §8ai: arm a seed re-force for the FIRST IN-STAGE playback frame. ZUN's stage-load restore
+     * (above) lands initSeed too EARLY — before ZUN's stage-setup draws ~80-95 RNG calls. In the
+     * LIVE netplay run the per-scene SEEDFORCE fires at the stage's first frame and WIPES those
+     * setup draws (the trace shows the live stage starting clean at initSeed, e.g. rec rf0 seed ==
+     * initSeed, while playback starts at initSeed-evolved-by-setup, e.g. f7c5) — so without a
+     * matching wipe every enemy's RNG forks from the first gameplay frame. Re-apply initSeed at the
+     * first in-stage frame (HookedUpdate) to reproduce the live SEEDFORCE's wipe-point. Net-recorded
+     * only: local replays never force-seed, so ZUN's setup draws ARE part of their canonical flow. */
+    if (IsReplayPlayback() && s_replayNetRecorded && sb) {
+        s_replayInitSeed = *(unsigned short *)(sb + 0x20);
+        s_replaySeedArm  = s_replayInitSeed ? 1 : 0;
     }
     return r;
 }
@@ -3740,6 +3754,18 @@ static int __fastcall HookedUpdate(void *self)
      * true from the stage's first frame in BOTH record and playback; gate on it so rec covers the
      * intro and aligns with rpy's rf=1.. for a clean per-frame diff of the early divergence. */
     int recActive = (int)(((*(volatile uint32_t *)0x0062f648) >> 2) & 1);
+    /* §8ai: reproduce the live per-scene SEEDFORCE on playback. HookedReplayLoad armed this at stage
+     * load; fire ONCE at the first IN-STAGE frame (recActive), after ZUN's stage-setup has drawn its
+     * ~80-95 RNG calls but before this frame's gameplay draws — wiping the setup exactly as the live
+     * netplay run did, so the replayed gameplay RNG starts from the recorded initSeed. Runs before the
+     * ReplayDetTrace below so the trace reflects the corrected seed. Net-recorded co-op replays only. */
+    if (isP1 && recActive && s_replaySeedArm && IsReplayPlayback()) {
+        unsigned short before = *ADDR_RNG_SEED;
+        *ADDR_RNG_SEED = s_replayInitSeed;
+        s_replaySeedArm = 0;
+        Log("replay PLAYBACK: §8ai first-in-stage seed re-force 0x%04x -> 0x%04x (wipes ~%u stage-setup "
+            "draws, mirrors live SEEDFORCE)", before, s_replayInitSeed, (unsigned)*ADDR_RNG_CTR);
+    }
     if (isP1 && (s_p2 || recActive || (IsReplayPlayback() && s_replayIsCoop))) {
         static int s_rpyDbgTick = 0;
         int play = IsReplayPlayback();
@@ -4393,6 +4419,8 @@ static void ResetCoopSession(void)
     s_replayNetRecorded = 0;     /* §8aa: forget last replay's net-recorded/FPU flag */
     s_rpyStageBlk = NULL;        /* §8ah: forget last recording's stage block (seed backfill target) */
     s_rpySeedLogged = 0;         /* §8ah: re-log the stage-seed fix for the next recording */
+    s_replaySeedArm = 0;         /* §8ai: cancel a pending first-in-stage seed re-force */
+    s_replayInitSeed = 0;        /* §8ai */
     s_replayTargetCw = 0x007f;   /* §8ad: default precision until the next replay loads its cw */
     s_replayPinCw = 0;           /* §8ad: no sim-seam pin until the next replay decides */
     s_fpuPinnedReplay = 0;       /* re-log the replay FPU pin for the next replay    */

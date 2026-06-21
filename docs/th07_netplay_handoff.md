@@ -2805,3 +2805,42 @@ the live SEEDFORCE landed. Net-recorded only; one re-force per stage (armed at l
 
 **Verify with a fresh net recording + playback.** The replayed run should now hold sync through the stage (the prior
 captures died at Cirno / Ran from the forked setup seed). Build green, native test green (16/16).
+
+### §8aj — netplay-replay desync (the SECOND layer): playback draws a different *number* of rands; re-pin the seed every frame (2026-06-22)
+
+§8ai got the **start** seed right, but the replay **still** desynced (tester: Phantasm, Ran midboss). A fresh
+record-vs-playback `ReplayDetTrace` (logging from the stage's first frame) plus the RNG being a pure function
+`next = rol2((seed ^ 0x9630) + 0x9aad)` let me reconstruct the **per-frame rand-call count for both files** (count the
+`f`-applications between consecutive sampled seeds — the record CSV's call-counter logs 0, but the seed deltas don't lie).
+
+**Diagnosis.** The seed is now correct at the start and the **player positions stay perfectly in lockstep** (rpy = rec with
+a cosmetic +1 trace-sample offset; the record/playback tasks bump the replay-frame counter at a slightly different phase than
+our `HookedUpdate` sample). But the **seed phase slips**: playback draws a *different number* of `rand()` calls per frame than
+the live recording. Reconstructed counts show isolated 1-frame *timing shifts* (e.g. rf459 — correlated with a **P2 input
+edge**: the live netcode-driven P2 vs the replay-driven P2 fire their rand-consuming actions on a slightly different frame) and
+small magnitude differences that **avalanche once the seed is even a little off** (an enemy that picks "5 vs 3 bullets" from a
+forked seed draws a different count, which forks the seed further). Cumulative drift over one Phantasm stage: **+3034 rand calls**
+(playback ≈ 10 % *more* RNG work than the live run). Positions match because they're input-driven; the divergence is entirely in
+the RNG phase, so the players don't *see* it until enough bullets have forked — at the midboss.
+
+**Fix (coop.c, §8aj) — stop chasing every rand source; re-pin the seed every frame.** ZUN's per-frame replay entry is 4 bytes:
+the 2-byte input word at `+0` (written by the record task `FUN_00442cd0`, read by the playback task `FUN_00442ee0`) and a
+2-byte "flags" half at `+2` that is **always 0** (`DAT_0062f640`, its only source, is never set) and that playback **never
+reads**. We hijack that free half to carry the **frame-START RNG seed**:
+
+* `HookedFrameTask` (record): after the original writes the entry (detected: the input-stream head `self+0x84` advanced by 4),
+  store `*ADDR_RNG_SEED` into the entry's `+2` half. This task runs *before* the frame's enemy/bullet sim draws any rand
+  (`HookedGameStart` seed-force → **this** → player update → sim), so the seed here is exactly the value the sim runs from.
+* `HookedPlayTask` (playback): after the original consumes the entry (same `+4` detection), restore
+  `*ADDR_RNG_SEED = entry[+2]` — at the **identical frame-phase**, before the sim. Every frame now starts from the exact recorded
+  seed, so **any rand-call-count difference is irrelevant** — there is no phase to slip. Subsumes §8ai (covers frame 1 too).
+
+Net co-op recordings only (local/solo replays are byte-clean vanilla and already deterministic). Gated by a version bit so OLD
+net replays (no stored seed; `+2` half = 0) fall back to §8ai instead of restoring a bogus 0: `stageblock+0x2a` **bit2** (durable,
+saved-replay) and header `+0x5c` **bit1** (in-memory watch-replay). The seed stream rides in the same compressed body that the
+§8ah stage block proved round-trips through a saved `.rpy`. Logs: record `replay: §8aj per-frame seed capture ON …`; load
+`replay PLAYBACK: §8aj per-frame seed = PRESENT …`; first restore `replay PLAYBACK: §8aj per-frame seed restore ON …`.
+
+**Verify with a fresh net recording + playback.** With `replay_trace=1`, `coop_rdt_rpy.csv`'s seed column should now track
+`coop_rdt_rec.csv` frame-for-frame (modulo the cosmetic +1 sample offset) all the way through the stage, and the replay should
+hold sync past Ran/the midboss to wherever the live run actually ended. Build green, native test green (16/16).

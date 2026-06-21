@@ -1225,6 +1225,9 @@ static int      s_replayIsCoop = 0;        /* the loaded replay carries our co-o
 static int      s_replayNetRecorded = 0;   /* §8aa: recorded under netplay (stageblock 0x2a bit1) */
 static unsigned short s_replayInitSeed = 0;/* §8ai: recorded netplay init seed (stageblock+0x20)  */
 static int      s_replaySeedArm = 0;       /* §8ai: re-force the seed at the first in-stage frame  */
+static int      s_replayPerFrameSeed = 0;  /* §8aj: replay carries a per-frame seed in each entry's free flags half */
+static unsigned s_rpySeedStored = 0;       /* §8aj: count of per-frame seeds written (record) — logged once */
+static unsigned s_rpySeedRestored = 0;     /* §8aj: count of per-frame seeds restored (playback) — logged once */
 static int      s_replayTrace = 0;         /* §8ac coop.ini replay_trace: per-frame record/playback CSV */
 static int      IsReplayPlayback(void);
 /* Per-player RAW menu words this frame (de-merged P1=host / P2=guest), for the
@@ -1912,7 +1915,9 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
         hdr[RPY_COOP_OFF + 1] = RPY_COOP_MAG1;
         hdr[RPY_COOP_OFF + 2] = (unsigned char)p2sel;
         hdr[RPY_COOP_OFF + 3] = (unsigned char)(s_allowDiffChar ? 1 : 0);
-        hdr[RPY_COOP_OFF + 4] = netFlag;
+        /* §8aj: bit1 = "per-frame seed present" (HookedFrameTask stores the frame-start seed in each
+         * entry's unused flags half for net co-op recordings — see HookedFrameTask / HookedPlayTask). */
+        hdr[RPY_COOP_OFF + 4] = (unsigned char)(netFlag | (s_netActive ? 0x02 : 0x00));
         hdr[RPY_CW_OFF]       = 0x00;
         s_rpyHdrBuf = hdr;
         /* §8ah: durable co-op metadata in the per-stage block (round-trips through a saved .rpy,
@@ -1946,7 +1951,10 @@ static uint32_t __fastcall HookedReplayHdrInit(void *self)
                 }
                 sb[0x28] = RPY_COOP_MAG0;
                 sb[0x29] = (unsigned char)p2sel;
-                sb[0x2a] = (unsigned char)((s_allowDiffChar ? 1 : 0) | (s_netActive ? 2 : 0));
+                /* bit0 diff-char, bit1 net-recorded, bit2 = §8aj per-frame seed present (the durable,
+                 * saved-replay copy of the hdr+0x5c bit1 above). */
+                sb[0x2a] = (unsigned char)((s_allowDiffChar ? 1 : 0) | (s_netActive ? 2 : 0)
+                                           | (s_netActive ? 4 : 0));
                 sb[0x2b] = 0;
             }
         }
@@ -2021,10 +2029,12 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
             s_replayP2Sel       = (signed char)sb[0x29];
             s_replayDiffChar    = (sb[0x2a] & 1) ? 1 : 0;
             s_replayNetRecorded = (sb[0x2a] & 2) ? 1 : 0;
+            s_replayPerFrameSeed = (sb[0x2a] & 4) ? 1 : 0;  /* §8aj per-frame seed in each entry */
         } else {                                            /* in-memory watch-replay path */
             s_replayP2Sel       = (signed char)hdr[RPY_COOP_OFF + 2];
             s_replayDiffChar    = hdr[RPY_COOP_OFF + 3] ? 1 : 0;
             s_replayNetRecorded = (hdr[RPY_COOP_OFF + 4] & 0x01) ? 1 : 0;   /* §8aa */
+            s_replayPerFrameSeed = (hdr[RPY_COOP_OFF + 4] & 0x02) ? 1 : 0;  /* §8aj */
         }
         s_replayTargetCw = 0x007f;   /* sim is 24-bit in both net & local; pin neutered (§8ad refuted) */
         if (!s_replayLoadLogged) {
@@ -2042,6 +2052,7 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
         s_replayP2Sel    = s_forceReplayP2;
         s_replayDiffChar = ((s_forceReplayP2 / 2) != (int)hdr[RPY_P1CHAR_OFF]) ? 1 : 0;
         s_replayNetRecorded = 0;   /* §8aa: untagged/forced — flag unknown */
+        s_replayPerFrameSeed = 0;  /* §8aj: untagged replay has no per-frame seed stream */
         s_replayTargetCw = 0x007f; /* §8ad: sim runs at 24-bit either way */
         if (!s_replayLoadLogged) {
             int n = (s_forceReplayP2 <= 5) ? s_forceReplayP2 : 0;
@@ -2053,6 +2064,7 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
     } else {
         s_replayIsCoop = 0;   /* solo/vanilla replay — no phantom P2 */
         s_replayNetRecorded = 0;
+        s_replayPerFrameSeed = 0;  /* §8aj */
         s_replayTargetCw = 0x007f;
         if (IsReplayPlayback() && !s_replayLoadLogged) {  /* why a replay didn't recover P2 */
             Log("replay PLAYBACK: NO co-op tag (stageblock+0x28=%02x header+0x%02x=%02x %02x) — "
@@ -2096,10 +2108,17 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
      * matching wipe every enemy's RNG forks from the first gameplay frame. Re-apply initSeed at the
      * first in-stage frame (HookedUpdate) to reproduce the live SEEDFORCE's wipe-point. Net-recorded
      * only: local replays never force-seed, so ZUN's setup draws ARE part of their canonical flow. */
-    if (IsReplayPlayback() && s_replayNetRecorded && sb) {
+    if (IsReplayPlayback() && s_replayNetRecorded && sb && !s_replayPerFrameSeed) {
         s_replayInitSeed = *(unsigned short *)(sb + 0x20);
         s_replaySeedArm  = s_replayInitSeed ? 1 : 0;
     }
+    /* §8aj supersedes §8ai for replays that carry a per-frame seed: HookedPlayTask re-pins the seed
+     * every frame (including frame 1), so the single first-in-stage re-force is redundant. Leave §8ai
+     * as the fallback for OLDER net replays whose entries have no stored seed (s_replayPerFrameSeed=0). */
+    if (IsReplayPlayback() && sb)
+        Log("replay PLAYBACK: §8aj per-frame seed = %s (sb+0x2a=0x%02x) — %s",
+            s_replayPerFrameSeed ? "PRESENT" : "absent", sb[0x2a],
+            s_replayPerFrameSeed ? "re-pinning seed every frame" : "falling back to §8ai single re-force");
     return r;
 }
 
@@ -2109,7 +2128,25 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
  * players). HookedSceneTick doesn't fire here; HookedReplayLoad decided s_replayPinCw. */
 static int __fastcall HookedPlayTask(int *self)
 {
+    /* §8aj: per-frame seed restore. Mirror of HookedFrameTask's capture. ZUN's playback task
+     * FUN_00442ee0 reads the recorded input from the head entry (self+0x84) and advances the head
+     * by 4 — it never touches the entry's +2 flags half, where the record build stored the live
+     * frame-START seed. Restore it here, AT THE SAME frame-phase (this task runs before the frame's
+     * sim), so this frame's enemies/bullets draw from the exact recorded seed. This makes any
+     * rand-CALL-COUNT difference between the live run and playback irrelevant: the seed is re-pinned
+     * to the recorded value every single frame, not just once at stage start (§8ai). Gated on the
+     * §8aj version bit so OLD net replays (no per-frame seed; flags half = 0) are left to §8ai. */
+    unsigned char *head0 = s_replayPerFrameSeed ? *(unsigned char **)((char *)self + 0x84) : NULL;
     int r = s_origPlayTask(self);
+    if (head0) {
+        unsigned char *head1 = *(unsigned char **)((char *)self + 0x84);
+        if (head1 == head0 + 4) {                  /* the task consumed a per-frame entry */
+            *ADDR_RNG_SEED = *(unsigned short *)(head0 + 2);     /* recorded frame-start seed */
+            if (++s_rpySeedRestored == 1)
+                Log("replay PLAYBACK: §8aj per-frame seed restore ON — re-pinning the RNG seed to the "
+                    "recorded value every frame (supersedes the §8ai single first-frame re-force)");
+        }
+    }
     if (s_replayPinCw) PinFpuForReplay(s_replayPinCw);
     return r;
 }
@@ -3691,7 +3728,28 @@ static int __fastcall HookedFrameTask(int *self)
         s_p2LocalIn = 0;
     }
 
+    /* §8aj: per-frame seed capture. ZUN's record task FUN_00442cd0 advances the input-stream head
+     * (self+0x84) by 4 and writes a 4-byte entry: input at +0, a 2-byte "flags" half at +2 that is
+     * ALWAYS 0 (DAT_0062f640 is never set) and that playback (FUN_00442ee0) NEVER reads. We hijack
+     * that free half to carry the frame-START RNG seed: this task runs before the frame's enemy/
+     * bullet sim draws any rand (order: HookedGameStart seed-force -> THIS -> player update -> sim),
+     * so *ADDR_RNG_SEED here is exactly the seed the sim will run from. Storing it per frame lets
+     * playback restore the seed every frame (HookedPlayTask) and stay bit-identical to the live run
+     * regardless of any rand-CALL-COUNT divergence (the residual §8ai desync: playback's P2 sim drew
+     * a different number of rands than the live netcode-driven P2, slipping the seed phase). Net co-op
+     * recordings only; the saved .rpy round-trips it (same compressed body as the §8ah stage block). */
+    unsigned char *rpyHead0 = (s_netActive && !s_suppressP2 && !IsReplayPlayback())
+                                  ? *(unsigned char **)((char *)self + 0x84) : NULL;
     int r = s_origFrameTask(self);
+    if (rpyHead0) {
+        unsigned char *rpyHead1 = *(unsigned char **)((char *)self + 0x84);
+        if (rpyHead1 == rpyHead0 + 4) {            /* the task wrote a fresh per-frame entry */
+            *(unsigned short *)(rpyHead1 + 2) = *ADDR_RNG_SEED;   /* frame-start seed -> free flags half */
+            if (++s_rpySeedStored == 1)
+                Log("replay: §8aj per-frame seed capture ON (frame-start seed -> each entry's free "
+                    "flags half; net co-op recording) — playback will restore the seed every frame");
+        }
+    }
     int f = *self;
     uint32_t res = *ADDR_RES_PTR;
     int score = res ? *(int *)(res + RES_SCORE) : s_lastScore;
@@ -4421,6 +4479,9 @@ static void ResetCoopSession(void)
     s_rpySeedLogged = 0;         /* §8ah: re-log the stage-seed fix for the next recording */
     s_replaySeedArm = 0;         /* §8ai: cancel a pending first-in-stage seed re-force */
     s_replayInitSeed = 0;        /* §8ai */
+    s_replayPerFrameSeed = 0;    /* §8aj: re-decided at the next replay load            */
+    s_rpySeedStored = 0;         /* §8aj: re-log per-frame seed capture for the next recording */
+    s_rpySeedRestored = 0;       /* §8aj: re-log per-frame seed restore for the next playback  */
     s_replayTargetCw = 0x007f;   /* §8ad: default precision until the next replay loads its cw */
     s_replayPinCw = 0;           /* §8ad: no sim-seam pin until the next replay decides */
     s_fpuPinnedReplay = 0;       /* re-log the replay FPU pin for the next replay    */

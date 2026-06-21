@@ -2077,8 +2077,15 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
     }
     /* §8ah: no RNG seed re-force here — ZUN's own restore (s_origReplayLoad, FUN_00443550:
      * DAT_0049fe20 = stageblock+0x20) already loaded the FORCED seed we wrote into that slot at
-     * record time, so every playback path (tagged, force_replay_p2, in-memory) starts each stage
-     * from the exact RNG state the live sim ran from. Verify by trace, not by a log line here. */
+     * record time. Log it (always-on, one line per stage load) so a normal coop_log.txt confirms
+     * the seed round-trip without needing the replay_trace CSV: if seed==stageblock+0x20==initSeed
+     * the start state is correct and any residual desync is a rand-CALL-COUNT divergence, not the
+     * seed. (RNG output depends only on DAT_0049fe20; DAT_0049fe24 is a pure call counter.) */
+    if (IsReplayPlayback() && sb) {
+        Log("replay PLAYBACK: stage=%d seed=0x%04x (stageblock+0x20=0x%04x tag+0x28=0x%02x) "
+            "[§8ah seed round-trip check]", (int)*(volatile uint32_t *)0x0062f85c,
+            (unsigned)*ADDR_RNG_SEED, (unsigned)*(unsigned short *)(sb + 0x20), sb[0x28]);
+    }
     return r;
 }
 

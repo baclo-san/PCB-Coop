@@ -3733,7 +3733,14 @@ static int __fastcall HookedUpdate(void *self)
      * live cross-machine desync the RNG oracle missed; a machine's live log vs its OWN replay log
      * exposes a record/playback asymmetry in our code. P1-also-off => global FP; P2-only => graft.
      * The §8aa pin proved a no-op for th7_12, so the residual is NOT control-word precision. */
-    if (isP1 && (s_p2 || (IsReplayPlayback() && s_replayIsCoop))) {
+    /* §8ah-diag: log the ReplayDetTrace from the FIRST recorded frame, not just after P2 spawns.
+     * The seed fork is in the stage INTRO (rf 0..~240, before P2 appears) which the old s_p2 gate
+     * skipped on the record side (rec started at rf=241) — so rec/rpy couldn't be diffed there.
+     * Mode bit2 (0x0062f648>>2) = "replay record/playback active" = inside a recorded/played stage,
+     * true from the stage's first frame in BOTH record and playback; gate on it so rec covers the
+     * intro and aligns with rpy's rf=1.. for a clean per-frame diff of the early divergence. */
+    int recActive = (int)(((*(volatile uint32_t *)0x0062f648) >> 2) & 1);
+    if (isP1 && (s_p2 || recActive || (IsReplayPlayback() && s_replayIsCoop))) {
         static int s_rpyDbgTick = 0;
         int play = IsReplayPlayback();
         /* §8ah: while RECORDING, backfill the FORCED init seed into ZUN's stage-block seed slot

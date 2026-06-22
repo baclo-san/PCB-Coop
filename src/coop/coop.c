@@ -4914,6 +4914,50 @@ static int InstallHooks(void)
     return 1;
 }
 
+/* §8an: Windows accessibility-shortcut suppression. Holding Shift to FOCUS (or tapping it)
+ * can trip Filter Keys (hold Shift ~8s -> SlowKeys/RepeatKeys throttles keyboard input) or
+ * Sticky Keys (5x Shift) — which on some machines shows up as a "massive slowdown whenever
+ * P2 presses Shift" (tester report). It's ENVIRONMENTAL, not in our sim: the RNG histogram
+ * shows no draw storm on focus (~88 draws/frame), and it doesn't repro on a machine whose
+ * accessibility hotkeys aren't armed (dev, even with replay_trace=1). Suppress the ACTIVATION
+ * hotkeys while the game runs — the standard gamedev fix — saving + restoring on exit so we
+ * touch only the accidental-activation shortcut, never a feature the user deliberately enabled
+ * (and SystemParametersInfo without SPIF_UPDATEINIFILE doesn't persist, so a crash self-heals
+ * at logoff). */
+static STICKYKEYS s_axSticky; static FILTERKEYS s_axFilter; static TOGGLEKEYS s_axToggle;
+static int s_axSaved = 0;
+static void SuppressAccessibilityShortcuts(void)
+{
+    s_axSticky.cbSize = sizeof(STICKYKEYS);
+    s_axFilter.cbSize = sizeof(FILTERKEYS);
+    s_axToggle.cbSize = sizeof(TOGGLEKEYS);
+    if (!SystemParametersInfoA(SPI_GETSTICKYKEYS, sizeof(STICKYKEYS), &s_axSticky, 0)) return;
+    if (!SystemParametersInfoA(SPI_GETFILTERKEYS, sizeof(FILTERKEYS), &s_axFilter, 0)) return;
+    if (!SystemParametersInfoA(SPI_GETTOGGLEKEYS, sizeof(TOGGLEKEYS), &s_axToggle, 0)) return;
+    s_axSaved = 1;
+    {
+        STICKYKEYS sk = s_axSticky; FILTERKEYS fk = s_axFilter; TOGGLEKEYS tk = s_axToggle;
+        if (!(sk.dwFlags & SKF_STICKYKEYSON)) sk.dwFlags &= ~(SKF_HOTKEYACTIVE | SKF_CONFIRMHOTKEY);
+        if (!(fk.dwFlags & FKF_FILTERKEYSON)) fk.dwFlags &= ~(FKF_HOTKEYACTIVE | FKF_CONFIRMHOTKEY);
+        if (!(tk.dwFlags & TKF_TOGGLEKEYSON)) tk.dwFlags &= ~(TKF_HOTKEYACTIVE | TKF_CONFIRMHOTKEY);
+        SystemParametersInfoA(SPI_SETSTICKYKEYS, sizeof(STICKYKEYS), &sk, 0);
+        SystemParametersInfoA(SPI_SETFILTERKEYS, sizeof(FILTERKEYS), &fk, 0);
+        SystemParametersInfoA(SPI_SETTOGGLEKEYS, sizeof(TOGGLEKEYS), &tk, 0);
+        Log("§8an: suppressed Windows Sticky/Filter/Toggle-Keys activation hotkeys "
+            "(was sticky=0x%lx filter=0x%lx toggle=0x%lx) — restored on exit. If a Shift-on-focus "
+            "slowdown persists, it's another machine-local cause (overlay / input driver).",
+            (unsigned long)s_axSticky.dwFlags, (unsigned long)s_axFilter.dwFlags,
+            (unsigned long)s_axToggle.dwFlags);
+    }
+}
+static void RestoreAccessibilityShortcuts(void)
+{
+    if (!s_axSaved) return;
+    SystemParametersInfoA(SPI_SETSTICKYKEYS, sizeof(STICKYKEYS), &s_axSticky, 0);
+    SystemParametersInfoA(SPI_SETFILTERKEYS, sizeof(FILTERKEYS), &s_axFilter, 0);
+    SystemParametersInfoA(SPI_SETTOGGLEKEYS, sizeof(TOGGLEKEYS), &s_axToggle, 0);
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
@@ -4948,6 +4992,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             s_dir, s_suppressP2, s_b2CherryBothFull, s_fpuGuard, s_netAutoResync, s_proxFade, s_damperBossOnly,
             s_netEnabled, s_netIsHost ? "host" : "guest", s_netDelay, s_netSeed);
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
+        SuppressAccessibilityShortcuts();        /* §8an: stop Shift(focus) tripping Filter/Sticky Keys */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */
         if (!InstallHooks())
             MessageBoxA(NULL, "th07_coop: hook install failed (wrong build/addresses?)",
@@ -4959,6 +5004,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
                 "border-break @0x441bd0, hud-draw @0x42b603)");
         break;
     case DLL_PROCESS_DETACH:
+        RestoreAccessibilityShortcuts();         /* §8an: put the user's accessibility hotkeys back */
         if (s_trace) { fclose(s_trace); s_trace = NULL; }
         if (s_log) { Log("detach"); fclose(s_log); }
         MH_Uninitialize();

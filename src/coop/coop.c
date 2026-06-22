@@ -1535,13 +1535,45 @@ static void ReplayDetTrace(int playback)
 
 /* §8al RNG-CALLER TRACE — the within-frame divergence (the seed force-pins fine, but the rec sim drew
  * 24 more rands than the rpy sim on the same frame: an off-screen event — "item RNG" — fires on record
- * but not playback) needs to be attributed to a CODE SITE. Hook the LCG (FUN_00431870) and log the
- * caller's return address per draw, keyed by replay frame, separately for record vs playback. A diff of
- * coop_rngcall_rec.csv vs coop_rngcall_rpy.csv at the diverging rf shows which function draws the extra
- * rands. Gated by [coop] replay_trace and only in-stage during a co-op record/playback. */
+ * but not playback) needs to be attributed to a CODE SITE. Hook the LCG (FUN_00431870) and tally the
+ * caller's return address into a PER-FRAME HISTOGRAM, flushed once per replay frame (separately for
+ * record vs playback). A diff of coop_rngcall_rec.csv vs coop_rngcall_rpy.csv at the diverging rf shows
+ * which function draws the extra rands. Gated by [coop] replay_trace, in-stage during a co-op run only.
+ *
+ * §8am: this was per-DRAW fprintf+fflush, which storms disk I/O whenever the draw rate spikes (P2 focus
+ * → focus-fire/combat) → SEVERE FPS lag that even bakes into the netplay replay. The histogram keeps the
+ * hot path to an in-memory tally (≤RNG_HIST_MAX linear scan) and writes ONE line per frame — no per-draw
+ * I/O — so the diagnostic no longer perturbs the run, and a focus-triggered draw STORM (if that is what's
+ * happening) shows up as one caller with a huge per-frame count, which is itself the lead. */
 typedef unsigned short (__fastcall *RngFn_t)(void *seed);
 static RngFn_t s_origRng = NULL;
 static FILE *s_rngRec = NULL, *s_rngRpy = NULL;
+#define RNG_HIST_MAX 96
+static struct { unsigned caller; unsigned count; } s_rngHist[RNG_HIST_MAX];
+static int s_rngHistN   = 0;
+static int s_rngHistRf  = -1;
+static int s_rngHistPlay = -1;
+static void RngHistFlush(void)
+{
+    if (s_rngHistN <= 0) { s_rngHistN = 0; return; }
+    FILE **fp = s_rngHistPlay ? &s_rngRpy : &s_rngRec;
+    if (!*fp) {
+        char p[MAX_PATH];
+        snprintf(p, sizeof(p), "%scoop_rngcall_%s.csv", s_dir, s_rngHistPlay ? "rpy" : "rec");
+        *fp = fopen(p, "w");
+        if (*fp) fputs("rf,total,callers(addr:count;...)\n", *fp);
+    }
+    if (*fp) {
+        unsigned total = 0; int i;
+        for (i = 0; i < s_rngHistN; i++) total += s_rngHist[i].count;
+        fprintf(*fp, "%d,%u,", s_rngHistRf, total);
+        for (i = 0; i < s_rngHistN; i++)
+            fprintf(*fp, "%08x:%u;", s_rngHist[i].caller, s_rngHist[i].count);
+        fputc('\n', *fp);
+        fflush(*fp);                       /* once per frame — cheap */
+    }
+    s_rngHistN = 0;
+}
 static unsigned short __fastcall HookedRng(void *seed)
 {
     void *caller = __builtin_return_address(0);
@@ -1549,23 +1581,22 @@ static unsigned short __fastcall HookedRng(void *seed)
         int inStage = (int)(((*(volatile uint32_t *)0x0062f648) >> 2) & 1);
         if (inStage && (s_replayIsCoop || s_netActive || s_p2)) {
             int play = IsReplayPlayback();
-            FILE **fp = play ? &s_rngRpy : &s_rngRec;
-            if (!*fp) {
-                char p[MAX_PATH];
-                snprintf(p, sizeof(p), "%scoop_rngcall_%s.csv", s_dir, play ? "rpy" : "rec");
-                *fp = fopen(p, "w");
-                if (*fp) fputs("rf,caller,seedBefore\n", *fp);
+            void *rm = *ADDR_REPLAY_MGR;
+            int rf = rm ? *(int *)rm : -1;
+            if (rf != s_rngHistRf || play != s_rngHistPlay) {  /* new frame -> flush the last one */
+                RngHistFlush();
+                s_rngHistRf = rf; s_rngHistPlay = play;
             }
-            if (*fp) {
-                void *rm = *ADDR_REPLAY_MGR;
-                int rf = rm ? *(int *)rm : -1;
-                /* the within-frame divergence shows up early (rf~600); cap the log so a multi-stage
-                 * run's files stay small and transferable (each stage logs only its first frames). */
-                if (rf >= 0 && rf <= 4000) {
-                    static unsigned flushCtr = 0;
-                    fprintf(*fp, "%d,%08x,%04x\n", rf, (unsigned)(uintptr_t)caller,
-                            (unsigned)*ADDR_RNG_SEED);
-                    if ((++flushCtr & 0x7f) == 0) fflush(*fp);
+            /* cap to early frames (the divergence shows up by rf~600) so files stay small */
+            if (rf >= 0 && rf <= 4000) {
+                unsigned c = (unsigned)(uintptr_t)caller;
+                int i, found = 0;
+                for (i = 0; i < s_rngHistN; i++)
+                    if (s_rngHist[i].caller == c) { s_rngHist[i].count++; found = 1; break; }
+                if (!found && s_rngHistN < RNG_HIST_MAX) {
+                    s_rngHist[s_rngHistN].caller = c;
+                    s_rngHist[s_rngHistN].count  = 1;
+                    s_rngHistN++;
                 }
             }
         }
@@ -4552,6 +4583,8 @@ static void ResetCoopSession(void)
     s_replayPerFrameSeed = 0;    /* §8aj: re-decided at the next replay load            */
     s_rpySeedStored = 0;         /* §8aj: re-log per-frame seed capture for the next recording */
     s_rpySeedRestored = 0;       /* §8aj: re-log per-frame seed restore for the next playback  */
+    s_rngHistN = 0;              /* §8am: drop any partial RNG-caller histogram         */
+    s_rngHistRf = -1; s_rngHistPlay = -1;
     s_replayTargetCw = 0x007f;   /* §8ad: default precision until the next replay loads its cw */
     s_replayPinCw = 0;           /* §8ad: no sim-seam pin until the next replay decides */
     s_fpuPinnedReplay = 0;       /* re-log the replay FPU pin for the next replay    */

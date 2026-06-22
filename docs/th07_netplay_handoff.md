@@ -2892,3 +2892,13 @@ didn't happen on playback. That is the residual desync, and it's a within-frame 
   function drawing the extra rands on record — which identifies the off-screen event (item drop, enemy pattern, scoring extend, …)
   that doesn't reproduce on playback. Our mod never calls the LCG, so every logged caller is game code; addresses are absolute
   (th07.exe is a fixed-base 0x400000 image) so they map straight into PCBdecomp.c. Build green, native test green (16/16).
+
+### §8am — the RNG diagnostic hook itself caused FPS lag; make it a per-frame histogram (2026-06-22)
+
+The §8al RNG-caller hook logged **per draw** (`fprintf` + `fflush` every 128 draws). With `replay_trace=1` and the draw rate
+spiking (tester: "severe FPS lag spikes whenever P2 presses Shift" — focus-fire/combat raises the draw rate), that became a
+per-frame disk-I/O storm — bad enough to bake into the netplay replay (a live stall shifts the lockstep input timing). Reworked the
+hook to tally caller→count into an **in-memory per-frame histogram** (`RNG_HIST_MAX=96`, linear scan on the hot path) and write
+**one line per replay frame** (`rf,total,addr:count;…`), flushed once per frame. No per-draw I/O, so the diagnostic no longer
+perturbs the run — and a focus-triggered draw STORM, if that's what's happening, shows up directly as one caller with a huge
+per-frame count (a lead in its own right). `replay_trace=0` leaves the hook a single branch (free). Build green, test green (16/16).

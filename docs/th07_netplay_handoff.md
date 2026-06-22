@@ -2871,3 +2871,24 @@ Playback-only (live and local paths untouched); falls back to `g_InputGameplay` 
 Because it reproduces the recorded `s_netMerged` timing, it should fix **old** net replays too, not just freshly recorded ones.
 ReplayDetTrace gains diagnostic columns `inMenu,netMerged,headW,headNext` to confirm the alignment (`headW` on the rpy side should
 lead the `input`/`g_InputGameplay` column by one frame). Build green, native test green (16/16).
+
+### §8al — netplay-replay desync: §8ak fixed P2 timing but a within-frame "item RNG" divergence remains; instrument the RNG (2026-06-22)
+
+§8ak confirmed: the trace now shows **P1 and P2 both at the +1 offset** — P2's one-frame lag is gone (`headW` leads `input` by one
+on the rpy side exactly as predicted). And §8aj holds the seed: **6143 of 6144 frames** match. Positions stay aligned to rf3184
+(P1) / rf3813 (P2). But the replay STILL desyncs, and the tester flagged **item RNG**. The COUNTER (which §8aj's seed-force can't
+mask — `DAT_0049fe24` is the true draw count, accumulating on playback) exposes it: at **rf603**, with identical seed-start, input,
+and both positions, the **record sim drew 44 rands but the playback sim drew only 20** — a ~24-rand event fires on record but NOT on
+playback. The seed-force then papers the seed back to the recorded value, but the *event* (an off-screen item drop / enemy fire)
+didn't happen on playback. That is the residual desync, and it's a within-frame divergence the position/seed columns can't attribute.
+
+**Two changes this build:**
+* **§8ai re-enabled** (was gated off under §8aj). §8aj's per-frame restore runs at *frame start*, but ZUN's ~95 stage-setup draws
+  on playback run *after* it (during frame 1's sim), so it can't wipe them — the trace confirms **rf1 is the one mismatched seed
+  frame**. §8ai's re-force fires in HookedUpdate *after* the setup draws, so it's the correct wipe-point; re-armed for all
+  net-recorded replays so frame 1's gameplay seed is right too (§8aj keeps 2..N).
+* **§8al RNG-caller trace** — hooks the LCG `FUN_00431870` and logs `rf,caller,seedBefore` per draw to `coop_rngcall_rec.csv` /
+  `coop_rngcall_rpy.csv` (gated by `replay_trace`, in-stage, rf≤4000 to stay small). Diffing the two at the diverging rf names the
+  function drawing the extra rands on record — which identifies the off-screen event (item drop, enemy pattern, scoring extend, …)
+  that doesn't reproduce on playback. Our mod never calls the LCG, so every logged caller is game code; addresses are absolute
+  (th07.exe is a fixed-base 0x400000 image) so they map straight into PCBdecomp.c. Build green, native test green (16/16).

@@ -1135,6 +1135,7 @@ static int s_p2InputLogged = 0;
 #define ADDR_INPUT_MENU ((volatile uint16_t *)0x004b9e4c) /* g_InputMenu (raw poll)    */
 #define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
 #define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
+#define ADDR_RNG_FN     ((LPVOID)0x00431870)              /* FUN_00431870 — the LCG draw (§8al diag) */
 #define ADDR_DIFFICULTY ((volatile uint32_t *)0x00626280) /* 0..3 main, 4 Extra, 5 Phantasm */
 /* Saved config (th07.cfg) defaults — the difficulty-SELECT screen seeds its cursor from
  * the saved default difficulty (PCBdecomp:37150), and the live 0x626280 is written from
@@ -1530,6 +1531,46 @@ static void ReplayDetTrace(int playback)
             (unsigned)FpuCw(),
             (unsigned)*ADDR_INPUT_MENU, (unsigned)s_netMerged, hW, hN);
     fflush(*fp);
+}
+
+/* §8al RNG-CALLER TRACE — the within-frame divergence (the seed force-pins fine, but the rec sim drew
+ * 24 more rands than the rpy sim on the same frame: an off-screen event — "item RNG" — fires on record
+ * but not playback) needs to be attributed to a CODE SITE. Hook the LCG (FUN_00431870) and log the
+ * caller's return address per draw, keyed by replay frame, separately for record vs playback. A diff of
+ * coop_rngcall_rec.csv vs coop_rngcall_rpy.csv at the diverging rf shows which function draws the extra
+ * rands. Gated by [coop] replay_trace and only in-stage during a co-op record/playback. */
+typedef unsigned short (__fastcall *RngFn_t)(void *seed);
+static RngFn_t s_origRng = NULL;
+static FILE *s_rngRec = NULL, *s_rngRpy = NULL;
+static unsigned short __fastcall HookedRng(void *seed)
+{
+    void *caller = __builtin_return_address(0);
+    if (s_replayTrace) {
+        int inStage = (int)(((*(volatile uint32_t *)0x0062f648) >> 2) & 1);
+        if (inStage && (s_replayIsCoop || s_netActive || s_p2)) {
+            int play = IsReplayPlayback();
+            FILE **fp = play ? &s_rngRpy : &s_rngRec;
+            if (!*fp) {
+                char p[MAX_PATH];
+                snprintf(p, sizeof(p), "%scoop_rngcall_%s.csv", s_dir, play ? "rpy" : "rec");
+                *fp = fopen(p, "w");
+                if (*fp) fputs("rf,caller,seedBefore\n", *fp);
+            }
+            if (*fp) {
+                void *rm = *ADDR_REPLAY_MGR;
+                int rf = rm ? *(int *)rm : -1;
+                /* the within-frame divergence shows up early (rf~600); cap the log so a multi-stage
+                 * run's files stay small and transferable (each stage logs only its first frames). */
+                if (rf >= 0 && rf <= 4000) {
+                    static unsigned flushCtr = 0;
+                    fprintf(*fp, "%d,%08x,%04x\n", rf, (unsigned)(uintptr_t)caller,
+                            (unsigned)*ADDR_RNG_SEED);
+                    if ((++flushCtr & 0x7f) == 0) fflush(*fp);
+                }
+            }
+        }
+    }
+    return s_origRng(seed);
 }
 
 /* Re-derive ZUN's menu key-repeat (hold-to-scroll) from the MERGED word so it is
@@ -2119,12 +2160,17 @@ static uint32_t __fastcall HookedReplayLoad(void *self)
      * matching wipe every enemy's RNG forks from the first gameplay frame. Re-apply initSeed at the
      * first in-stage frame (HookedUpdate) to reproduce the live SEEDFORCE's wipe-point. Net-recorded
      * only: local replays never force-seed, so ZUN's setup draws ARE part of their canonical flow. */
-    if (IsReplayPlayback() && s_replayNetRecorded && sb && !s_replayPerFrameSeed) {
+    /* §8al: §8aj's per-frame restore runs at FRAME START (HookedPlayTask), but ZUN's ~95 stage-setup
+     * draws on playback run AFTER that (during frame 1's sim), so the per-frame restore does NOT wipe
+     * them — the trace confirms rf1's seed is the ONLY mismatched frame. §8ai's re-force fires in
+     * HookedUpdate, AFTER the setup draws, so it IS the wipe-point. Arm it for ALL net-recorded replays
+     * (no longer gated off by §8aj) so frame 1's gameplay seed is correct too; §8aj handles 2..N. */
+    if (IsReplayPlayback() && s_replayNetRecorded && sb) {
         s_replayInitSeed = *(unsigned short *)(sb + 0x20);
         s_replaySeedArm  = s_replayInitSeed ? 1 : 0;
     }
-    /* §8aj supersedes §8ai for replays that carry a per-frame seed: HookedPlayTask re-pins the seed
-     * every frame (including frame 1), so the single first-in-stage re-force is redundant. Leave §8ai
+    /* §8aj per-frame seed re-pins frames 2..N; §8ai (re-armed above) wipes ZUN's setup draws at the
+     * first in-stage frame (which §8aj's frame-start restore is too early to catch). Leave §8ai
      * as the fallback for OLDER net replays whose entries have no stored seed (s_replayPerFrameSeed=0). */
     if (IsReplayPlayback() && sb)
         Log("replay PLAYBACK: §8aj per-frame seed = %s (sb+0x2a=0x%02x) — %s",
@@ -4779,6 +4825,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_REPLAY_HDR_INIT,(LPVOID)&HookedReplayHdrInit, (LPVOID*)&s_origReplayHdr)     != MH_OK) return 0;
     if (MH_CreateHook(ADDR_REPLAY_LOAD,    (LPVOID)&HookedReplayLoad,    (LPVOID*)&s_origReplayLoad)    != MH_OK) return 0; /* §8k playback */
     if (MH_CreateHook(ADDR_REPLAY_PLAY_TASK,(LPVOID)&HookedPlayTask,     (LPVOID*)&s_origPlayTask)      != MH_OK) return 0; /* §8ad playback FPU pin */
+    if (MH_CreateHook(ADDR_RNG_FN,         (LPVOID)&HookedRng,           (LPVOID*)&s_origRng)           != MH_OK) return 0; /* §8al RNG-caller trace (gated by replay_trace) */
     /* B5: capture the enemy-manager base (FUN_00420620's ECX/param_1) so the boss-spell
      * armour gate reads the LIVE spellcardInfo.isActive at param_1+0x9545c8. The base is
      * non-zero in-game (the absolute-globals assumption was wrong — see HookedEnemyUpdate). */
@@ -4820,6 +4867,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_DECL_DRAW)      != MH_OK) return 0;
     if (MH_EnableHook(ADDR_REPLAY_HDR_INIT)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_REPLAY_PLAY_TASK)!= MH_OK) return 0;  /* §8ad playback FPU pin */
+    if (MH_EnableHook(ADDR_RNG_FN)         != MH_OK) return 0;   /* §8al RNG-caller trace */
     if (MH_EnableHook(ADDR_REPLAY_LOAD)    != MH_OK) return 0;   /* §8k: was CREATED but never
                                                                    ENABLED — playback ran unhooked,
                                                                    so co-op replays never spawned P2 */

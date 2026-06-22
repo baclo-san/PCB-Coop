@@ -2902,3 +2902,29 @@ hook to tally caller→count into an **in-memory per-frame histogram** (`RNG_HIS
 **one line per replay frame** (`rf,total,addr:count;…`), flushed once per frame. No per-draw I/O, so the diagnostic no longer
 perturbs the run — and a focus-triggered draw STORM, if that's what's happening, shows up directly as one caller with a huge
 per-frame count (a lead in its own right). `replay_trace=0` leaves the hook a single branch (free). Build green, test green (16/16).
+
+### §8an — the "P2-focus FPS slowdown" was Windows accessibility, not the mod (2026-06-23)
+
+Tester: "P2 pressing Shift causes massive slowdown; only on my Windows machine; local co-op does it too." The dev cannot
+reproduce it **even with `replay_trace=1`**, and the §8am histogram shows **no draw storm** on focus (~88 draws/frame) — so it is
+neither the sim nor the diagnostic hook. Signature (Shift-triggered, machine-specific, mode-independent, a "slowdown") is the
+classic Windows **Filter Keys / Sticky Keys** trap: holding Shift to focus trips Filter Keys (SlowKeys/RepeatKeys throttles
+keyboard input). PCB (2003) predates games suppressing these. §8an adds the standard fix: on attach, save Sticky/Filter/Toggle-Keys
+state and clear only the activation-hotkey flags (never a feature the user deliberately enabled); restore on detach. No
+`SPIF_UPDATEINIFILE`, so a crash self-heals at logoff. Manual workaround: Windows Settings → Accessibility → Keyboard → turn off
+Sticky Keys + Filter Keys and their shortcuts. Not a sim change; the replay desync stays open.
+
+### §8ao — RNG-caller diagnostic, level 2: hook the 32-bit wrapper to name the real consumer (2026-06-23)
+
+The first clean netplay rngcall capture (rec+rpy histograms) localized the residual desync precisely: the per-frame caller
+histograms match exactly until **rf699**, then a **~6-call / 12-draw event goes one frame out of phase** (rf699 rpy +12, rf711 rpy
+−12, …) and oscillates — and at rf699 **both players are idle** (P1 parked shooting, P2 hasn't left spawn), so it's an **enemy**
+firing pattern that's one frame off on playback, not P2. The seed is force-pinned and matches; it's a within-frame *call-count*
+divergence (control flow) — an enemy whose timer/spawn is one frame off → a data-dependent draw count differs.
+
+But the histogram only showed `004318e0`/`004318ee` — the two LCG sites *inside* the 32-bit wrapper `FUN_004318d0` — because
+~every random goes through it, so the logged caller was always the wrapper, never the game system. §8ao hooks `FUN_004318d0` too
+and logs ITS caller (the real consumer); the `FUN_00431870` hook now logs only DIRECT 16-bit callers (skips the wrapper-internal
+range `[0x004318d0,0x00431900)`). Together they attribute every draw to a real code site, so the next capture's `coop_rngcall_*`
+names the enemy/spawn function at rf699. **Likely reproducible in LOCAL co-op record→playback** (the replay-task-vs-enemy-update
+ordering matches netplay playback), which would let the dev iterate without the tester. Build green, native test green (16/16).

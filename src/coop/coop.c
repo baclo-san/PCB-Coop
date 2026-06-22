@@ -1136,6 +1136,7 @@ static int s_p2InputLogged = 0;
 #define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
 #define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
 #define ADDR_RNG_FN     ((LPVOID)0x00431870)              /* FUN_00431870 — the LCG draw (§8al diag) */
+#define ADDR_RNG32_FN   ((LPVOID)0x004318d0)              /* FUN_004318d0 — 32-bit rand wrapper (§8ao diag) */
 #define ADDR_DIFFICULTY ((volatile uint32_t *)0x00626280) /* 0..3 main, 4 Extra, 5 Phantasm */
 /* Saved config (th07.cfg) defaults — the difficulty-SELECT screen seeds its cursor from
  * the saved default difficulty (PCBdecomp:37150), and the live 0x626280 is written from
@@ -1546,8 +1547,18 @@ static void ReplayDetTrace(int playback)
  * I/O — so the diagnostic no longer perturbs the run, and a focus-triggered draw STORM (if that is what's
  * happening) shows up as one caller with a huge per-frame count, which is itself the lead. */
 typedef unsigned short (__fastcall *RngFn_t)(void *seed);
-static RngFn_t s_origRng = NULL;
+typedef unsigned (*Rng32Fn_t)(void);
+static RngFn_t   s_origRng   = NULL;            /* FUN_00431870 — 16-bit LCG draw            */
+static Rng32Fn_t s_origRng32 = NULL;            /* FUN_004318d0 — 32-bit wrapper (2× LCG)    */
 static FILE *s_rngRec = NULL, *s_rngRpy = NULL;
+/* §8ao: the §8am histogram showed only 004318e0/004318ee — the two LCG call sites INSIDE the
+ * 32-bit wrapper FUN_004318d0 — because ~every random goes through it, so the logged "caller" was
+ * always the wrapper, not the game system. Hook FUN_004318d0 too and log ITS caller (the real
+ * consumer); the FUN_00431870 hook now logs only DIRECT 16-bit callers (skips wrapper-internal) so
+ * the two together attribute every draw to a real code site. The divergence is a ~6-call (12-draw)
+ * enemy event one frame out of phase on playback (players idle at rf699) — this names the enemy. */
+#define WRAP_LO 0x004318d0u                     /* FUN_004318d0 body start */
+#define WRAP_HI 0x00431900u                     /* next function (FUN_00431900) */
 #define RNG_HIST_MAX 96
 static struct { unsigned caller; unsigned count; } s_rngHist[RNG_HIST_MAX];
 static int s_rngHistN   = 0;
@@ -1574,34 +1585,39 @@ static void RngHistFlush(void)
     }
     s_rngHistN = 0;
 }
-static unsigned short __fastcall HookedRng(void *seed)
+/* tally one random-consumer call site into the per-frame histogram (gated; flushes on frame change) */
+static void RngTally(unsigned caller)
 {
-    void *caller = __builtin_return_address(0);
-    if (s_replayTrace) {
-        int inStage = (int)(((*(volatile uint32_t *)0x0062f648) >> 2) & 1);
-        if (inStage && (s_replayIsCoop || s_netActive || s_p2)) {
-            int play = IsReplayPlayback();
-            void *rm = *ADDR_REPLAY_MGR;
-            int rf = rm ? *(int *)rm : -1;
-            if (rf != s_rngHistRf || play != s_rngHistPlay) {  /* new frame -> flush the last one */
-                RngHistFlush();
-                s_rngHistRf = rf; s_rngHistPlay = play;
-            }
-            /* cap to early frames (the divergence shows up by rf~600) so files stay small */
-            if (rf >= 0 && rf <= 4000) {
-                unsigned c = (unsigned)(uintptr_t)caller;
-                int i, found = 0;
-                for (i = 0; i < s_rngHistN; i++)
-                    if (s_rngHist[i].caller == c) { s_rngHist[i].count++; found = 1; break; }
-                if (!found && s_rngHistN < RNG_HIST_MAX) {
-                    s_rngHist[s_rngHistN].caller = c;
-                    s_rngHist[s_rngHistN].count  = 1;
-                    s_rngHistN++;
-                }
-            }
+    if (!s_replayTrace) return;
+    if (!(((*(volatile uint32_t *)0x0062f648) >> 2) & 1)) return;   /* in-stage only */
+    if (!(s_replayIsCoop || s_netActive || s_p2)) return;
+    {
+        int play = IsReplayPlayback();
+        void *rm = *ADDR_REPLAY_MGR;
+        int rf = rm ? *(int *)rm : -1;
+        int i;
+        if (rf != s_rngHistRf || play != s_rngHistPlay) { RngHistFlush(); s_rngHistRf = rf; s_rngHistPlay = play; }
+        if (rf < 0 || rf > 4000) return;        /* cap so files stay small */
+        for (i = 0; i < s_rngHistN; i++)
+            if (s_rngHist[i].caller == caller) { s_rngHist[i].count++; return; }
+        if (s_rngHistN < RNG_HIST_MAX) {
+            s_rngHist[s_rngHistN].caller = caller;
+            s_rngHist[s_rngHistN].count  = 1;
+            s_rngHistN++;
         }
     }
+}
+static unsigned short __fastcall HookedRng(void *seed)
+{
+    unsigned caller = (unsigned)(uintptr_t)__builtin_return_address(0);
+    if (caller < WRAP_LO || caller >= WRAP_HI)   /* skip wrapper-internal; FUN_004318d0 hook logs those */
+        RngTally(caller);
     return s_origRng(seed);
+}
+static unsigned HookedRng32(void)
+{
+    RngTally((unsigned)(uintptr_t)__builtin_return_address(0));   /* the real 32-bit-random consumer */
+    return s_origRng32();
 }
 
 /* Re-derive ZUN's menu key-repeat (hold-to-scroll) from the MERGED word so it is
@@ -4859,6 +4875,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_REPLAY_LOAD,    (LPVOID)&HookedReplayLoad,    (LPVOID*)&s_origReplayLoad)    != MH_OK) return 0; /* §8k playback */
     if (MH_CreateHook(ADDR_REPLAY_PLAY_TASK,(LPVOID)&HookedPlayTask,     (LPVOID*)&s_origPlayTask)      != MH_OK) return 0; /* §8ad playback FPU pin */
     if (MH_CreateHook(ADDR_RNG_FN,         (LPVOID)&HookedRng,           (LPVOID*)&s_origRng)           != MH_OK) return 0; /* §8al RNG-caller trace (gated by replay_trace) */
+    if (MH_CreateHook(ADDR_RNG32_FN,       (LPVOID)&HookedRng32,         (LPVOID*)&s_origRng32)         != MH_OK) return 0; /* §8ao 32-bit-rand consumer trace */
     /* B5: capture the enemy-manager base (FUN_00420620's ECX/param_1) so the boss-spell
      * armour gate reads the LIVE spellcardInfo.isActive at param_1+0x9545c8. The base is
      * non-zero in-game (the absolute-globals assumption was wrong — see HookedEnemyUpdate). */
@@ -4901,6 +4918,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_REPLAY_HDR_INIT)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_REPLAY_PLAY_TASK)!= MH_OK) return 0;  /* §8ad playback FPU pin */
     if (MH_EnableHook(ADDR_RNG_FN)         != MH_OK) return 0;   /* §8al RNG-caller trace */
+    if (MH_EnableHook(ADDR_RNG32_FN)       != MH_OK) return 0;   /* §8ao 32-bit-rand consumer trace */
     if (MH_EnableHook(ADDR_REPLAY_LOAD)    != MH_OK) return 0;   /* §8k: was CREATED but never
                                                                    ENABLED — playback ran unhooked,
                                                                    so co-op replays never spawned P2 */

@@ -1547,7 +1547,7 @@ static void ReplayDetTrace(int playback)
  * I/O — so the diagnostic no longer perturbs the run, and a focus-triggered draw STORM (if that is what's
  * happening) shows up as one caller with a huge per-frame count, which is itself the lead. */
 typedef unsigned short (__fastcall *RngFn_t)(void *seed);
-typedef unsigned (*Rng32Fn_t)(void);
+typedef unsigned (__fastcall *Rng32Fn_t)(void *seed);
 static RngFn_t   s_origRng   = NULL;            /* FUN_00431870 — 16-bit LCG draw            */
 static Rng32Fn_t s_origRng32 = NULL;            /* FUN_004318d0 — 32-bit wrapper (2× LCG)    */
 static FILE *s_rngRec = NULL, *s_rngRpy = NULL;
@@ -1614,10 +1614,13 @@ static unsigned short __fastcall HookedRng(void *seed)
         RngTally(caller);
     return s_origRng(seed);
 }
-static unsigned HookedRng32(void)
+/* FUN_004318d0 is __fastcall(ushort* seed) — it saves the INCOMING ECX (seed ptr) and reloads it
+ * for each FUN_00431870 call. So the detour MUST receive ECX and pass it through, or the wrapper
+ * draws from a garbage pointer (the §8ao crash: a void detour clobbered ECX → AV inside FUN_00431870). */
+static unsigned __fastcall HookedRng32(void *seed)
 {
     RngTally((unsigned)(uintptr_t)__builtin_return_address(0));   /* the real 32-bit-random consumer */
-    return s_origRng32();
+    return s_origRng32(seed);
 }
 
 /* Re-derive ZUN's menu key-repeat (hold-to-scroll) from the MERGED word so it is

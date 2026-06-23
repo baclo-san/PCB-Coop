@@ -2972,3 +2972,35 @@ is inside `FUN_00431900` `[0x431900,0x431920)`, step up to `FUN_00431900`'s own 
 the wrapper site — no crash, no FPU, worst case = §8ao behaviour. Direct int (`FUN_004318d0`) and direct 16-bit (`FUN_00431870`)
 consumers are unchanged. Next capture's `coop_rngcall_*` names the real **float** consumer (the bullet/enemy system) at the Cirno
 divergence (~rf1280+) and at rf698. Build green, native test green (16/16).
+
+### §8as — ROOT CAUSE: a cosmetic particle effect shares the gameplay RNG seed (2026-06-23)
+
+The §8ar float-consumer capture (dev replayed `th7_12.rpy` locally) named the divergent consumer outright: call sites
+`0x0041a383` + `0x0041a3a8`, both calls to `FUN_00431900` inside **`FUN_0041a370`** (PCBdecomp.c:10081). That function is a
+**particle initializer** — it draws two random floats into a spread *velocity* (`obj+0x264/+0x268/+0x26c = (rand·256−128)/12 ·
+scale`), sets a deceleration (`+0x270.. = −vel·0.0526`); the sibling `FUN_0041a5a0` (`·4/33`) and `FUN_0041aa60` are the same
+effect-object module, and `FUN_0041a4f0` integrates pos+=vel, vel+=decel. It's a **cosmetic spark/dust spray** (user-confirmed
+visual-only) and it draws its randoms from the **global gameplay seed** (`mov ecx, 0x0049fe20` hardcoded in the caller).
+
+**Mechanism:** in netplay playback the burst fires **one frame out of phase** vs the live run, so it consumes a different rand
+count that frame → shifts the shared seed's phase → every downstream bullet diverges. That's the Cirno desync: harmless ±24
+flickers from rf698 (which §8aj heals) that compound into the permanent divergence once the dense Cirno patterns hit (~rf1280).
+This is exactly why **seed-pinning (§8aj) only band-aids it** (it re-syncs the seed *value* at frame boundaries but can't un-draw
+the mid-frame particle randoms), why **local replays are clean** (no netcode jitter to shift the particle timing), and why
+**vanilla single-player replays work** (the effect fires deterministically given the input).
+
+### §8at — FIX: decouple cosmetic effect RNG from the gameplay seed (2026-06-23)
+
+Give the cosmetic effects their own RNG so they never touch the gameplay seed. At the existing FPU-free integer chokepoint
+(`HookedRng32` on `FUN_004318d0`), once the real consumer is resolved (the §8ar ebp-walk), if it's a cosmetic effect
+(`FUN_0041a370`/`a5a0`/`aa60` ranges) and the seed pointer is the global `0x0049fe20`, call the trampoline with a **private
+seed** (`&s_fxSeed`) instead — so the gameplay seed is **byte-identical regardless of particle timing**, on BOTH record and
+playback. **FPU-safe:** we only swap the integer seed *pointer*; the original effect code does its own x87 math (we never touch
+st0 — `FUN_00431900` returns in st0 and the game is x87-sensitive). Gated on co-op (`s_replayIsCoop || s_netActive || s_p2`) so
+vanilla replays are untouched; `s_fxDecouple` kill-switch. Scoped to the proven divergence source + its in-module RNG-drawing
+siblings; the snow (`FUN_0041b0b0`, steady/in-phase, the hot 22/frame baseline) is deliberately left on the global seed.
+This is the root fix the §8aj seed-pin was approximating — §8aj is retained (belt-and-suspenders) pending a fresh netplay
+record→playback verification, then can likely be retired. **Breaks OLD net replays** (recorded with effects in the seed stream)
+— acceptable during dev; new recordings on this build are self-consistent. Build green, native test green (16/16). Still TODO
+(user asked for "both"): investigate *why* the burst fires one frame off in netplay playback — the decouple makes it moot for
+the sim, but the timing slip itself is worth understanding.

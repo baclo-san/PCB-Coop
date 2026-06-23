@@ -1629,23 +1629,44 @@ static unsigned short __fastcall HookedRng(void *seed)
 #define FLOATW_HI 0x00431920u
 #define TEXT_LO   0x00401000u
 #define TEXT_HI   0x0048cd38u
+/* §8at — ROOT FIX (the §8aj seed-pin was a band-aid): the cosmetic effect-particle module (the
+ * FUN_0041a3xx spark/dust SPRAY etc. — user-confirmed visual-only) draws its random velocities from
+ * the GLOBAL gameplay seed (ADDR_RNG_SEED, 0x0049fe20). In netplay PLAYBACK the burst fires one frame
+ * out of phase vs the live run, so it consumes a different rand count that frame → shifts the shared
+ * seed phase → every downstream bullet diverges → the Cirno desync (§8as). Decouple it: under co-op,
+ * redirect these COSMETIC draws to a PRIVATE seed so the gameplay seed is byte-identical regardless of
+ * particle timing, on BOTH record and playback. FPU-SAFE: we only swap the integer seed POINTER handed
+ * to the trampoline; the original effect code does its own x87 math (we never touch st0 — FUN_00431900
+ * returns in st0 and this game is x87-sensitive). Scoped to the proven divergence source + its
+ * in-module RNG-drawing siblings; the snow (FUN_0041b0b0, steady/in-phase) stays on the global seed. */
+static unsigned short s_fxSeed = 0x4321;   /* private cosmetic-effect RNG state (value irrelevant) */
+static int s_fxDecouple = 1;               /* on under co-op; kill-switch for debugging */
+static int IsCosmeticEffectRng(unsigned a)
+{
+    return (a >= 0x0041a370u && a < 0x0041a4f0u)    /* FUN_0041a370 — spray (confirmed culprit)     */
+        || (a >= 0x0041a5a0u && a < 0x0041a730u)    /* FUN_0041a5a0 — spray variant (×4/33)         */
+        || (a >= 0x0041aa60u && a < 0x0041aaf0u);   /* FUN_0041aa60 — same effect module, draws RNG */
+}
 static unsigned __fastcall HookedRng32(void *seed)
 {
-    unsigned caller = (unsigned)(uintptr_t)__builtin_return_address(0);   /* immediate caller */
-    if (caller >= FLOATW_LO && caller < FLOATW_HI) {                      /* came via the float wrapper */
-        void **bp = (void **)__builtin_frame_address(0);   /* our frame: bp[0]=caller ebp, bp[1]=ret */
-        if (bp) {
-            void **bp900 = (void **)bp[0];                  /* FUN_00431900's frame (caller's ebp) */
-            if ((uintptr_t)bp900 > (uintptr_t)bp &&
-                (uintptr_t)bp900 < (uintptr_t)bp + 0x10000 &&
-                (((uintptr_t)bp900) & 3) == 0) {
-                unsigned consumer = (unsigned)(uintptr_t)bp900[1];   /* FUN_00431900's return addr */
-                if (consumer >= TEXT_LO && consumer < TEXT_HI)
-                    caller = consumer;                      /* the real float-random consumer */
+    if (s_replayIsCoop || s_netActive || s_p2) {
+        unsigned consumer = (unsigned)(uintptr_t)__builtin_return_address(0);   /* immediate caller */
+        if (consumer >= FLOATW_LO && consumer < FLOATW_HI) {   /* came via the float wrapper FUN_00431900 */
+            void **bp = (void **)__builtin_frame_address(0);   /* our frame: bp[0]=caller ebp, bp[1]=ret */
+            if (bp) {
+                void **bp900 = (void **)bp[0];                 /* FUN_00431900's frame */
+                if ((uintptr_t)bp900 > (uintptr_t)bp &&
+                    (uintptr_t)bp900 < (uintptr_t)bp + 0x10000 &&
+                    (((uintptr_t)bp900) & 3) == 0) {
+                    unsigned c = (unsigned)(uintptr_t)bp900[1];
+                    if (c >= TEXT_LO && c < TEXT_HI) consumer = c;   /* the real float-random consumer */
+                }
             }
         }
+        RngTally(consumer);                                    /* diagnostic (self-gates on replay_trace) */
+        if (s_fxDecouple && (uintptr_t)seed == 0x0049fe20u && IsCosmeticEffectRng(consumer))
+            return s_origRng32((void *)&s_fxSeed);             /* cosmetic → private seed; gameplay seed untouched */
     }
-    RngTally(caller);
     return s_origRng32(seed);
 }
 

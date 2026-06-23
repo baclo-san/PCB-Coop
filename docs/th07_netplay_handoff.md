@@ -3004,3 +3004,28 @@ record→playback verification, then can likely be retired. **Breaks OLD net rep
 — acceptable during dev; new recordings on this build are self-consistent. Build green, native test green (16/16). Still TODO
 (user asked for "both"): investigate *why* the burst fires one frame off in netplay playback — the decouple makes it moot for
 the sim, but the timing slip itself is worth understanding.
+
+### §8at VERIFIED working (fresh a346e27 netplay record→playback) + §8au snapshot fix (2026-06-23)
+
+A fresh netplay record→playback on the §8at build (`build/newer test logs/`) confirms the decouple **works**: splitting each
+frame's draws into *effect* (`0x41a3xx`) vs *gameplay* (everything else) and taking the +1-aligned cumulative diff, the
+**gameplay** stream — which before §8at diverged to a permanent **−88+** at Cirno — is now down to a **±4 wobble, +18 final over
+4000 frames** (essentially synced). The **effect** stream still slips ±12 (the one-frame timing slip persists, now isolated and
+harmless). So the cosmetic-RNG pollution was indeed the desync driver, and decoupling fixed the dominant share.
+
+But that run was crippled by a **separate bug** the tester surfaced (so the recording was also input-corrupted): a **per-particle
+single-frame input stall**, **P2 unfocusing every few frames + a screenshot every time**, and a connection drop. Root cause = a
+**merge/th07 input-bit collision**, NOT Windows accessibility (the §8an theory was wrong and is **removed**, per user). th07's
+in-game snapshot (PCBdecomp.c:21081, inside the present `FUN_004345c0`) fires a BMP save on a **rising edge of bit `0x800`** in
+g_InputMenu (`DAT_004b9e4c`). Our merged word puts **P2 FOCUS on `NB_FOCUS2` = bit 11 = `0x800`** — the *same* bit. The 16-bit
+word has no free high bit to relocate it (P1 owns 0-8, P2 owns 9-15). **§8au fix:** hook the present (`FUN_004345c0`) and, under
+co-op, strip `0x800` from g_InputMenu just before th07 tests it. The replay RECORD task (PCBdecomp.c:27602) has already copied
+g_InputMenu→g_InputGameplay earlier in the frame, and P2's live focus comes from `s_netMerged` — so clearing it at present is
+invisible to gameplay and the replay and only kills the spurious screenshot (and the stall/unfocus/drop loop it caused).
+
+Residual after §8at: the small ±4 gameplay wobble (onset ~rf2043) is two MORE RNG consumers still on the global seed —
+`FUN_004012b0` (2 draws) and `FUN_0043b5c0` (5 ints + 3 floats), both writing `rand%100000+0x198f` into a sub-object — that fire
+one frame off like the spray. They are **not** confirmed cosmetic (they write into manager/sub-object structs, not particle
+pos/vel), so they are deliberately NOT decoupled yet. Re-test on the §8au build for a CLEAN (non-input-corrupted) recording; if
+the residual persists, identify/confirm those two before extending the decouple. NEXT: tester re-test on ≥(this build) — expect
+no screenshot/stall/drop and a much closer replay; report whether any Cirno desync remains.

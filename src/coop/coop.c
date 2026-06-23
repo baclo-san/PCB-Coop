@@ -4900,6 +4900,30 @@ static void PatchDisableDemo(void)
     VirtualProtect(p, 4, old, &old);
 }
 
+/* §8au — the REAL "P2 focus lag" (NOT Windows accessibility; the §8an Sticky/Filter-Keys
+ * suppression was a misdiagnosis and is removed). th07's in-game SNAPSHOT (PCBdecomp.c:21081,
+ * inside the present/flip FUN_004345c0) writes a screenshot BMP on a RISING EDGE of bit 0x800
+ * in g_InputMenu (DAT_004b9e4c). Our merged input word puts P2's FOCUS on NB_FOCUS2 = bit 11 =
+ * 0x800 — the SAME bit th07 reads as the snapshot key. So when P2 focuses (and especially when
+ * its focus toggles), th07 saves a BMP each rising edge: a multi-ms disk stall that starves the
+ * input poll, drops P2's focus, re-presses it (another edge -> another BMP) and stalls the frame
+ * long enough to trip the lockstep timeout (tester: stutter on every particle / "screenshot every
+ * time" / connection drop). The 16-bit merged word has NO free high bit to relocate FOCUS2 to
+ * (P1 owns bits 0-8, P2 owns 9-15), so we suppress the snapshot under co-op instead: strip 0x800
+ * from g_InputMenu right before th07 tests it. By present-time the replay RECORD task has already
+ * copied g_InputMenu -> g_InputGameplay (so P2's recorded focus is preserved for playback), and
+ * P2's live focus is read from s_netMerged, not this word — so clearing it here is invisible to
+ * gameplay and the replay, and only kills the spurious screenshot. */
+typedef void (*PresentFn_t)(void);
+static PresentFn_t s_origPresent = NULL;
+#define ADDR_PRESENT_FN ((LPVOID)0x004345c0)   /* FUN_004345c0 — D3D present + the snapshot check */
+static void HookedPresent(void)
+{
+    if (s_replayIsCoop || s_netActive || s_p2)
+        *ADDR_MENU_IN_CUR &= (uint16_t)~0x0800u;   /* NB_FOCUS2 == th07 snapshot key — suppress it */
+    s_origPresent();
+}
+
 static int InstallHooks(void)
 {
     if (MH_Initialize() != MH_OK) return 0;
@@ -4926,6 +4950,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_REPLAY_PLAY_TASK,(LPVOID)&HookedPlayTask,     (LPVOID*)&s_origPlayTask)      != MH_OK) return 0; /* §8ad playback FPU pin */
     if (MH_CreateHook(ADDR_RNG_FN,         (LPVOID)&HookedRng,           (LPVOID*)&s_origRng)           != MH_OK) return 0; /* §8al RNG-caller trace (gated by replay_trace) */
     if (MH_CreateHook(ADDR_RNG32_FN,       (LPVOID)&HookedRng32,         (LPVOID*)&s_origRng32)         != MH_OK) return 0; /* §8ao 32-bit-rand consumer trace */
+    if (MH_CreateHook(ADDR_PRESENT_FN,     (LPVOID)&HookedPresent,       (LPVOID*)&s_origPresent)       != MH_OK) return 0; /* §8au suppress P2-focus snapshot */
     /* B5: capture the enemy-manager base (FUN_00420620's ECX/param_1) so the boss-spell
      * armour gate reads the LIVE spellcardInfo.isActive at param_1+0x9545c8. The base is
      * non-zero in-game (the absolute-globals assumption was wrong — see HookedEnemyUpdate). */
@@ -4982,50 +5007,6 @@ static int InstallHooks(void)
     return 1;
 }
 
-/* §8an: Windows accessibility-shortcut suppression. Holding Shift to FOCUS (or tapping it)
- * can trip Filter Keys (hold Shift ~8s -> SlowKeys/RepeatKeys throttles keyboard input) or
- * Sticky Keys (5x Shift) — which on some machines shows up as a "massive slowdown whenever
- * P2 presses Shift" (tester report). It's ENVIRONMENTAL, not in our sim: the RNG histogram
- * shows no draw storm on focus (~88 draws/frame), and it doesn't repro on a machine whose
- * accessibility hotkeys aren't armed (dev, even with replay_trace=1). Suppress the ACTIVATION
- * hotkeys while the game runs — the standard gamedev fix — saving + restoring on exit so we
- * touch only the accidental-activation shortcut, never a feature the user deliberately enabled
- * (and SystemParametersInfo without SPIF_UPDATEINIFILE doesn't persist, so a crash self-heals
- * at logoff). */
-static STICKYKEYS s_axSticky; static FILTERKEYS s_axFilter; static TOGGLEKEYS s_axToggle;
-static int s_axSaved = 0;
-static void SuppressAccessibilityShortcuts(void)
-{
-    s_axSticky.cbSize = sizeof(STICKYKEYS);
-    s_axFilter.cbSize = sizeof(FILTERKEYS);
-    s_axToggle.cbSize = sizeof(TOGGLEKEYS);
-    if (!SystemParametersInfoA(SPI_GETSTICKYKEYS, sizeof(STICKYKEYS), &s_axSticky, 0)) return;
-    if (!SystemParametersInfoA(SPI_GETFILTERKEYS, sizeof(FILTERKEYS), &s_axFilter, 0)) return;
-    if (!SystemParametersInfoA(SPI_GETTOGGLEKEYS, sizeof(TOGGLEKEYS), &s_axToggle, 0)) return;
-    s_axSaved = 1;
-    {
-        STICKYKEYS sk = s_axSticky; FILTERKEYS fk = s_axFilter; TOGGLEKEYS tk = s_axToggle;
-        if (!(sk.dwFlags & SKF_STICKYKEYSON)) sk.dwFlags &= ~(SKF_HOTKEYACTIVE | SKF_CONFIRMHOTKEY);
-        if (!(fk.dwFlags & FKF_FILTERKEYSON)) fk.dwFlags &= ~(FKF_HOTKEYACTIVE | FKF_CONFIRMHOTKEY);
-        if (!(tk.dwFlags & TKF_TOGGLEKEYSON)) tk.dwFlags &= ~(TKF_HOTKEYACTIVE | TKF_CONFIRMHOTKEY);
-        SystemParametersInfoA(SPI_SETSTICKYKEYS, sizeof(STICKYKEYS), &sk, 0);
-        SystemParametersInfoA(SPI_SETFILTERKEYS, sizeof(FILTERKEYS), &fk, 0);
-        SystemParametersInfoA(SPI_SETTOGGLEKEYS, sizeof(TOGGLEKEYS), &tk, 0);
-        Log("§8an: suppressed Windows Sticky/Filter/Toggle-Keys activation hotkeys "
-            "(was sticky=0x%lx filter=0x%lx toggle=0x%lx) — restored on exit. If a Shift-on-focus "
-            "slowdown persists, it's another machine-local cause (overlay / input driver).",
-            (unsigned long)s_axSticky.dwFlags, (unsigned long)s_axFilter.dwFlags,
-            (unsigned long)s_axToggle.dwFlags);
-    }
-}
-static void RestoreAccessibilityShortcuts(void)
-{
-    if (!s_axSaved) return;
-    SystemParametersInfoA(SPI_SETSTICKYKEYS, sizeof(STICKYKEYS), &s_axSticky, 0);
-    SystemParametersInfoA(SPI_SETFILTERKEYS, sizeof(FILTERKEYS), &s_axFilter, 0);
-    SystemParametersInfoA(SPI_SETTOGGLEKEYS, sizeof(TOGGLEKEYS), &s_axToggle, 0);
-}
-
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
@@ -5060,7 +5041,6 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             s_dir, s_suppressP2, s_b2CherryBothFull, s_fpuGuard, s_netAutoResync, s_proxFade, s_damperBossOnly,
             s_netEnabled, s_netIsHost ? "host" : "guest", s_netDelay, s_netSeed);
         if (s_disableDemo) PatchDisableDemo();   /* kill title attract-mode demo */
-        SuppressAccessibilityShortcuts();        /* §8an: stop Shift(focus) tripping Filter/Sticky Keys */
         StartNet();        /* no-op unless coop.ini [net] enabled=1 */
         if (!InstallHooks())
             MessageBoxA(NULL, "th07_coop: hook install failed (wrong build/addresses?)",
@@ -5072,7 +5052,6 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
                 "border-break @0x441bd0, hud-draw @0x42b603)");
         break;
     case DLL_PROCESS_DETACH:
-        RestoreAccessibilityShortcuts();         /* §8an: put the user's accessibility hotkeys back */
         if (s_trace) { fclose(s_trace); s_trace = NULL; }
         if (s_log) { Log("detach"); fclose(s_log); }
         MH_Uninitialize();

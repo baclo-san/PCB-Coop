@@ -1207,6 +1207,7 @@ static FILE    *s_trace = NULL;            /* DIAGNOSTIC: per-frame determinism 
 static int      s_seedForced = 0;          /* seed forced once for the current scene   */
 static int      s_netSceneId  = -1;        /* last top-level scene id (self+0x154); a
                                               change re-zeros the lockstep (start barrier)*/
+static int      s_netInStagePrev = 0;      /* §8av: in-stage flag last frame (re-align only on its flip in-stage) */
 static int      s_proxFade   = 1;          /* coop.ini [coop] proximity_fade (default ON) */
 static int      s_disableDemo = 1;         /* coop.ini [coop] disable_demo (default ON)    */
 static int      s_debugKeys  = 0;          /* coop.ini [coop] debug_keys (item 5): the F2-F12
@@ -1718,6 +1719,7 @@ static int __fastcall HookedSceneTick(void *self)
             /* anchor the scene-boundary detector to wherever we linked up (usually the
              * title menu) so the first active frame doesn't fire a spurious re-zero. */
             s_netSceneId = *(int *)((char *)self + 0x154);
+            s_netInStagePrev = (int)((*ADDR_MODE_FLAGS >> 2) & 1);   /* §8av anchor */
             s_netDesyncLogged = 0; s_netSyncRun = 0; s_netPeerLost = 0;
             s_netDesyncRun = 0;    s_netHardDesyncLogged = 0;
             s_netStallLogged = 0;  s_netStatLogged = 0;
@@ -1797,9 +1799,21 @@ static int __fastcall HookedSceneTick(void *self)
          * Both commit the menu->stage transition on the same input-driven logic-frame,
          * so the re-zero lands together; the seed is forced by HookedGameStart. */
         int sceneId = *(int *)((char *)self + 0x154);
-        if (sceneId != s_netSceneId) {
-            Log("netplay: scene %d -> %d — lockstep re-aligned to frame 0 (was %d)",
-                s_netSceneId, sceneId, s_netFrame);
+        /* §8av: self+0x154 is ZUN's top-level scene id (0..~12) ONLY when `self` is the
+         * scene task; the per-frame task self we sample also lands on OTHER objects whose
+         * +0x154 reads unrelated EVEN values (6/10/22/46…, never the odd real scenes
+         * 1/5/9/11). In-stage the real top-level scene is fixed (==2) and never changes
+         * mid-stage (the boss is within scene 2), so every in-stage "scene change" we saw
+         * was spurious — yet it fired a lockstep re-align + seed re-force EVERY frame at
+         * Letty: 3652 re-aligns/run, 68ms re-sync waits, ~14fps, P2 input "Parkinson's",
+         * apparent drop (RNG self==peer throughout, so NOT a desync). Honor a scene change
+         * only when OUT of stage (the menu FSM, where it always worked) or when the
+         * in-stage flag itself FLIPS (the real menu<->stage load that needs the clock
+         * re-zero); ignore in-stage scene-id noise. */
+        int inStageNow = (int)((*ADDR_MODE_FLAGS >> 2) & 1);
+        if (sceneId != s_netSceneId && (!inStageNow || inStageNow != s_netInStagePrev)) {
+            Log("netplay: scene %d -> %d — lockstep re-aligned to frame 0 (was %d, inStage %d->%d)",
+                s_netSceneId, sceneId, s_netFrame, s_netInStagePrev, inStageNow);
             s_netSceneId = sceneId;
             s_netFrame   = 0;
             s_menuRepeatCtr = 0;        /* fresh hold-scroll state for the new scene  */
@@ -1809,6 +1823,7 @@ static int __fastcall HookedSceneTick(void *self)
             s_netDesyncRun = 0;    s_netHardDesyncLogged = 0;
             s_netStallLogged  = 0; s_netStatLogged = 0;
         }
+        s_netInStagePrev = inStageNow;
         int inStage = (int)((*ADDR_MODE_FLAGS >> 2) & 1);  /* recording active = in a stage */
         int ctrl = 0;
         /* FPU firewall: save ZUN's full x87 state, run the netcode (its lockstep wait

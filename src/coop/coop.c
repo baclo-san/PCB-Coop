@@ -1617,9 +1617,35 @@ static unsigned short __fastcall HookedRng(void *seed)
 /* FUN_004318d0 is __fastcall(ushort* seed) — it saves the INCOMING ECX (seed ptr) and reloads it
  * for each FUN_00431870 call. So the detour MUST receive ECX and pass it through, or the wrapper
  * draws from a garbage pointer (the §8ao crash: a void detour clobbered ECX → AV inside FUN_00431870). */
+/* §8ar: the FLOAT random is a THIRD wrapper layer — FUN_00431900 (__fastcall(seed*), ebp frame,
+ * returns float10 in st0) calls FUN_004318d0 at 0x43190c (return site 0x431911). So bullet
+ * angle/speed draws (the bulk — the §8ao capture put ~94% of all draws on 0x431911) get attributed
+ * to the float wrapper, not the game system that wanted the float. Rather than hook the float
+ * function (it returns in st0 — this game is x87-sensitive, see the FPU-pin work — and a diagnostic
+ * must not perturb the FPU), resolve the consumer here with ONE ebp-frame walk: when our caller is
+ * inside FUN_00431900 [0x431900,0x431920), step up to FUN_00431900's own caller. Fully guarded —
+ * any validation miss falls back to logging the wrapper site, exactly as before (no crash, no FPU). */
+#define FLOATW_LO 0x00431900u
+#define FLOATW_HI 0x00431920u
+#define TEXT_LO   0x00401000u
+#define TEXT_HI   0x0048cd38u
 static unsigned __fastcall HookedRng32(void *seed)
 {
-    RngTally((unsigned)(uintptr_t)__builtin_return_address(0));   /* the real 32-bit-random consumer */
+    unsigned caller = (unsigned)(uintptr_t)__builtin_return_address(0);   /* immediate caller */
+    if (caller >= FLOATW_LO && caller < FLOATW_HI) {                      /* came via the float wrapper */
+        void **bp = (void **)__builtin_frame_address(0);   /* our frame: bp[0]=caller ebp, bp[1]=ret */
+        if (bp) {
+            void **bp900 = (void **)bp[0];                  /* FUN_00431900's frame (caller's ebp) */
+            if ((uintptr_t)bp900 > (uintptr_t)bp &&
+                (uintptr_t)bp900 < (uintptr_t)bp + 0x10000 &&
+                (((uintptr_t)bp900) & 3) == 0) {
+                unsigned consumer = (unsigned)(uintptr_t)bp900[1];   /* FUN_00431900's return addr */
+                if (consumer >= TEXT_LO && consumer < TEXT_HI)
+                    caller = consumer;                      /* the real float-random consumer */
+            }
+        }
+    }
+    RngTally(caller);
     return s_origRng32(seed);
 }
 

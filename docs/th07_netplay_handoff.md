@@ -2928,3 +2928,47 @@ and logs ITS caller (the real consumer); the `FUN_00431870` hook now logs only D
 range `[0x004318d0,0x00431900)`). Together they attribute every draw to a real code site, so the next capture's `coop_rngcall_*`
 names the enemy/spawn function at rf699. **Likely reproducible in LOCAL co-op record→playback** (the replay-task-vs-enemy-update
 ordering matches netplay playback), which would let the dev iterate without the tester. Build green, native test green (16/16).
+
+### §8ap — fix the §8ao crash: `FUN_004318d0` is `__fastcall(seed*)`, not `void` (2026-06-23, d5cf334)
+
+§8ao crashed right after character select: AV (0xc0000005) at `EIP=0x004318ac` *inside* `FUN_00431870` during stage init. Disasm
+of `FUN_004318d0` proved Ghidra's `uint FUN_004318d0(void)` wrong: `55 8b ec 51 56 89 4d fc …` = `push ebp; mov ebp,esp; push ecx;
+push esi; mov [ebp-4],ecx` — it **saves the incoming ECX (the seed pointer)** and reloads it for each of its two `FUN_00431870`
+calls. The §8ao detour was `HookedRng32(void)`, so the C prologue clobbered ECX before the trampoline ran → both draws got a
+garbage pointer → AV. Fix: declare it `__fastcall(void* seed)` and pass `seed` to the trampoline, mirroring the working
+`HookedRng`. Both `FUN_00431870` and `FUN_004318d0` take the seed in ECX. Pure calling-convention fix; diagnostic logic unchanged.
+
+### §8aq — re-analysis of the Jun-22 capture: rf699 was a red herring; the real desync is the Cirno fight (2026-06-23)
+
+Re-diffed the existing netplay capture (`build/new test logs/`: `coop_rngcall_{rec,rpy}.csv`, `coop_rdt_{rec,rpy}.csv`,
+`coop_trace_host.csv` = the live run) with the **correct metric**: the *cumulative* sum of per-frame rngcall totals, +1-aligned
+(`rec[rf]` vs `rpy[rf+1]`). Per-frame rf diffing is fooled by the cosmetic +1 rf-offset — a draw burst that straddles a
+seed-transition boundary lands on rf=N (rec) vs N+1 (rpy), faking ±24 "divergences" that conserve over the pair. Findings:
+
+* **rf 1–697:** `cum_diff = 0` — perfect sync.
+* **rf 698 → ~1279:** clean **±24 oscillations that always heal back to 0** — one 12-wrapper-call event flickering ±1 frame then
+  self-correcting. Harmless. The prior §8ao/§8al focus on rf603/rf699 was chasing *this transient*.
+* **rf ~1280 → 1800:** deltas go **irregular and stop conserving** (rec=66/rpy=46, rec=88/rpy=44, rec=132/rpy=48…) → genuine sim
+  divergence, accumulating into a **permanent ~−88-draw offset that never heals**. rf~1400–2200 @60fps ≈ 23–37 s into stage 1 =
+  **the Cirno fight — matching the tester's live "replays desync at Cirno" exactly.**
+* **At the onset (rf~1280): P1 positions match frame-for-frame (synced), P2 is frozen/parked at 192,384 (idle).** So the divergent
+  rands are **enemy/bullet draws**, not a player/P2 bug (rules out §8ak here). The seed still matches every frame (§8aj pinning) →
+  **§8aj is confirmed a band-aid**: it keeps the seed column synced while the game *objects* drift underneath. The harmless
+  pre-1280 flickers don't heal in object state; they compound until the dense Cirno patterns diverge in draw count too. The real
+  fix must prevent the *first object-state divergence*, not re-pin the seed after it.
+
+Corollary: the desync repro is **playing a netplay-recorded `.rpy` back locally** (playback is a local action) — only a fresh
+netplay *record* needs the tester. `th7_12.rpy` is already on disk.
+
+### §8ar — RNG-caller diagnostic, level 3: see through the float wrapper `FUN_00431900` (2026-06-23)
+
+The d5cf334 rpy capture put **~94% of all draws on `0x431911`** — a return site *inside* a **third** RNG layer: `FUN_00431900`
+(`__fastcall(seed*)`, ebp frame, returns `float10` in st0) wraps `FUN_004318d0` to produce a random *float*. So bullet
+angle/speed draws (most of Cirno's pattern) were attributed to the float wrapper, not the game system. We **do not** hook
+`FUN_00431900` — it returns in st0 and this game is x87-sensitive (a diagnostic must not perturb the FPU). Instead, the existing
+FPU-free integer hook (`HookedRng32` on `FUN_004318d0`) resolves the consumer with **one guarded ebp-frame walk**: when its caller
+is inside `FUN_00431900` `[0x431900,0x431920)`, step up to `FUN_00431900`'s own caller (`bp[0]` → that frame's `[+4]`), validated
+(stack-ordered, ≤64 KB up, 4-aligned, return addr within `.text [0x401000,0x48cd38)`). Any validation miss falls back to logging
+the wrapper site — no crash, no FPU, worst case = §8ao behaviour. Direct int (`FUN_004318d0`) and direct 16-bit (`FUN_00431870`)
+consumers are unchanged. Next capture's `coop_rngcall_*` names the real **float** consumer (the bullet/enemy system) at the Cirno
+divergence (~rf1280+) and at rf698. Build green, native test green (16/16).

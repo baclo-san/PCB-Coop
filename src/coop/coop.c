@@ -4994,6 +4994,7 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_REPLAY_PLAY_TASK)!= MH_OK) return 0;  /* §8ad playback FPU pin */
     if (MH_EnableHook(ADDR_RNG_FN)         != MH_OK) return 0;   /* §8al RNG-caller trace */
     if (MH_EnableHook(ADDR_RNG32_FN)       != MH_OK) return 0;   /* §8ao 32-bit-rand consumer trace */
+    if (MH_EnableHook(ADDR_PRESENT_FN)     != MH_OK) return 0;   /* §8au suppress P2-focus snapshot (was CREATED but not ENABLED — inert) */
     if (MH_EnableHook(ADDR_REPLAY_LOAD)    != MH_OK) return 0;   /* §8k: was CREATED but never
                                                                    ENABLED — playback ran unhooked,
                                                                    so co-op replays never spawned P2 */

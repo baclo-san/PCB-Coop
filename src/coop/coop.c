@@ -1136,7 +1136,6 @@ static int s_p2InputLogged = 0;
 #define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
 #define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
 #define ADDR_RNG_FN     ((LPVOID)0x00431870)              /* FUN_00431870 — the LCG draw (§8al diag) */
-#define ADDR_RNG32_FN   ((LPVOID)0x004318d0)              /* FUN_004318d0 — 32-bit rand wrapper (§8ao diag) */
 #define ADDR_DIFFICULTY ((volatile uint32_t *)0x00626280) /* 0..3 main, 4 Extra, 5 Phantasm */
 /* Saved config (th07.cfg) defaults — the difficulty-SELECT screen seeds its cursor from
  * the saved default difficulty (PCBdecomp:37150), and the live 0x626280 is written from
@@ -1207,7 +1206,6 @@ static FILE    *s_trace = NULL;            /* DIAGNOSTIC: per-frame determinism 
 static int      s_seedForced = 0;          /* seed forced once for the current scene   */
 static int      s_netSceneId  = -1;        /* last top-level scene id (self+0x154); a
                                               change re-zeros the lockstep (start barrier)*/
-static int      s_netInStagePrev = 0;      /* §8av: in-stage flag last frame (re-align only on its flip in-stage) */
 static int      s_proxFade   = 1;          /* coop.ini [coop] proximity_fade (default ON) */
 static int      s_disableDemo = 1;         /* coop.ini [coop] disable_demo (default ON)    */
 static int      s_debugKeys  = 0;          /* coop.ini [coop] debug_keys (item 5): the F2-F12
@@ -1548,9 +1546,7 @@ static void ReplayDetTrace(int playback)
  * I/O — so the diagnostic no longer perturbs the run, and a focus-triggered draw STORM (if that is what's
  * happening) shows up as one caller with a huge per-frame count, which is itself the lead. */
 typedef unsigned short (__fastcall *RngFn_t)(void *seed);
-typedef unsigned (__fastcall *Rng32Fn_t)(void *seed);
 static RngFn_t   s_origRng   = NULL;            /* FUN_00431870 — 16-bit LCG draw            */
-static Rng32Fn_t s_origRng32 = NULL;            /* FUN_004318d0 — 32-bit wrapper (2× LCG)    */
 static FILE *s_rngRec = NULL, *s_rngRpy = NULL;
 /* §8ao: the §8am histogram showed only 004318e0/004318ee — the two LCG call sites INSIDE the
  * 32-bit wrapper FUN_004318d0 — because ~every random goes through it, so the logged "caller" was
@@ -1615,61 +1611,6 @@ static unsigned short __fastcall HookedRng(void *seed)
         RngTally(caller);
     return s_origRng(seed);
 }
-/* FUN_004318d0 is __fastcall(ushort* seed) — it saves the INCOMING ECX (seed ptr) and reloads it
- * for each FUN_00431870 call. So the detour MUST receive ECX and pass it through, or the wrapper
- * draws from a garbage pointer (the §8ao crash: a void detour clobbered ECX → AV inside FUN_00431870). */
-/* §8ar: the FLOAT random is a THIRD wrapper layer — FUN_00431900 (__fastcall(seed*), ebp frame,
- * returns float10 in st0) calls FUN_004318d0 at 0x43190c (return site 0x431911). So bullet
- * angle/speed draws (the bulk — the §8ao capture put ~94% of all draws on 0x431911) get attributed
- * to the float wrapper, not the game system that wanted the float. Rather than hook the float
- * function (it returns in st0 — this game is x87-sensitive, see the FPU-pin work — and a diagnostic
- * must not perturb the FPU), resolve the consumer here with ONE ebp-frame walk: when our caller is
- * inside FUN_00431900 [0x431900,0x431920), step up to FUN_00431900's own caller. Fully guarded —
- * any validation miss falls back to logging the wrapper site, exactly as before (no crash, no FPU). */
-#define FLOATW_LO 0x00431900u
-#define FLOATW_HI 0x00431920u
-#define TEXT_LO   0x00401000u
-#define TEXT_HI   0x0048cd38u
-/* §8at — ROOT FIX (the §8aj seed-pin was a band-aid): the cosmetic effect-particle module (the
- * FUN_0041a3xx spark/dust SPRAY etc. — user-confirmed visual-only) draws its random velocities from
- * the GLOBAL gameplay seed (ADDR_RNG_SEED, 0x0049fe20). In netplay PLAYBACK the burst fires one frame
- * out of phase vs the live run, so it consumes a different rand count that frame → shifts the shared
- * seed phase → every downstream bullet diverges → the Cirno desync (§8as). Decouple it: under co-op,
- * redirect these COSMETIC draws to a PRIVATE seed so the gameplay seed is byte-identical regardless of
- * particle timing, on BOTH record and playback. FPU-SAFE: we only swap the integer seed POINTER handed
- * to the trampoline; the original effect code does its own x87 math (we never touch st0 — FUN_00431900
- * returns in st0 and this game is x87-sensitive). Scoped to the proven divergence source + its
- * in-module RNG-drawing siblings; the snow (FUN_0041b0b0, steady/in-phase) stays on the global seed. */
-static unsigned short s_fxSeed = 0x4321;   /* private cosmetic-effect RNG state (value irrelevant) */
-static int s_fxDecouple = 1;               /* on under co-op; kill-switch for debugging */
-static int IsCosmeticEffectRng(unsigned a)
-{
-    return (a >= 0x0041a370u && a < 0x0041a4f0u)    /* FUN_0041a370 — spray (confirmed culprit)     */
-        || (a >= 0x0041a5a0u && a < 0x0041a730u)    /* FUN_0041a5a0 — spray variant (×4/33)         */
-        || (a >= 0x0041aa60u && a < 0x0041aaf0u);   /* FUN_0041aa60 — same effect module, draws RNG */
-}
-static unsigned __fastcall HookedRng32(void *seed)
-{
-    if (s_replayIsCoop || s_netActive || s_p2) {
-        unsigned consumer = (unsigned)(uintptr_t)__builtin_return_address(0);   /* immediate caller */
-        if (consumer >= FLOATW_LO && consumer < FLOATW_HI) {   /* came via the float wrapper FUN_00431900 */
-            void **bp = (void **)__builtin_frame_address(0);   /* our frame: bp[0]=caller ebp, bp[1]=ret */
-            if (bp) {
-                void **bp900 = (void **)bp[0];                 /* FUN_00431900's frame */
-                if ((uintptr_t)bp900 > (uintptr_t)bp &&
-                    (uintptr_t)bp900 < (uintptr_t)bp + 0x10000 &&
-                    (((uintptr_t)bp900) & 3) == 0) {
-                    unsigned c = (unsigned)(uintptr_t)bp900[1];
-                    if (c >= TEXT_LO && c < TEXT_HI) consumer = c;   /* the real float-random consumer */
-                }
-            }
-        }
-        RngTally(consumer);                                    /* diagnostic (self-gates on replay_trace) */
-        if (s_fxDecouple && (uintptr_t)seed == 0x0049fe20u && IsCosmeticEffectRng(consumer))
-            return s_origRng32((void *)&s_fxSeed);             /* cosmetic → private seed; gameplay seed untouched */
-    }
-    return s_origRng32(seed);
-}
 
 /* Re-derive ZUN's menu key-repeat (hold-to-scroll) from the MERGED word so it is
  * identical on both peers. Mirrors FUN_00437c70's own logic (PCBdecomp.c:22806-22816)
@@ -1719,7 +1660,6 @@ static int __fastcall HookedSceneTick(void *self)
             /* anchor the scene-boundary detector to wherever we linked up (usually the
              * title menu) so the first active frame doesn't fire a spurious re-zero. */
             s_netSceneId = *(int *)((char *)self + 0x154);
-            s_netInStagePrev = (int)((*ADDR_MODE_FLAGS >> 2) & 1);   /* §8av anchor */
             s_netDesyncLogged = 0; s_netSyncRun = 0; s_netPeerLost = 0;
             s_netDesyncRun = 0;    s_netHardDesyncLogged = 0;
             s_netStallLogged = 0;  s_netStatLogged = 0;
@@ -1799,21 +1739,9 @@ static int __fastcall HookedSceneTick(void *self)
          * Both commit the menu->stage transition on the same input-driven logic-frame,
          * so the re-zero lands together; the seed is forced by HookedGameStart. */
         int sceneId = *(int *)((char *)self + 0x154);
-        /* §8av: self+0x154 is ZUN's top-level scene id (0..~12) ONLY when `self` is the
-         * scene task; the per-frame task self we sample also lands on OTHER objects whose
-         * +0x154 reads unrelated EVEN values (6/10/22/46…, never the odd real scenes
-         * 1/5/9/11). In-stage the real top-level scene is fixed (==2) and never changes
-         * mid-stage (the boss is within scene 2), so every in-stage "scene change" we saw
-         * was spurious — yet it fired a lockstep re-align + seed re-force EVERY frame at
-         * Letty: 3652 re-aligns/run, 68ms re-sync waits, ~14fps, P2 input "Parkinson's",
-         * apparent drop (RNG self==peer throughout, so NOT a desync). Honor a scene change
-         * only when OUT of stage (the menu FSM, where it always worked) or when the
-         * in-stage flag itself FLIPS (the real menu<->stage load that needs the clock
-         * re-zero); ignore in-stage scene-id noise. */
-        int inStageNow = (int)((*ADDR_MODE_FLAGS >> 2) & 1);
-        if (sceneId != s_netSceneId && (!inStageNow || inStageNow != s_netInStagePrev)) {
-            Log("netplay: scene %d -> %d — lockstep re-aligned to frame 0 (was %d, inStage %d->%d)",
-                s_netSceneId, sceneId, s_netFrame, s_netInStagePrev, inStageNow);
+        if (sceneId != s_netSceneId) {
+            Log("netplay: scene %d -> %d — lockstep re-aligned to frame 0 (was %d)",
+                s_netSceneId, sceneId, s_netFrame);
             s_netSceneId = sceneId;
             s_netFrame   = 0;
             s_menuRepeatCtr = 0;        /* fresh hold-scroll state for the new scene  */
@@ -1823,7 +1751,6 @@ static int __fastcall HookedSceneTick(void *self)
             s_netDesyncRun = 0;    s_netHardDesyncLogged = 0;
             s_netStallLogged  = 0; s_netStatLogged = 0;
         }
-        s_netInStagePrev = inStageNow;
         int inStage = (int)((*ADDR_MODE_FLAGS >> 2) & 1);  /* recording active = in a stage */
         int ctrl = 0;
         /* FPU firewall: save ZUN's full x87 state, run the netcode (its lockstep wait
@@ -4964,7 +4891,6 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_REPLAY_LOAD,    (LPVOID)&HookedReplayLoad,    (LPVOID*)&s_origReplayLoad)    != MH_OK) return 0; /* §8k playback */
     if (MH_CreateHook(ADDR_REPLAY_PLAY_TASK,(LPVOID)&HookedPlayTask,     (LPVOID*)&s_origPlayTask)      != MH_OK) return 0; /* §8ad playback FPU pin */
     if (MH_CreateHook(ADDR_RNG_FN,         (LPVOID)&HookedRng,           (LPVOID*)&s_origRng)           != MH_OK) return 0; /* §8al RNG-caller trace (gated by replay_trace) */
-    if (MH_CreateHook(ADDR_RNG32_FN,       (LPVOID)&HookedRng32,         (LPVOID*)&s_origRng32)         != MH_OK) return 0; /* §8ao 32-bit-rand consumer trace */
     if (MH_CreateHook(ADDR_PRESENT_FN,     (LPVOID)&HookedPresent,       (LPVOID*)&s_origPresent)       != MH_OK) return 0; /* §8au suppress P2-focus snapshot */
     /* B5: capture the enemy-manager base (FUN_00420620's ECX/param_1) so the boss-spell
      * armour gate reads the LIVE spellcardInfo.isActive at param_1+0x9545c8. The base is
@@ -5008,7 +4934,6 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_REPLAY_HDR_INIT)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_REPLAY_PLAY_TASK)!= MH_OK) return 0;  /* §8ad playback FPU pin */
     if (MH_EnableHook(ADDR_RNG_FN)         != MH_OK) return 0;   /* §8al RNG-caller trace */
-    if (MH_EnableHook(ADDR_RNG32_FN)       != MH_OK) return 0;   /* §8ao 32-bit-rand consumer trace */
     if (MH_EnableHook(ADDR_PRESENT_FN)     != MH_OK) return 0;   /* §8au suppress P2-focus snapshot (was CREATED but not ENABLED — inert) */
     if (MH_EnableHook(ADDR_REPLAY_LOAD)    != MH_OK) return 0;   /* §8k: was CREATED but never
                                                                    ENABLED — playback ran unhooked,

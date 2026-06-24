@@ -1509,6 +1509,12 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
  * the streams can also be aligned by input if the rf origins differ. Gated by [coop] replay_trace
  * (default 0) so normal play writes nothing. Separate files for record vs playback. */
 static FILE *s_rdtRec = NULL, *s_rdtRpy = NULL;
+/* §8ba: a TRUE monotonic LCG-call count, bumped in HookedRng on every draw (the 16-bit LCG is the
+ * bottom of the int + float wrappers, so this catches ALL draws across all 3 layers). Unlike ZUN's
+ * ADDR_RNG_CTR (record side logs 0; reset/sample-point quirks) and unlike the seed (pinned per-frame
+ * by §8aj, which MASKS divergence), this counter is never reset — so its per-frame DELTA, diffed
+ * rec-vs-rpy, names the exact frame the draw stream forks (the real desync onset the pin hides). */
+static unsigned s_rngDraws = 0;
 static void ReplayDetTrace(int playback)
 {
     if (!s_replayTrace) return;
@@ -1526,7 +1532,9 @@ static void ReplayDetTrace(int playback)
          * sample point (pre-update) so a rec-vs-rpy diff shows which word P2 must use to match. */
         /* §8ax: mult/mult2/slow = the framerate timestep. If a netplay RECORD shows mult != 1.0
          * (or != the playback's), the sub-frame timer stepping is the desync axis EoSD guards. */
-        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw,inMenu,netMerged,headW,headNext,mult,mult2,slow\n", *fp);
+        /* §8ba: draws = true monotonic LCG-call count; diff its per-frame DELTA rec-vs-rpy to find
+         * the real draw-stream fork (the §8aj seed-pin keeps `seed` matching, hiding it). */
+        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw,inMenu,netMerged,headW,headNext,mult,mult2,slow,draws\n", *fp);
     }
     void *p2 = (void *)s_p2;
     /* replay buffer current head + next entry words (the recorded merged words FUN_00442ee0 applies) */
@@ -1535,7 +1543,7 @@ static void ReplayDetTrace(int playback)
         unsigned char *head = *(unsigned char **)((char *)rm + 0x84);
         if (head) { hW = *(unsigned short *)head; hN = *(unsigned short *)(head + 4); }
     }
-    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x,%04x,%04x,%04x,%04x,%.4f,%.4f,%d\n",
+    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x,%04x,%04x,%04x,%04x,%.4f,%.4f,%d,%u\n",
             rf, (unsigned)*ADDR_INPUT_GAMEPLAY,
             (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR,
             *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X),
@@ -1545,7 +1553,7 @@ static void ReplayDetTrace(int playback)
             (unsigned)FpuCw(),
             (unsigned)*ADDR_INPUT_MENU, (unsigned)s_netMerged, hW, hN,
             (double)*ADDR_FRAME_MULT, (double)*ADDR_FRAME_MULT2,
-            (int)((*ADDR_FRAME_SLOWF >> 5) & 1));
+            (int)((*ADDR_FRAME_SLOWF >> 5) & 1), s_rngDraws);
     fflush(*fp);
 }
 
@@ -1622,6 +1630,7 @@ static void RngTally(unsigned caller)
 }
 static unsigned short __fastcall HookedRng(void *seed)
 {
+    s_rngDraws++;                                /* §8ba: count EVERY draw (all 3 layers bottom out here) */
     unsigned caller = (unsigned)(uintptr_t)__builtin_return_address(0);
     if (caller < WRAP_LO || caller >= WRAP_HI)   /* skip wrapper-internal; FUN_004318d0 hook logs those */
         RngTally(caller);

@@ -1480,7 +1480,8 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
         s_trace = fopen(p, "w");
         if (!s_trace) return;
         fputs("frame,inStage,merged,p1,p2,seed,counter,waitMs,sync,"
-              "readFrame,selfKey,rcvKey,rcvStatus,rcvSrc,rcvWrites,fpucw,fpusw\n", s_trace);
+              "readFrame,selfKey,rcvKey,rcvStatus,rcvSrc,rcvWrites,fpucw,fpusw,"
+              "mult,mult2,slow\n", s_trace);   /* §8ay: capture the LIVE-record timestep multiplier UNGATED */
     }
     /* netcode internals for this frame: the index GetKeys read (readFrame =
      * netFrame-delay) and the raw self/rcv words it merged. Diffing host vs guest
@@ -1491,10 +1492,12 @@ static void NetTrace(int frame, int inStage, uint16_t merged, int waitMs, int sy
     int rsrc = -1, rwr = 0;
     Nc_GetReadStats(&rf, &sk, &rk, &rs);
     Nc_GetRcvSrc(&rsrc, &rwr);
-    fprintf(s_trace, "%d,%d,%04x,%04x,%04x,%04x,%u,%d,%d,%d,%04x,%04x,%d,%d,%d,%04x,%04x\n",
+    fprintf(s_trace, "%d,%d,%04x,%04x,%04x,%04x,%u,%d,%d,%d,%04x,%04x,%d,%d,%d,%04x,%04x,%.4f,%.4f,%d\n",
             frame, inStage, merged, s_netP1Menu, s_netP2Menu,
             (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR, waitMs, sync,
-            rf, sk, rk, rs, rsrc, rwr, s_fpuCw, s_fpuSw);
+            rf, sk, rk, rs, rsrc, rwr, s_fpuCw, s_fpuSw,
+            (double)*ADDR_FRAME_MULT, (double)*ADDR_FRAME_MULT2,
+            (int)((*ADDR_FRAME_SLOWF >> 5) & 1));   /* §8ay: live timestep multiplier */
     fflush(s_trace);                        /* survive the freeze tail */
 }
 

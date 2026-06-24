@@ -1136,6 +1136,15 @@ static int s_p2InputLogged = 0;
 #define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
 #define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
 #define ADDR_RNG_FN     ((LPVOID)0x00431870)              /* FUN_00431870 — the LCG draw (§8al diag) */
+/* §8ax: the framerate/timestep multiplier (EoSD Supervisor::framerateMultiplier; PCB reads this same
+ * global via Supervisor+0x178). It SCALES ALL MOTION (pos += vel * mult, PCBdecomp 5918/6122/6440…) and
+ * GATES ZunTimer sub-frame stepping (FUN_00439401/FUN_0043958d: when mult<=0.99 timers tick fractionally
+ * instead of +1). EoSD forces this to 1.0 for replays and refuses to record under slowdown. Hypothesis:
+ * a netplay RECORD that dips !=1.0 (lockstep stalls) while PLAYBACK runs at 1.0 forks every timer-gated
+ * event → the netplay-replay desync. These are read-only diagnostic taps. */
+#define ADDR_FRAME_MULT  ((volatile float *)0x00575ac8)    /* effectiveFramerateMultiplier (motion + gate) */
+#define ADDR_FRAME_MULT2 ((volatile float *)0x00575ac4)    /* adjacent catch-up multiplier field           */
+#define ADDR_FRAME_SLOWF ((volatile uint32_t *)0x00575adc) /* bit5 (0x20) = slow-mode toggle flag           */
 #define ADDR_DIFFICULTY ((volatile uint32_t *)0x00626280) /* 0..3 main, 4 Extra, 5 Phantasm */
 /* Saved config (th07.cfg) defaults — the difficulty-SELECT screen seeds its cursor from
  * the saved default difficulty (PCBdecomp:37150), and the live 0x626280 is written from
@@ -1512,7 +1521,9 @@ static void ReplayDetTrace(int playback)
          * one frame on playback — record sources P2 from the FRESH s_netMerged (merged[N]) while
          * playback sources it from g_InputGameplay; this records every candidate source at the SAME
          * sample point (pre-update) so a rec-vs-rpy diff shows which word P2 must use to match. */
-        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw,inMenu,netMerged,headW,headNext\n", *fp);
+        /* §8ax: mult/mult2/slow = the framerate timestep. If a netplay RECORD shows mult != 1.0
+         * (or != the playback's), the sub-frame timer stepping is the desync axis EoSD guards. */
+        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw,inMenu,netMerged,headW,headNext,mult,mult2,slow\n", *fp);
     }
     void *p2 = (void *)s_p2;
     /* replay buffer current head + next entry words (the recorded merged words FUN_00442ee0 applies) */
@@ -1521,7 +1532,7 @@ static void ReplayDetTrace(int playback)
         unsigned char *head = *(unsigned char **)((char *)rm + 0x84);
         if (head) { hW = *(unsigned short *)head; hN = *(unsigned short *)(head + 4); }
     }
-    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x,%04x,%04x,%04x,%04x\n",
+    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x,%04x,%04x,%04x,%04x,%.4f,%.4f,%d\n",
             rf, (unsigned)*ADDR_INPUT_GAMEPLAY,
             (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR,
             *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X),
@@ -1529,7 +1540,9 @@ static void ReplayDetTrace(int playback)
             p2 ? *(float *)((char *)p2 + OFF_POS_X) : -1.0f,
             p2 ? *(float *)((char *)p2 + OFF_POS_Y) : -1.0f,
             (unsigned)FpuCw(),
-            (unsigned)*ADDR_INPUT_MENU, (unsigned)s_netMerged, hW, hN);
+            (unsigned)*ADDR_INPUT_MENU, (unsigned)s_netMerged, hW, hN,
+            (double)*ADDR_FRAME_MULT, (double)*ADDR_FRAME_MULT2,
+            (int)((*ADDR_FRAME_SLOWF >> 5) & 1));
     fflush(*fp);
 }
 

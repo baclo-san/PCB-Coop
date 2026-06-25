@@ -1140,7 +1140,10 @@ static int s_p2InputLogged = 0;
 #define ADDR_RNG_FN     ((LPVOID)0x00431870)              /* FUN_00431870 — the LCG draw (§8al diag) */
 #define ADDR_RNG32_FN   ((LPVOID)0x004318d0)              /* FUN_004318d0 — 32-bit rand wrapper (§8bb attribution) */
 #define ADDR_SCHED      ((LPVOID)0x004012b0)              /* FUN_004012b0 — "next-fire = now + rand%100000" self-rescheduler (§8bc call-site attribution) */
-#define ADDR_SCORE_MGR  ((volatile int *)0x00626278)      /* -> score/item-collection manager base (score @+4, pointItemsCollected @+0x24) — §8bd */
+#define ADDR_SCORE_MGR  ((volatile int *)0x00626278)      /* -> score/item-collection manager base (score @+4, pointItemsCollected @+0x24, cherry_base @+0x88) — §8bd */
+#define ADDR_CHERRY     ((volatile int *)0x0062f88c)      /* Cherry — drives point-item VALUE + item-drop roll (= this global − cherry_base) — §8be */
+#define ADDR_CHERRY_MAX ((volatile int *)0x0062f888)      /* Cherry Max — the value cap / roll denominator */
+#define ADDR_CHERRY_PLUS ((volatile int *)0x0062f890)     /* Cherry+ — the supernatural-BORDER gauge (border fires at base+50000) */
 /* §8ax: the framerate/timestep multiplier (EoSD Supervisor::framerateMultiplier; PCB reads this same
  * global via Supervisor+0x178). It SCALES ALL MOTION (pos += vel * mult, PCBdecomp 5918/6122/6440…) and
  * GATES ZunTimer sub-frame stepping (FUN_00439401/FUN_0043958d: when mult<=0.99 timers tick fractionally
@@ -1544,7 +1547,14 @@ static void ReplayDetTrace(int playback)
          * FUN_004325e0/rf1037) — so the root is NON-RNG collection state (a clone-side asymmetry), not a
          * draw-stream drift. These two counters name the exact frame + kind of the collection fork: a
          * `pitems` delta = a point item collected that frame; `score` catches the bonus/extend RNG too. */
-        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw,inMenu,netMerged,headW,headNext,mult,mult2,slow,draws,score,pitems\n", *fp);
+        /* §8be: the f331c96 capture localized the fork to the FIRST point item (rf854: same item, same
+         * frame, both players + RNG identical, yet record scores +1 and playback +4250=MAX). Per PCB
+         * mechanics (user + docs/th07_cherry_determinism.md §0) point-item value = f(CHERRY, POC-proximity)
+         * and a BORDER collects all items at MAX. Cherry fills from shots/graze and is the handoff's #1
+         * determinism risk. `pitems` was 0 until rf854 ⇒ the FIRST point item reveals a cherry that
+         * diverged silently EARLIER. These columns expose the three cherry deltas (global − cbase) + both
+         * border states (player state 4 = border active) so a rec-vs-rpy diff names the frame cherry forks. */
+        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw,inMenu,netMerged,headW,headNext,mult,mult2,slow,draws,score,pitems,cherry,cmax,cplus,cbase,p1st,p2st\n", *fp);
     }
     void *p2 = (void *)s_p2;
     /* replay buffer current head + next entry words (the recorded merged words FUN_00442ee0 applies) */
@@ -1556,7 +1566,13 @@ static void ReplayDetTrace(int playback)
     int smb = *ADDR_SCORE_MGR;                              /* §8bd: score/item-collection manager base */
     int score = smb ? *(int *)(smb + 4) : -1;
     int pitems = smb ? *(int *)(smb + 0x24) : -1;
-    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x,%04x,%04x,%04x,%04x,%.4f,%.4f,%d,%u,%d,%d\n",
+    int cbase = smb ? *(int *)(smb + 0x88) : 0;             /* §8be: cherry reference base; deltas below */
+    int cherry = *ADDR_CHERRY - cbase;                     /* point-item value driver */
+    int cmax   = *ADDR_CHERRY_MAX - cbase;
+    int cplus  = *ADDR_CHERRY_PLUS - cbase;                /* border gauge (border @ 50000) */
+    int p1st = (int)*(unsigned char *)((char *)ADDR_PLAYER_BASE + OFF_STATE);
+    int p2st = p2 ? (int)*(unsigned char *)((char *)p2 + OFF_STATE) : -1;
+    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x,%04x,%04x,%04x,%04x,%.4f,%.4f,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d\n",
             rf, (unsigned)*ADDR_INPUT_GAMEPLAY,
             (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR,
             *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X),
@@ -1566,7 +1582,8 @@ static void ReplayDetTrace(int playback)
             (unsigned)FpuCw(),
             (unsigned)*ADDR_INPUT_MENU, (unsigned)s_netMerged, hW, hN,
             (double)*ADDR_FRAME_MULT, (double)*ADDR_FRAME_MULT2,
-            (int)((*ADDR_FRAME_SLOWF >> 5) & 1), s_rngDraws, score, pitems);
+            (int)((*ADDR_FRAME_SLOWF >> 5) & 1), s_rngDraws, score, pitems,
+            cherry, cmax, cplus, cbase, p1st, p2st);
     fflush(*fp);
 }
 

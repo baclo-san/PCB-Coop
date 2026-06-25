@@ -1139,6 +1139,7 @@ static int s_p2InputLogged = 0;
 #define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
 #define ADDR_RNG_FN     ((LPVOID)0x00431870)              /* FUN_00431870 — the LCG draw (§8al diag) */
 #define ADDR_RNG32_FN   ((LPVOID)0x004318d0)              /* FUN_004318d0 — 32-bit rand wrapper (§8bb attribution) */
+#define ADDR_SCHED      ((LPVOID)0x004012b0)              /* FUN_004012b0 — "next-fire = now + rand%100000" self-rescheduler (§8bc call-site attribution) */
 /* §8ax: the framerate/timestep multiplier (EoSD Supervisor::framerateMultiplier; PCB reads this same
  * global via Supervisor+0x178). It SCALES ALL MOTION (pos += vel * mult, PCBdecomp 5918/6122/6440…) and
  * GATES ZunTimer sub-frame stepping (FUN_00439401/FUN_0043958d: when mult<=0.99 timers tick fractionally
@@ -1671,6 +1672,28 @@ static unsigned __fastcall HookedRng32(void *seed)
         RngTally(consumer);                                    /* read-only attribution; self-gates again */
     }
     return s_origRng32(seed);
+}
+
+/* §8bc: name WHICH of the ~25 FUN_004012b0 call sites fires per frame. FUN_004012b0 is the
+ * "next-fire-time = now + rand%100000" self-rescheduler whose 2 wrapper draws are the FIRST visible
+ * divergent consumer of the in-stage replay fork (rf1163 in the 89d1891 capture): record fired it,
+ * playback did not, with both players in IDENTICAL positions — so the trigger is a phase/scheduler
+ * drift, not a player-state difference. The rngcall histogram only sees the draws INSIDE FUN_004012b0
+ * (return sites 0x4012cc/0x401306); to tell a COSMETIC self-rescheduler (decouple-safe) from a
+ * GAMEPLAY scene-init caller, we need its CALLER — which is exactly __builtin_return_address(0) in a
+ * MinHook detour (the original entry is overwritten, so the on-stack return addr is the true caller).
+ * Read-only: tally the caller into the same per-frame histogram, tagged with 0x80000000 so it reads as
+ * 8xxxxxxx in the CSV (unmistakable vs a 00xxxxxx RNG-consumer). Hard-gated on s_replayTrace, so a
+ * normal product run never lays this trampoline — the §8aw hot path is untouched. __fastcall(int): ECX. */
+typedef void (__fastcall *SchedFn_t)(int param_1);
+static SchedFn_t s_origSched = NULL;            /* FUN_004012b0 */
+static void __fastcall HookedSched(int param_1)
+{
+    if (s_replayTrace && (s_replayIsCoop || s_netActive || s_p2)) {
+        unsigned caller = (unsigned)(uintptr_t)__builtin_return_address(0);   /* the call site of FUN_004012b0 */
+        RngTally(caller | 0x80000000u);                                       /* tagged: 8xxxxxxx = scheduler caller */
+    }
+    s_origSched(param_1);
 }
 
 /* Re-derive ZUN's menu key-repeat (hold-to-scroll) from the MERGED word so it is
@@ -4978,6 +5001,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_REPLAY_PLAY_TASK,(LPVOID)&HookedPlayTask,     (LPVOID*)&s_origPlayTask)      != MH_OK) return 0; /* §8ad playback FPU pin */
     if (MH_CreateHook(ADDR_RNG_FN,         (LPVOID)&HookedRng,           (LPVOID*)&s_origRng)           != MH_OK) return 0; /* §8al RNG-caller trace (gated by replay_trace) */
     if (MH_CreateHook(ADDR_RNG32_FN,       (LPVOID)&HookedRng32,         (LPVOID*)&s_origRng32)         != MH_OK) return 0; /* §8bb 32-bit consumer attribution (read-only, gated by replay_trace) */
+    if (MH_CreateHook(ADDR_SCHED,          (LPVOID)&HookedSched,         (LPVOID*)&s_origSched)         != MH_OK) return 0; /* §8bc FUN_004012b0 call-site attribution (read-only, gated by replay_trace) */
     if (MH_CreateHook(ADDR_PRESENT_FN,     (LPVOID)&HookedPresent,       (LPVOID*)&s_origPresent)       != MH_OK) return 0; /* §8au suppress P2-focus snapshot */
     /* B5: capture the enemy-manager base (FUN_00420620's ECX/param_1) so the boss-spell
      * armour gate reads the LIVE spellcardInfo.isActive at param_1+0x9545c8. The base is
@@ -5025,6 +5049,7 @@ static int InstallHooks(void)
      * the EXACT §8aw hot path (no 32-bit trampoline at all). The tester sets replay_trace=1 for the
      * diagnostic captures that need it; there the read-only attribution can't affect determinism. */
     if (s_replayTrace && MH_EnableHook(ADDR_RNG32_FN) != MH_OK) return 0;
+    if (s_replayTrace && MH_EnableHook(ADDR_SCHED)    != MH_OK) return 0;   /* §8bc: caller-of-FUN_004012b0 trace, replay_trace-only */
     if (MH_EnableHook(ADDR_PRESENT_FN)     != MH_OK) return 0;   /* §8au suppress P2-focus snapshot (was CREATED but not ENABLED — inert) */
     if (MH_EnableHook(ADDR_REPLAY_LOAD)    != MH_OK) return 0;   /* §8k: was CREATED but never
                                                                    ENABLED — playback ran unhooked,

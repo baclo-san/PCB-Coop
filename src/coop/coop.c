@@ -464,6 +464,8 @@ static void KillP2FocusFx(void)
 typedef int (__fastcall *FrameTaskFn_t)(int *self);
 static FrameTaskFn_t s_origFrameTask = NULL;
 static int s_lastLogicFrame = 0x7fffffff;
+static int s_rpyStageFrame  = 0x7fffffff;  /* §8bb: PLAYBACK per-stage replay-frame tracker, to mirror
+                                              the live stage-transition P2 de-spawn on the playback path */
 static int s_lastScore = 0;            /* prev frame's team score; a DROP at a frame
                                           reset = retry/fresh start (vs stage advance,
                                           which carries the score). Phantom-spare logic
@@ -1136,6 +1138,7 @@ static int s_p2InputLogged = 0;
 #define ADDR_RNG_SEED   ((volatile uint16_t *)0x0049fe20) /* g_RngState.seed           */
 #define ADDR_RNG_CTR    ((volatile uint32_t *)0x0049fe24) /* g_RngState.call_counter   */
 #define ADDR_RNG_FN     ((LPVOID)0x00431870)              /* FUN_00431870 — the LCG draw (§8al diag) */
+#define ADDR_RNG32_FN   ((LPVOID)0x004318d0)              /* FUN_004318d0 — 32-bit rand wrapper (§8bb attribution) */
 /* §8ax: the framerate/timestep multiplier (EoSD Supervisor::framerateMultiplier; PCB reads this same
  * global via Supervisor+0x178). It SCALES ALL MOTION (pos += vel * mult, PCBdecomp 5918/6122/6440…) and
  * GATES ZunTimer sub-frame stepping (FUN_00439401/FUN_0043958d: when mult<=0.99 timers tick fractionally
@@ -1618,7 +1621,7 @@ static void RngTally(unsigned caller)
         int rf = rm ? *(int *)rm : -1;
         int i;
         if (rf != s_rngHistRf || play != s_rngHistPlay) { RngHistFlush(); s_rngHistRf = rf; s_rngHistPlay = play; }
-        if (rf < 0 || rf > 4000) return;        /* cap so files stay small */
+        if (rf < 0 || rf > 60000) return;       /* §8bb: cap raised to cover multi-stage runs (in-stage desyncs now appear in stage 2+, well past the old 4000) */
         for (i = 0; i < s_rngHistN; i++)
             if (s_rngHist[i].caller == caller) { s_rngHist[i].count++; return; }
         if (s_rngHistN < RNG_HIST_MAX) {
@@ -1635,6 +1638,39 @@ static unsigned short __fastcall HookedRng(void *seed)
     if (caller < WRAP_LO || caller >= WRAP_HI)   /* skip wrapper-internal; FUN_004318d0 hook logs those */
         RngTally(caller);
     return s_origRng(seed);
+}
+/* §8bb: RESTORE the 32-bit-wrapper consumer attribution (the §8ao/§8ar diagnostic) so the per-frame
+ * rngcall histogram names the REAL consumer of wrapper-routed draws (the bulk), not the wrapper site —
+ * essential for chasing the in-stage draw-fork the §8ba counter pinpoints. This is the §8ar code WITHOUT
+ * the §8at decouple (which was the §8aw regression): it NEVER changes the seed/state, it only attributes.
+ * Hard-gated on s_replayTrace FIRST, so in a normal product run the body is skipped entirely (a flag test
+ * + passthrough) — the ebp-walk and tally run ONLY during a tester diagnostic capture, where read-only
+ * attribution cannot affect determinism. FUN_004318d0 is __fastcall(ushort* seed) — pass ECX through. */
+#define FLOATW_LO 0x00431900u
+#define FLOATW_HI 0x00431920u
+#define TEXT_LO   0x00401000u
+#define TEXT_HI   0x0048cd38u
+typedef unsigned (__fastcall *Rng32Fn_t)(void *seed);
+static Rng32Fn_t s_origRng32 = NULL;            /* FUN_004318d0 — 32-bit wrapper (2× LCG) */
+static unsigned __fastcall HookedRng32(void *seed)
+{
+    if (s_replayTrace && (s_replayIsCoop || s_netActive || s_p2)) {
+        unsigned consumer = (unsigned)(uintptr_t)__builtin_return_address(0);   /* immediate caller */
+        if (consumer >= FLOATW_LO && consumer < FLOATW_HI) {   /* came via the float wrapper FUN_00431900 */
+            void **bp = (void **)__builtin_frame_address(0);   /* our frame: bp[0]=caller ebp, bp[1]=ret */
+            if (bp) {
+                void **bp900 = (void **)bp[0];                 /* FUN_00431900's frame */
+                if ((uintptr_t)bp900 > (uintptr_t)bp &&
+                    (uintptr_t)bp900 < (uintptr_t)bp + 0x10000 &&
+                    (((uintptr_t)bp900) & 3) == 0) {
+                    unsigned c = (unsigned)(uintptr_t)bp900[1];
+                    if (c >= TEXT_LO && c < TEXT_HI) consumer = c;   /* the real float-random consumer */
+                }
+            }
+        }
+        RngTally(consumer);                                    /* read-only attribution; self-gates again */
+    }
+    return s_origRng32(seed);
 }
 
 /* Re-derive ZUN's menu key-repeat (hold-to-scroll) from the MERGED word so it is
@@ -4074,6 +4110,30 @@ static int __fastcall HookedUpdate(void *self)
 
         PollHotkeys();
 
+        /* §8bb: PLAYBACK must reproduce the live stage-transition P2 de-spawn. The live run de-spawns
+         * P2 at each stage boundary (HookedFrameTask — the RECORD task — on its frame-counter reset)
+         * and auto-respawns it ~3s into the next stage; ZUN runs a DIFFERENT task on playback, so that
+         * de-spawn NEVER fired — P2 carried across the boundary and stayed present the whole next stage
+         * while the live run had NO P2 for ~240 frames, so playback drew RNG (P2's per-frame update) the
+         * record never drew → the stage-2+ desync (confirmed: §8ba draws-delta forks at the boundary,
+         * P2 present on rpy / absent on rec). Detect the per-stage replay-frame RESET here (AFTER the
+         * det-trace sample above, so rf0 still shows the carried P2 exactly like the record's rf0 does)
+         * and de-spawn + re-arm the auto-spawn so P2's absent-then-respawn window matches the live run
+         * frame-for-frame. Co-op replay playback only; the record path is untouched (no live regression). */
+        if (IsReplayPlayback() && s_replayIsCoop) {
+            void *rm = *ADDR_REPLAY_MGR;
+            int pf = rm ? *(int *)rm : -1;
+            if (pf >= 0 && pf < s_rpyStageFrame && s_p2) {
+                s_p2Carry = 1;              /* stage advance carries resources (matches the record path) */
+                DespawnP2();
+                s_autoSpawned = 0;          /* re-arm: P2 returns via the auto-spawn below, ~3s in */
+                s_readyFrames = 0;
+                Log("replay PLAYBACK: stage advance (rf=%d<%d) -> P2 de-spawn + re-arm auto-spawn "
+                    "(§8bb — match the live P2 lifecycle)", pf, s_rpyStageFrame);
+            }
+            if (pf >= 0) s_rpyStageFrame = pf;
+        }
+
         /* auto-spawn P2 as soon as P1 is controllable. P2 is a CLONE of P1, so it
          * can't exist until P1's character is loaded — P1Ready() (char-data set) is
          * the hard floor, and by the time that's true P1 is already in state 0 (the
@@ -4634,6 +4694,7 @@ static void ResetCoopSession(void)
     s_lifeReady     = 0;   /* re-capture icon templates next stage (front.anm may reload) */
     s_bombReady     = 0;
     s_lastLogicFrame = 0x7fffffff;
+    s_rpyStageFrame  = 0x7fffffff;   /* §8bb */
     Log("coop session reset (returned to front-end menu)");
 }
 
@@ -4916,6 +4977,7 @@ static int InstallHooks(void)
     if (MH_CreateHook(ADDR_REPLAY_LOAD,    (LPVOID)&HookedReplayLoad,    (LPVOID*)&s_origReplayLoad)    != MH_OK) return 0; /* §8k playback */
     if (MH_CreateHook(ADDR_REPLAY_PLAY_TASK,(LPVOID)&HookedPlayTask,     (LPVOID*)&s_origPlayTask)      != MH_OK) return 0; /* §8ad playback FPU pin */
     if (MH_CreateHook(ADDR_RNG_FN,         (LPVOID)&HookedRng,           (LPVOID*)&s_origRng)           != MH_OK) return 0; /* §8al RNG-caller trace (gated by replay_trace) */
+    if (MH_CreateHook(ADDR_RNG32_FN,       (LPVOID)&HookedRng32,         (LPVOID*)&s_origRng32)         != MH_OK) return 0; /* §8bb 32-bit consumer attribution (read-only, gated by replay_trace) */
     if (MH_CreateHook(ADDR_PRESENT_FN,     (LPVOID)&HookedPresent,       (LPVOID*)&s_origPresent)       != MH_OK) return 0; /* §8au suppress P2-focus snapshot */
     /* B5: capture the enemy-manager base (FUN_00420620's ECX/param_1) so the boss-spell
      * armour gate reads the LIVE spellcardInfo.isActive at param_1+0x9545c8. The base is
@@ -4959,6 +5021,10 @@ static int InstallHooks(void)
     if (MH_EnableHook(ADDR_REPLAY_HDR_INIT)!= MH_OK) return 0;
     if (MH_EnableHook(ADDR_REPLAY_PLAY_TASK)!= MH_OK) return 0;  /* §8ad playback FPU pin */
     if (MH_EnableHook(ADDR_RNG_FN)         != MH_OK) return 0;   /* §8al RNG-caller trace */
+    /* §8bb: ENABLE the 32-bit attribution hook ONLY under replay_trace, so a normal product run keeps
+     * the EXACT §8aw hot path (no 32-bit trampoline at all). The tester sets replay_trace=1 for the
+     * diagnostic captures that need it; there the read-only attribution can't affect determinism. */
+    if (s_replayTrace && MH_EnableHook(ADDR_RNG32_FN) != MH_OK) return 0;
     if (MH_EnableHook(ADDR_PRESENT_FN)     != MH_OK) return 0;   /* §8au suppress P2-focus snapshot (was CREATED but not ENABLED — inert) */
     if (MH_EnableHook(ADDR_REPLAY_LOAD)    != MH_OK) return 0;   /* §8k: was CREATED but never
                                                                    ENABLED — playback ran unhooked,

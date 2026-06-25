@@ -1140,6 +1140,7 @@ static int s_p2InputLogged = 0;
 #define ADDR_RNG_FN     ((LPVOID)0x00431870)              /* FUN_00431870 — the LCG draw (§8al diag) */
 #define ADDR_RNG32_FN   ((LPVOID)0x004318d0)              /* FUN_004318d0 — 32-bit rand wrapper (§8bb attribution) */
 #define ADDR_SCHED      ((LPVOID)0x004012b0)              /* FUN_004012b0 — "next-fire = now + rand%100000" self-rescheduler (§8bc call-site attribution) */
+#define ADDR_SCORE_MGR  ((volatile int *)0x00626278)      /* -> score/item-collection manager base (score @+4, pointItemsCollected @+0x24) — §8bd */
 /* §8ax: the framerate/timestep multiplier (EoSD Supervisor::framerateMultiplier; PCB reads this same
  * global via Supervisor+0x178). It SCALES ALL MOTION (pos += vel * mult, PCBdecomp 5918/6122/6440…) and
  * GATES ZunTimer sub-frame stepping (FUN_00439401/FUN_0043958d: when mult<=0.99 timers tick fractionally
@@ -1538,7 +1539,12 @@ static void ReplayDetTrace(int playback)
          * (or != the playback's), the sub-frame timer stepping is the desync axis EoSD guards. */
         /* §8ba: draws = true monotonic LCG-call count; diff its per-frame DELTA rec-vs-rpy to find
          * the real draw-stream fork (the §8aj seed-pin keeps `seed` matching, hiding it). */
-        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw,inMenu,netMerged,headW,headNext,mult,mult2,slow,draws\n", *fp);
+        /* §8bd: score/pitems = the item-COLLECTION state. The newer-test-logs capture proved the RNG
+         * stream AND both players are byte-identical until the first fork (an extra item-collect bonus,
+         * FUN_004325e0/rf1037) — so the root is NON-RNG collection state (a clone-side asymmetry), not a
+         * draw-stream drift. These two counters name the exact frame + kind of the collection fork: a
+         * `pitems` delta = a point item collected that frame; `score` catches the bonus/extend RNG too. */
+        fputs("rf,input,seed,counter,p1x,p1y,p2x,p2y,cw,inMenu,netMerged,headW,headNext,mult,mult2,slow,draws,score,pitems\n", *fp);
     }
     void *p2 = (void *)s_p2;
     /* replay buffer current head + next entry words (the recorded merged words FUN_00442ee0 applies) */
@@ -1547,7 +1553,10 @@ static void ReplayDetTrace(int playback)
         unsigned char *head = *(unsigned char **)((char *)rm + 0x84);
         if (head) { hW = *(unsigned short *)head; hN = *(unsigned short *)(head + 4); }
     }
-    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x,%04x,%04x,%04x,%04x,%.4f,%.4f,%d,%u\n",
+    int smb = *ADDR_SCORE_MGR;                              /* §8bd: score/item-collection manager base */
+    int score = smb ? *(int *)(smb + 4) : -1;
+    int pitems = smb ? *(int *)(smb + 0x24) : -1;
+    fprintf(*fp, "%d,%04x,%04x,%u,%.3f,%.3f,%.3f,%.3f,%04x,%04x,%04x,%04x,%04x,%.4f,%.4f,%d,%u,%d,%d\n",
             rf, (unsigned)*ADDR_INPUT_GAMEPLAY,
             (unsigned)*ADDR_RNG_SEED, (unsigned)*ADDR_RNG_CTR,
             *(float *)((char *)ADDR_PLAYER_BASE + OFF_POS_X),
@@ -1557,7 +1566,7 @@ static void ReplayDetTrace(int playback)
             (unsigned)FpuCw(),
             (unsigned)*ADDR_INPUT_MENU, (unsigned)s_netMerged, hW, hN,
             (double)*ADDR_FRAME_MULT, (double)*ADDR_FRAME_MULT2,
-            (int)((*ADDR_FRAME_SLOWF >> 5) & 1), s_rngDraws);
+            (int)((*ADDR_FRAME_SLOWF >> 5) & 1), s_rngDraws, score, pitems);
     fflush(*fp);
 }
 
@@ -3496,11 +3505,13 @@ static int __fastcall HookedCollectOverlap(void *self, void *edx, float *pos, fl
     RestoreHeldRes();                                  /* undo the previous item's P2 swap */
 
     int isP1 = ((uint32_t)self == ADDR_PLAYER_BASE);
+    int byP2 = 0;                                          /* §8bd: track the collector for the event log */
     int r = (isP1 && s_p1Ghost) ? 0                       /* ghost P1: can't collect */
           : s_origCollectOverlap(self, edx, pos, size);   /* P1 (unchanged) */
     void *p2 = (void *)s_p2;
     if (isP1 && !r && p2 && !s_p2Ghost) {
         r = s_origCollectOverlap(p2, edx, pos, size);      /* P2 — param-relative */
+        if (r) byP2 = 1;
         if (r && s_p2SepRes) {
             /* P2 collected: hold P2's resources in for this item's upcoming credit */
             uint32_t res = *ADDR_RES_PTR;
@@ -3516,6 +3527,17 @@ static int __fastcall HookedCollectOverlap(void *self, void *edx, float *pos, fl
                 if (!s_p2CollectLogged) { Log("P2 item collect -> P2 resources (first)"); s_p2CollectLogged = 1; }
             }
         }
+    }
+    /* §8bd: per-collect event log (replay_trace only — product run is a flag-test no-op). The
+     * newer-test-logs capture showed playback collects one EXTRA item-bonus at rf1037 with both
+     * players byte-identical in position and the RNG stream identical up to that point. Logging the
+     * collector (P1/P2) + item position on BOTH record and playback lets a rec-vs-rpy diff name the
+     * exact extra collect — is it a P2-clone-only collect (a clone-state asymmetry, → option 3), or
+     * a +1-offset double-count of the same item? `pos` is the item's collection circle ≈ item pos. */
+    if (s_replayTrace && r) {
+        void *rm = *ADDR_REPLAY_MGR; int rf = rm ? *(int *)rm : -1;
+        Log("COLLECT rf=%d by=%s item=(%.1f,%.1f)", rf, byP2 ? "P2" : "P1",
+            pos ? pos[0] : -1.0f, pos ? pos[1] : -1.0f);
     }
     return r;
 }
